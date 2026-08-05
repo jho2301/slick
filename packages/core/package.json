@@ -1,0 +1,15 @@
+{
+  "name": "@slick/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Storage + domain model for Slick (channels, threads, messages, agent sessions)",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./paths": "./src/paths.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

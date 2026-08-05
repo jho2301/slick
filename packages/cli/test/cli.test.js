@@ -1,0 +1,239 @@
+import { test, describe, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { parse, withGlobals } from '../src/args.js';
+
+const BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../bin/slick.js');
+let home;
+
+before(() => {
+  home = mkdtempSync(join(tmpdir(), 'slick-cli-'));
+});
+
+after(() => {
+  rmSync(home, { recursive: true, force: true });
+});
+
+/**
+ * Run the real binary in a real subprocess. Every call is a cold start, which
+ * is exactly the situation `slick agent resume` exists for.
+ */
+function slick(args, opts = {}) {
+  return new Promise((done) => {
+    execFile(
+      process.execPath,
+      [BIN, ...args],
+      {
+        env: { ...process.env, SLICK_HOME: home, NO_COLOR: '1', FORCE_COLOR: '0', ...(opts.env ?? {}) },
+        encoding: 'utf8',
+      },
+      (err, stdout, stderr) => {
+        let json = null;
+        try {
+          json = JSON.parse(stdout);
+        } catch {
+          /* human output */
+        }
+        done({ code: err?.code ?? 0, stdout: stdout.trim(), stderr: stderr.trim(), json });
+      }
+    );
+  });
+}
+
+describe('argument parsing', () => {
+  const spec = withGlobals({ booleans: ['peek'], strings: ['channel', 'limit'] });
+
+  test('separates flags from free text', () => {
+    const { _, flags } = parse(['general', 'deploy', 'is', '--broken', '--json'], spec);
+    assert.deepEqual(_, ['general', 'deploy', 'is']);
+    assert.equal(flags.json, true);
+    assert.equal(flags.broken, true);
+  });
+
+  test('value flags consume their value, boolean flags do not', () => {
+    const { _, flags } = parse(['--channel', 'general', '--peek', 'text', '--limit=5'], spec);
+    assert.equal(flags.channel, 'general');
+    assert.equal(flags.peek, true);
+    assert.equal(flags.limit, '5');
+    assert.deepEqual(_, ['text']);
+  });
+
+  test('supports --no-x, short flags and --', () => {
+    assert.equal(parse(['--no-json'], spec).flags.json, false);
+    assert.equal(parse(['-j'], spec).flags.json, true);
+    assert.deepEqual(parse(['--', '--not-a-flag'], spec)._, ['--not-a-flag']);
+  });
+});
+
+describe('the basics', () => {
+  test('init creates a workspace', async () => {
+    const result = await slick(['init', '--user', 'Tester', '--json']);
+    assert.equal(result.code, 0);
+    assert.equal(result.json.user.name, 'Tester');
+    assert.equal(result.json.counts.channels, 2);
+  });
+
+  test('send and read a message', async () => {
+    const sent = await slick(['send', 'general', 'hello from a subprocess', '--json']);
+    assert.equal(sent.code, 0);
+    assert.equal(sent.json.message.text, 'hello from a subprocess');
+    assert.equal(sent.json.message.author.label, 'Tester');
+
+    const read = await slick(['read', 'general', '--json']);
+    assert.equal(read.json.messages.at(-1).id, sent.json.message.id);
+  });
+
+  test('reads message text from a pipe', async () => {
+    const result = await new Promise((done) => {
+      const child = execFile(
+        process.execPath,
+        [BIN, 'send', 'general', '-', '--json'],
+        { env: { ...process.env, SLICK_HOME: home, NO_COLOR: '1' }, encoding: 'utf8' },
+        (err, stdout) => done(JSON.parse(stdout))
+      );
+      child.stdin.end('piped in\n');
+    });
+    assert.equal(result.message.text, 'piped in');
+  });
+
+  test('channel lifecycle', async () => {
+    assert.equal((await slick(['channel', 'create', 'cli-room', '--topic', 'made by a test', '--json'])).code, 0);
+    const shown = await slick(['channel', 'show', 'cli-room', '--json']);
+    assert.equal(shown.json.channel.topic, 'made by a test');
+    await slick(['channel', 'update', 'cli-room', '--rename', 'cli-den', '--json']);
+    assert.equal((await slick(['channel', 'show', 'cli-room'])).code, 4, 'old name is gone');
+    await slick(['channel', 'archive', 'cli-den']);
+    assert.ok(!(await slick(['channel', 'list', '--json'])).json.channels.some((c) => c.slug === 'cli-den'));
+    await slick(['channel', 'unarchive', 'cli-den']);
+    assert.equal((await slick(['channel', 'delete', 'cli-den', '--json'])).json.channel.deleted, true);
+  });
+
+  test('threads', async () => {
+    const root = (await slick(['send', 'general', 'thread root', '--json'])).json.message;
+    await slick(['thread', 'reply', root.id, 'first reply', '--json']);
+    const thread = (await slick(['thread', 'show', root.id, '--json'])).json;
+    assert.equal(thread.replies.length, 1);
+    assert.equal(thread.root.replyCount, 1);
+  });
+
+  test('edit and delete', async () => {
+    const msg = (await slick(['send', 'general', 'typo mesage', '--json'])).json.message;
+    const edited = (await slick(['message', 'edit', msg.id, 'typo message', '--json'])).json.message;
+    assert.equal(edited.text, 'typo message');
+    assert.ok(edited.editedAt);
+    assert.equal((await slick(['message', 'delete', msg.id, '--json'])).json.message.deleted, true);
+  });
+
+  test('search', async () => {
+    await slick(['send', 'general', 'the quick brown fox']);
+    assert.equal((await slick(['search', 'quick', 'fox', '--json'])).json.count, 1);
+    assert.equal((await slick(['search', 'quick', 'zebra', '--json'])).json.count, 0);
+  });
+});
+
+describe('agent history keys across processes', () => {
+  let key;
+
+  test('start prints a key on its own with -q', async () => {
+    const result = await slick(['agent', 'start', '--agent', 'claude', '--name', 'cli', '--channel', 'general', '-q']);
+    key = result.stdout;
+    assert.match(key, /^slk_h1_[0-9a-z]{20}$/);
+  });
+
+  test('a later process resumes with only the key', async () => {
+    await slick(['send', 'general', '@claude please look at the build']);
+    const resumed = (await slick(['agent', 'resume', key, '--json'])).json;
+    assert.equal(resumed.session.agentId, 'claude');
+    assert.equal(resumed.pending, 1);
+    assert.equal(resumed.missed[0].message.text, '@claude please look at the build');
+    assert.deepEqual(resumed.missed[0].message.mentions, ['claude']);
+  });
+
+  test('resume does not consume; pull does', async () => {
+    assert.equal((await slick(['agent', 'resume', key, '--json'])).json.pending, 1);
+    const pulled = (await slick(['agent', 'pull', key, '--json'])).json;
+    assert.equal(pulled.events.length, 1);
+    assert.equal((await slick(['agent', 'pull', key, '--json'])).json.events.length, 0);
+  });
+
+  test('SLICK_AGENT_KEY stands in for --key', async () => {
+    await slick(['send', 'general', 'another one']);
+    const pulled = (await slick(['agent', 'pull', '--json'], { env: { SLICK_AGENT_KEY: key } })).json;
+    assert.equal(pulled.events.length, 1);
+  });
+
+  test('the agent posts as itself and does not re-read its own words', async () => {
+    const posted = (await slick(['agent', 'post', key, 'on it', '--json'])).json;
+    assert.equal(posted.message.author.kind, 'agent');
+    assert.equal(posted.message.author.id, 'claude');
+    assert.equal((await slick(['agent', 'pull', key, '--json'])).json.events.length, 0);
+    assert.equal((await slick(['agent', 'pull', key, '--json', '--include-own', '--peek'])).json.events.length, 1);
+  });
+
+  test('state survives between processes', async () => {
+    await slick(['agent', 'state', 'set', key, 'step=verifying', 'attempt=2']);
+    await slick(['agent', 'state', 'set', key, 'step=done']);
+    const state = (await slick(['agent', 'state', 'get', key, '--json'])).json.state;
+    assert.deepEqual(state, { step: 'done', attempt: 2 });
+  });
+
+  test('sessions can be found again by name when the key is lost', async () => {
+    const listed = (await slick(['agent', 'sessions', '--json'])).json.sessions;
+    assert.ok(listed.some((s) => s.key === key && s.name === 'cli'));
+    const byName = (await slick(['agent', 'resume', 'cli', '--agent', 'claude', '--json'])).json;
+    assert.equal(byName.session.key, key);
+  });
+
+  test('replies into a thread as the agent', async () => {
+    const root = (await slick(['send', 'general', 'question for the bot', '--json'])).json.message;
+    const replied = (await slick(['agent', 'reply', key, root.id, 'answer', '--json'])).json;
+    assert.equal(replied.message.parentId, root.id);
+    assert.equal(replied.message.author.kind, 'agent');
+  });
+
+  test('resume --create makes the session on first run', async () => {
+    const first = (await slick(['agent', 'resume', 'nightly', '--create', '--agent', 'ops', '--json'])).json;
+    const second = (await slick(['agent', 'resume', 'nightly', '--create', '--agent', 'ops', '--json'])).json;
+    assert.equal(first.session.key, second.session.key);
+  });
+});
+
+describe('errors are actionable', () => {
+  test('unknown channel exits 4 with a hint', async () => {
+    const result = await slick(['read', 'nope']);
+    assert.equal(result.code, 4);
+    assert.match(result.stderr, /No channel named "nope"/);
+    assert.match(result.stderr, /slick channel list/);
+  });
+
+  test('unknown history key reports a distinct code in --json', async () => {
+    const result = await slick(['agent', 'resume', 'slk_h1_00000000000000000000', '--json']);
+    assert.equal(result.code, 4);
+    assert.equal(result.json.error.code, 'unknown_history_key');
+  });
+
+  test('duplicate channel exits 5', async () => {
+    assert.equal((await slick(['channel', 'create', 'general'])).code, 5);
+  });
+
+  test('empty message exits 2', async () => {
+    assert.equal((await slick(['send', 'general', '   '])).code, 2);
+  });
+
+  test('unknown command suggests a real one', async () => {
+    const result = await slick(['chanel']);
+    assert.equal(result.code, 2);
+    assert.match(result.stdout, /Did you mean channel/);
+  });
+
+  test('--help works without touching the workspace', async () => {
+    const result = await slick(['--help'], { env: { SLICK_HOME: '/nonexistent/should-not-be-created' } });
+    assert.equal(result.code, 0);
+    assert.match(result.stdout, /Slack-shaped workspace/);
+  });
+});

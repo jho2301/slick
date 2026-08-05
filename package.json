@@ -1,0 +1,30 @@
+{
+  "name": "slick-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Slick — a Slack-like workspace for one human and their AI agents",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/desktop"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "slick": "node packages/cli/bin/slick.js",
+    "app": "node packages/cli/bin/slick.js app",
+    "serve": "node packages/server/bin/slickd.js --foreground",
+    "desktop": "npm start --workspace @slick/desktop",
+    "test": "node --test --no-warnings \"packages/*/test/*.test.js\"",
+    "test:core": "node --test --no-warnings packages/core/test/*.test.js",
+    "test:server": "node --test --no-warnings packages/server/test/*.test.js",
+    "test:cli": "node --test --no-warnings packages/cli/test/*.test.js",
+    "smoke:ui": "electron scripts/ui-smoke.mjs",
+    "shots": "electron scripts/ui-shots.mjs",
+    "seed": "node scripts/seed-demo.mjs"
+  },
+  "devDependencies": {
+    "electron": "^43.0.0"
+  }
+}

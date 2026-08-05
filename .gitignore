@@ -1,0 +1,13 @@
+node_modules/
+dist/
+out/
+shots/
+*.log
+
+# A workspace accidentally created inside the repo
+.slick/
+*.db
+*.db-wal
+*.db-shm
+
+.DS_Store

@@ -1,0 +1,18 @@
+{
+  "name": "@slick/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Slick desktop app (Electron shell around the local workspace)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@slick/core": "0.1.0",
+    "@slick/server": "0.1.0"
+  },
+  "devDependencies": {
+    "electron": "^43.0.0"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@slick/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local daemon: REST + live event stream over the Slick workspace",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./daemon": "./src/daemon.js"
+  },
+  "bin": {
+    "slickd": "./bin/slickd.js"
+  },
+  "dependencies": {
+    "@slick/core": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
