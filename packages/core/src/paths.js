@@ -23,6 +23,7 @@ export function paths(home) {
     db: join(root, 'slick.db'),
     daemonFile: join(root, 'daemon.json'),
     daemonLog: join(root, 'daemon.log'),
+    tokenFile: join(root, 'token'),
     uploads: join(root, 'files'),
   };
 }

@@ -77,6 +77,7 @@ export const daemon = {
         const info = await startDaemon({
           home,
           port: ctx.flags.port ? Number(ctx.flags.port) : undefined,
+          host: ctx.flags.host,
         });
         if (ctx.json) return json(info);
         return ok(`Restarted on ${style.bold(info.url)}`);

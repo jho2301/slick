@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { parse, withGlobals } from '../src/args.js';
 
 const BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../bin/slick.js');
+const FAKE_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/fake-agent.js');
 let home;
 
 before(() => {
@@ -200,6 +201,60 @@ describe('agent history keys across processes', () => {
     const first = (await slick(['agent', 'resume', 'nightly', '--create', '--agent', 'ops', '--json'])).json;
     const second = (await slick(['agent', 'resume', 'nightly', '--create', '--agent', 'ops', '--json'])).json;
     assert.equal(first.session.key, second.session.key);
+  });
+});
+
+describe('agent serve', () => {
+  let key;
+
+  test('sets up a session and a mention to answer', async () => {
+    key = (
+      await slick(['agent', 'start', '--agent', 'claude', '--name', 'server', '--channel', 'general', '-q'])
+    ).stdout;
+    await slick(['send', 'general', '@claude what is the plan']);
+    await slick(['send', 'general', 'not addressed to anyone']);
+  });
+
+  test('--once calls the fake agent only for the @mention and posts its reply', async () => {
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json']);
+    assert.equal(result.code, 0);
+    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].message.text, 'echo(resumed=false): @claude what is the plan');
+    assert.equal(lines[0].message.author.id, 'claude');
+
+    const pulled = (await slick(['agent', 'pull', key, '--json', '--peek'])).json;
+    assert.equal(pulled.events.length, 0, 'both messages were consumed even though only one was answered');
+  });
+
+  test('the next run resumes the same fake-agent session', async () => {
+    await slick(['send', 'general', '@claude and now']);
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json']);
+    const line = JSON.parse(result.stdout.trim());
+    assert.equal(line.message.text, 'echo(resumed=true): @claude and now');
+  });
+
+  test('a failing call is reported and does not consume the message', async () => {
+    await slick(['send', 'general', '@claude trigger a failure']);
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_FAIL: '1' },
+    });
+    assert.match(result.stderr, /boom/);
+    assert.equal(result.stdout.trim(), '');
+  });
+
+  test('--dry-run prints the prompt and calls nothing', async () => {
+    const result = await slick(['agent', 'serve', key, '--once', '--dry-run', '--cmd', FAKE_AGENT]);
+    assert.match(result.stdout, /would call/);
+    assert.match(result.stdout, /trigger a failure/);
+  });
+
+  test('--all answers every message, not just mentions', async () => {
+    await slick(['agent', 'pull', key]); // catch up past the earlier failed/dry-run rounds
+    await slick(['send', 'general', 'no mention here']);
+    const result = await slick(['agent', 'serve', key, '--once', '--all', '--cmd', FAKE_AGENT, '--json']);
+    const line = JSON.parse(result.stdout.trim());
+    assert.match(line.message.text, /no mention here$/);
   });
 });
 

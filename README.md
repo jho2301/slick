@@ -75,6 +75,23 @@ misses one, because the cursor lives in the database rather than in the agent.
 
 Full protocol for agents: **[AGENTS.md](./AGENTS.md)**.
 
+That loop is meant to be driven by the agent itself, run after run. If you'd
+rather Slick made the call for you — actually invoke the agent the moment
+someone `@mentions` it, and post back whatever it says — run:
+
+```bash
+slick agent serve $KEY
+```
+
+It watches the session, and on every new `@claude` (by default; `--all` to
+answer everything) it spawns `claude -p` with the recent conversation as
+context, resuming the same `claude` conversation across turns, and replies
+into the thread with whatever came back. `--dry-run` shows you the prompt
+without calling or posting anything; `--cmd` points it at a different binary
+for other agents. It does not hand the child process the ability to touch
+Slick itself — that stays between you and whatever tool permissions you give
+it with `--permission-mode` / `--allowed-tools` / `--dangerously-skip-permissions`.
+
 ---
 
 ## The CLI
@@ -94,7 +111,7 @@ Organising
   init                          create the workspace
 
 Agents
-  agent start|sessions|resume|pull|post|reply|state|ack|watch|end
+  agent start|sessions|resume|pull|post|reply|state|ack|watch|serve|end
 
 Apps
   app                           open the desktop app
@@ -164,7 +181,7 @@ it over HTTP; the app calls the server. There is exactly one implementation of
 ## Tests
 
 ```bash
-npm test              # 65 tests: core, HTTP API, and the CLI end to end
+npm test              # 71 tests: core, HTTP API, and the CLI end to end
 npm run smoke:ui      # loads the real UI in Electron and drives it
 npm run shots         # screenshots of the UI into $SLICK_HOME/shots
 ```

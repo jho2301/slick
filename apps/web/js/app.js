@@ -1040,3 +1040,9 @@ async function boot() {
 }
 
 boot();
+
+// A bare inline <script> would be blocked by the page's CSP, so registration
+// lives here instead — this module is already an allowed same-origin source.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+}

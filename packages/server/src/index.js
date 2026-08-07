@@ -29,12 +29,14 @@ export function newToken() {
  * @param {{
  *   workspace?: Workspace, home?: string, file?: string,
  *   token?: string|null, webRoot?: string|null, host?: string,
+ *   trustedHosts?: string[],
  * }} [opts]
  */
 export function createServer(opts = {}) {
   const ws = opts.workspace ?? Workspace.open({ home: opts.home, file: opts.file });
   const ownsWorkspace = !opts.workspace;
   const host = opts.host ?? '127.0.0.1';
+  const trustedHosts = new Set((opts.trustedHosts ?? []).map((h) => h.toLowerCase()));
   const token = opts.token === null ? null : (opts.token ?? newToken());
   const webRoot = opts.webRoot === null ? null : resolveWebRoot(opts.webRoot);
   const hub = createHub(ws);
@@ -63,8 +65,12 @@ export function createServer(opts = {}) {
     }
 
     // Loopback bindings are still reachable from any web page the user has
-    // open, so pin the Host header too (defeats DNS rebinding).
-    if (host === '127.0.0.1' && !isLocalHost(req.headers.host)) {
+    // open, so pin the Host header too (defeats DNS rebinding). A reverse
+    // proxy that only ever forwards to us over loopback (e.g. `tailscale
+    // serve`, which forwards traffic that already passed tailnet auth) can
+    // be allow-listed by hostname via `trustedHosts`.
+    const requestHost = (req.headers.host ?? '').replace(/:\d+$/, '').toLowerCase();
+    if (host === '127.0.0.1' && !isLocalHost(req.headers.host) && !trustedHosts.has(requestHost)) {
       return sendJson(res, 403, { error: { code: 'forbidden', message: 'Non-local Host header' } });
     }
 

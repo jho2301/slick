@@ -26,6 +26,7 @@ import {
   table,
 } from '../output.js';
 import { requireRef } from './channel.js';
+import { serve, SERVE_SPEC } from './agent-serve.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -106,6 +107,7 @@ export const agent = {
   state [get|set|clear]         the agent's own JSON memory
   ack [key] [seq|latest]        move the read cursor by hand
   watch [key]                   stream new messages as they arrive
+  serve [key|name]              call the real agent on new @mentions and post its reply
   end [key]                     close a session
   forget [key]                  delete a session record
 
@@ -124,7 +126,21 @@ Reading
 Writing
   --channel <channel>           where to post (default: the session's channel)
   --thread <message-id>         post into a thread
-  --meta <json>                 attach structured data`,
+  --meta <json>                 attach structured data
+
+Serving
+  --all                         respond to every message, not just @mentions
+  --cmd <bin>                   the agent binary to call (default: claude)
+  --interval <ms>                poll interval (default 2000)
+  --once                         handle one batch and exit
+  --context <n>                  messages of context to give the agent (default 20)
+  --system <text>                extra instruction appended to every prompt
+  --dry-run                      print the prompt instead of calling and posting
+  --permission-mode <mode>       passed through to claude
+  --allowed-tools <tools>        passed through to claude as --allowedTools
+  --dangerously-skip-permissions passed through to claude
+  --model <name>                 passed through to claude
+  --timeout <ms>                 kill the child if it runs this long (default 10m)`,
   spec: {
     booleans: [
       'peek',
@@ -137,8 +153,22 @@ Writing
       'replace',
       'once',
       'follow',
+      ...SERVE_SPEC.booleans,
     ],
-    strings: ['agent', 'key', 'name', 'title', 'channel', 'limit', 'thread', 'meta', 'scope', 'interval', 'context'],
+    strings: [
+      'agent',
+      'key',
+      'name',
+      'title',
+      'channel',
+      'limit',
+      'thread',
+      'meta',
+      'scope',
+      'interval',
+      'context',
+      ...SERVE_SPEC.strings,
+    ],
   },
 
   async run(ctx) {
@@ -365,6 +395,13 @@ Writing
         }
       }
 
+      // ------------------------------------------------------------ serve ---
+      case 'serve': {
+        const ref = sessionRef(ctx, rest[0]);
+        await serve(ws, ref, { agentId: agentId(ctx), flags, json: ctx.json });
+        return;
+      }
+
       // ------------------------------------------------------- end/forget ---
       case 'end':
       case 'close': {
@@ -383,7 +420,7 @@ Writing
 
       default:
         throw new ValidationError(`Unknown agent command "${sub}".`, {
-          hint: 'Try: start, sessions, resume, pull, post, reply, state, ack, watch, end',
+          hint: 'Try: start, sessions, resume, pull, post, reply, state, ack, watch, serve, end',
         });
     }
   },
