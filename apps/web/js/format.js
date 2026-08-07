@@ -45,6 +45,29 @@ const md = new MarkdownIt({
 });
 md.use(mentionPlugin);
 
+/**
+ * Markdown collapses any run of blank lines into a single paragraph break, so
+ * hitting Enter four times reads exactly like hitting it twice. In a chat box
+ * those extra blank lines are deliberate spacing, so keep them: every blank
+ * line past the first one adds a line of top margin to the block that follows.
+ * Block tokens carry `map` = [startLine, endLine), which is what makes the gap
+ * recoverable after parsing.
+ */
+const LINE = 1.5; // em; matches the body line-height, so one gap reads as one blank line
+const MAX_GAP = 10; // a wall of Enters shouldn't be able to push content off-screen
+function blankLineGaps(state) {
+  let prevEnd = null;
+  for (const token of state.tokens) {
+    if (token.level !== 0 || !token.map) continue;
+    if (prevEnd !== null) {
+      const extra = Math.min(token.map[0] - prevEnd - 1, MAX_GAP);
+      if (extra > 0) token.attrSet('style', `margin-top:${(0.9 + extra * LINE).toFixed(2)}em`);
+    }
+    prevEnd = token.map[1];
+  }
+}
+md.core.ruler.push('blank_line_gaps', blankLineGaps);
+
 // Bare and [text](url) links both go through link_open — force them to open
 // in a new tab without leaking a referrer.
 const defaultLinkOpen =

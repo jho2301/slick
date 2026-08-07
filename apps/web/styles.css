@@ -447,7 +447,7 @@ button { cursor: pointer; }
 }
 .msg__body > :first-child { margin-top: 0; }
 .msg__body > :last-child { margin-bottom: 0; }
-.msg__body p { margin: 0.3em 0; }
+.msg__body p { margin: 0.9em 0; }
 .msg__body code {
   font-family: var(--mono);
   font-size: 0.87em;

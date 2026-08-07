@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { NotFoundError } from '@slick/core';
 import { line, note, ok, style, warn } from '../output.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -171,40 +172,57 @@ export async function serve(ws, ref, ctx) {
         threadId: event.message.threadId,
         channelId: event.message.channelId,
       };
-      await ws.agents.typing(ref, { ...typingOpts, on: true });
-      let result;
+      // A thread can vanish out from under us (the human deletes it, a
+      // race with the API, ...) between resume() handing us the event and
+      // reply() landing — that must not take the whole watcher down.
       try {
-        result = await callAgent({
-          cmd,
-          prompt,
-          resumeId: claudeSessionId,
-          permissionMode: flags['permission-mode'],
-          allowedTools: flags['allowed-tools'],
-          skipPermissions: Boolean(flags['dangerously-skip-permissions']),
-          model: flags.model,
-          appendSystemPrompt: flags['append-system-prompt'],
-          timeoutMs,
+        await ws.agents.typing(ref, { ...typingOpts, on: true });
+        let result;
+        try {
+          result = await callAgent({
+            cmd,
+            prompt,
+            resumeId: claudeSessionId,
+            permissionMode: flags['permission-mode'],
+            allowedTools: flags['allowed-tools'],
+            skipPermissions: Boolean(flags['dangerously-skip-permissions']),
+            model: flags.model,
+            appendSystemPrompt: flags['append-system-prompt'],
+            timeoutMs,
+          });
+        } finally {
+          await ws.agents.typing(ref, { ...typingOpts, on: false });
+        }
+
+        if (result.sessionId) claudeSessionId = result.sessionId;
+
+        if (result.error) {
+          warn(`${cmd} failed on ${event.message.id}: ${result.error}`);
+          failedAtSeq = event.seq;
+          break;
+        }
+
+        const posted = await ws.agents.reply(ref, event.message.threadId, {
+          agentId: ctx.agentId,
+          text: result.text,
         });
-      } finally {
-        await ws.agents.typing(ref, { ...typingOpts, on: false });
-      }
-
-      if (result.sessionId) claudeSessionId = result.sessionId;
-
-      if (result.error) {
-        warn(`${cmd} failed on ${event.message.id}: ${result.error}`);
+        if (asJson) {
+          line(JSON.stringify({ repliedTo: event.message.id, message: posted.message }));
+        } else {
+          ok(`Replied in thread ${style.dim(posted.message.threadId)}`);
+        }
+      } catch (err) {
+        // A message that has been hard-removed can never be answered — retrying
+        // it forever would wedge every mention behind it. Anything else (a
+        // transient claude failure, a DB hiccup) keeps the existing
+        // retry-and-block behavior in case the trouble clears.
+        if (err instanceof NotFoundError) {
+          warn(`Skipping ${event.message.id}: ${err.message}`);
+          continue;
+        }
+        warn(`Could not answer ${event.message.id}: ${err.message}`);
         failedAtSeq = event.seq;
         break;
-      }
-
-      const posted = await ws.agents.reply(ref, event.message.threadId, {
-        agentId: ctx.agentId,
-        text: result.text,
-      });
-      if (asJson) {
-        line(JSON.stringify({ repliedTo: event.message.id, message: posted.message }));
-      } else {
-        ok(`Replied in thread ${style.dim(posted.message.threadId)}`);
       }
     }
 
