@@ -4,7 +4,7 @@
  * updates and serve stale messages.
  */
 
-const CACHE = 'slick-shell-v2';
+const CACHE = 'slick-shell-v3';
 const SHELL = [
   './',
   './index.html',
@@ -15,6 +15,7 @@ const SHELL = [
   './js/ui.js',
   './js/mentions.js',
   './js/push.js',
+  './js/vendor/markdown-it.esm.min.mjs',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',

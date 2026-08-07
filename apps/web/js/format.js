@@ -2,10 +2,15 @@
  * Turning message text into safe HTML, plus the small formatting helpers the
  * UI leans on.
  *
- * Everything is escaped *before* any markup is generated, and the only tags
- * ever produced are the ones written here — message text can never inject
- * HTML.
+ * Rendering is delegated to markdown-it (vendored as a single dependency-free
+ * ESM build under ./vendor — this app has no bundler, so an npm-installed
+ * copy would not be loadable). `html: false` means raw HTML in a message is
+ * always escaped rather than parsed, so message text can never inject
+ * arbitrary markup; the one addition on top of stock markdown-it is the
+ * @mention inline rule below.
  */
+
+import MarkdownIt from './vendor/markdown-it.esm.min.mjs';
 
 export function escapeHtml(text) {
   return String(text)
@@ -16,56 +21,47 @@ export function escapeHtml(text) {
     .replace(/'/g, '&#39;');
 }
 
-const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/g;
+/** @mentions aren't standard markdown, so they get their own inline rule. */
+function mentionPlugin(md) {
+  md.inline.ruler.after('emphasis', 'mention', (state, silent) => {
+    const start = state.pos;
+    if (state.src.charCodeAt(start) !== 0x40 /* @ */) return false;
+    const prev = start > 0 ? state.src[start - 1] : '';
+    if (prev && !/[\s(]/.test(prev)) return false;
+    const match = /^@([a-z0-9][a-z0-9._-]*)/i.exec(state.src.slice(start));
+    if (!match) return false;
+    if (!silent) state.push('mention', '', 0).content = match[1];
+    state.pos += match[0].length;
+    return true;
+  });
+  md.renderer.rules.mention = (tokens, idx) =>
+    `<span class="mention">@${md.utils.escapeHtml(tokens[idx].content)}</span>`;
+}
+
+const md = new MarkdownIt({
+  html: false,
+  linkify: true,
+  breaks: true, // one Enter in the composer should read as a line break, not a new paragraph
+});
+md.use(mentionPlugin);
+
+// Bare and [text](url) links both go through link_open — force them to open
+// in a new tab without leaking a referrer.
+const defaultLinkOpen =
+  md.renderer.rules.link_open ?? ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx].attrSet('target', '_blank');
+  tokens[idx].attrSet('rel', 'noreferrer noopener');
+  return defaultLinkOpen(tokens, idx, options, env, self);
+};
 
 /**
- * A deliberately small markdown: fenced and inline code, bold, italic,
- * strikethrough, blockquotes, links and @mentions. Newlines survive because
- * the container is `white-space: pre-wrap`.
+ * Markdown for chat: headings, ordered/unordered lists, tables, blockquotes,
+ * fenced/inline code, bold/italic/strikethrough, rules, autolinked URLs, and
+ * @mentions.
  */
 export function renderText(raw) {
-  // \u0000-delimited placeholders, stripped from the input first so no
-  // message can forge one.
-  const source = String(raw ?? '').split('\u0000').join('');
-  /** @type {string[]} */
-  const blocks = [];
-
-  // Pull fenced code out first so nothing inside it gets formatted.
-  let text = source.replace(/```([a-z0-9+-]*)\n?([\s\S]*?)```/gi, (_, _lang, code) => {
-    blocks.push(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
-    return `\u0000BLOCK${blocks.length - 1}\u0000`;
-  });
-
-  text = escapeHtml(text);
-
-  /** @type {string[]} */
-  const inline = [];
-  const keep = (html) => {
-    inline.push(html);
-    return `\u0000INLINE${inline.length - 1}\u0000`;
-  };
-
-  text = text.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${code}</code>`));
-  text = text.replace(URL_RE, (url) => {
-    const trimmed = url.replace(/[.,;:!?]+$/, '');
-    const tail = url.slice(trimmed.length);
-    return keep(`<a href="${trimmed}" target="_blank" rel="noreferrer noopener">${trimmed}</a>`) + tail;
-  });
-  text = text.replace(/(^|[\s(])@([a-z0-9][a-z0-9._-]*)/gi, (_, pre, name) =>
-    `${pre}${keep(`<span class="mention">@${name}</span>`)}`
-  );
-
-  text = text
-    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])[*_]([^*_\n]+)[*_](?=[\s).,!?]|$)/g, '$1<em>$2</em>')
-    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
-    .replace(/^&gt; ?(.*)$/gm, '<blockquote>$1</blockquote>');
-
-  text = text.replace(/\u0000INLINE(\d+)\u0000/g, (_, i) => inline[Number(i)]);
-  // The container is pre-wrap, so the newlines that surrounded a fenced block
-  // would otherwise show up as blank lines on top of the block’s own margin.
-  text = text.replace(/\n*\u0000BLOCK(\d+)\u0000\n*/g, (_, i) => blocks[Number(i)]);
-  return text;
+  return md.render(String(raw ?? ''));
 }
 
 /** Highlight search terms in an already-escaped snippet. */

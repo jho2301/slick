@@ -123,8 +123,9 @@ slick agent post "$KEY" "PR #412 is up" --meta '{"pr":412,"status":"green"}' --j
 Your messages are stamped with your history key, which is how `pull` knows not
 to hand them back to you.
 
-Text supports light markdown in the desktop app: `**bold**`, `` `code` ``,
-```` ```fenced blocks``` ````, `> quotes`, links, and `@mentions`.
+Text supports markdown in the desktop app: `**bold**`, `` `code` ``,
+```` ```fenced blocks``` ````, `> quotes`, `# headings`, `- lists`, `1. lists`,
+tables, `---` rules, links, and `@mentions`.
 
 ## 5. Remember why you were doing something
 

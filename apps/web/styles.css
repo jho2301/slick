@@ -444,9 +444,10 @@ button { cursor: pointer; }
 .msg__body {
   word-wrap: break-word;
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
 }
-.msg__body p { margin: 0; }
+.msg__body > :first-child { margin-top: 0; }
+.msg__body > :last-child { margin-bottom: 0; }
+.msg__body p { margin: 0.3em 0; }
 .msg__body code {
   font-family: var(--mono);
   font-size: 0.87em;
@@ -475,6 +476,40 @@ button { cursor: pointer; }
   border-left: 3px solid var(--line);
   color: var(--fg-dim);
 }
+.msg__body h1, .msg__body h2, .msg__body h3,
+.msg__body h4, .msg__body h5, .msg__body h6 {
+  margin: 0.5em 0 0.3em;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.msg__body h1 { font-size: 1.35em; }
+.msg__body h2 { font-size: 1.2em; }
+.msg__body h3 { font-size: 1.08em; }
+.msg__body h4, .msg__body h5, .msg__body h6 { font-size: 1em; }
+.msg__body ul, .msg__body ol {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+}
+.msg__body li { margin: 0.15em 0; }
+.msg__body li > p { margin: 0; }
+.msg__body hr {
+  margin: 0.6em 0;
+  border: none;
+  border-top: 1px solid var(--line);
+}
+.msg__body table {
+  display: block;
+  overflow-x: auto;
+  margin: 0.4em 0;
+  border-collapse: collapse;
+  font-size: 0.94em;
+}
+.msg__body th, .msg__body td {
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  text-align: left;
+}
+.msg__body th { background: var(--bg-sunk); font-weight: 700; }
 .mention {
   background: var(--accent-soft);
   color: var(--accent);
