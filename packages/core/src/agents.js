@@ -431,6 +431,26 @@ export function createAgentService(ctx) {
     return post(ref, { ...input, threadId: rootId });
   }
 
+  /**
+   * An ephemeral "working on it" signal for the UI — not part of the durable
+   * conversation, so it never shows up in `pull`/`resume`. The daemon's live
+   * stream carries it straight through like any other event.
+   * @param {string} ref
+   * @param {{on: boolean, threadId?: string|null, channelId?: string|null, agentId?: string}} [input]
+   */
+  function typing(ref, input = {}) {
+    const session = get(ref, input);
+    recordEvent(db, {
+      type: EVENT_TYPES.agentTyping,
+      actor: { id: session.agentId, kind: 'agent' },
+      channelId: input.channelId ?? session.channelId,
+      threadId: input.threadId ?? null,
+      sessionKey: session.key,
+      payload: { on: Boolean(input.on) },
+    });
+    return { ok: true };
+  }
+
   function end(ref, opts = {}) {
     return transact(db, () => {
       const session = get(ref, opts);
@@ -463,6 +483,7 @@ export function createAgentService(ctx) {
     update,
     post,
     reply,
+    typing,
     end,
     remove,
     pendingCount,

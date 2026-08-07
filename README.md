@@ -146,6 +146,8 @@ unreachable, `1` everything else.
   messages inline.
 - `⌘K` jumps between channels and searches messages in the same box.
 - Live updates over SSE — including changes made by the CLI while you watch.
+- A "claude is typing…" indicator, on the message and in its thread, while
+  `slick agent serve` is waiting on a reply.
 - Light and dark, following the system.
 
 ## Where things are
@@ -181,7 +183,7 @@ it over HTTP; the app calls the server. There is exactly one implementation of
 ## Tests
 
 ```bash
-npm test              # 71 tests: core, HTTP API, and the CLI end to end
+npm test              # 73 tests: core, HTTP API, and the CLI end to end
 npm run smoke:ui      # loads the real UI in Electron and drives it
 npm run shots         # screenshots of the UI into $SLICK_HOME/shots
 ```

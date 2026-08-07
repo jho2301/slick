@@ -14,7 +14,7 @@ export const RAW = Symbol('raw');
 
 const CREATED = (body) => ({ status: 201, body });
 
-export function createRoutes({ ws, hub, version }) {
+export function createRoutes({ ws, hub, push, version }) {
   const router = createRouter();
   const r = router.add;
 
@@ -162,7 +162,17 @@ export function createRoutes({ ws, hub, version }) {
     CREATED(ws.agents.post(params.ref, body))
   );
 
+  r('POST /api/agents/sessions/:ref/typing', ({ params, body }) => ws.agents.typing(params.ref, body));
+
   r('POST /api/agents/sessions/:ref/end', ({ params }) => ({ session: ws.agents.end(params.ref) }));
+
+  // -------------------------------------------------------------- push ---
+
+  r('GET /api/push/vapid-public-key', () => ({ publicKey: push.publicKey }));
+
+  r('POST /api/push/subscribe', ({ body }) => push.subscribe(body));
+
+  r('POST /api/push/unsubscribe', ({ body }) => push.unsubscribe(body.endpoint));
 
   return router;
 }

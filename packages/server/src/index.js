@@ -14,6 +14,7 @@ import { Workspace } from '@slick/core';
 
 import { createRoutes, RAW } from './routes.js';
 import { createHub } from './hub.js';
+import { createPushService } from './push.js';
 import { createStaticHandler, resolveWebRoot } from './static.js';
 import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.js';
 
@@ -29,7 +30,7 @@ export function newToken() {
  * @param {{
  *   workspace?: Workspace, home?: string, file?: string,
  *   token?: string|null, webRoot?: string|null, host?: string,
- *   trustedHosts?: string[],
+ *   trustedHosts?: string[], push?: ReturnType<typeof createPushService>,
  * }} [opts]
  */
 export function createServer(opts = {}) {
@@ -39,8 +40,9 @@ export function createServer(opts = {}) {
   const trustedHosts = new Set((opts.trustedHosts ?? []).map((h) => h.toLowerCase()));
   const token = opts.token === null ? null : (opts.token ?? newToken());
   const webRoot = opts.webRoot === null ? null : resolveWebRoot(opts.webRoot);
-  const hub = createHub(ws);
-  const router = createRoutes({ ws, hub, version: VERSION });
+  const push = opts.push ?? createPushService(ws);
+  const hub = createHub(ws, { push });
+  const router = createRoutes({ ws, hub, push, version: VERSION });
   const serveStatic = createStaticHandler(webRoot);
 
   function authenticate(req, url) {
@@ -168,7 +170,7 @@ export function createServer(opts = {}) {
     });
   }
 
-  return { server, ws, hub, token, webRoot, host, listen, close };
+  return { server, ws, hub, push, token, webRoot, host, listen, close };
 }
 
 function safeEqual(a, b) {
@@ -188,4 +190,4 @@ code{background:#f4f4f5;padding:.15em .4em;border-radius:4px;font-size:.9em}</st
 <p><code>slick app</code></p>
 <p>…or copy the URL printed by <code>slick daemon status</code>.</p>`;
 
-export { createHub, resolveWebRoot };
+export { createHub, createPushService, resolveWebRoot };

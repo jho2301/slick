@@ -285,6 +285,29 @@ describe('agent sessions', () => {
     assert.equal(message.parentId, root.id);
     assert.equal(ws.messages.thread(root.id).replies.length, 1);
   });
+
+  test('typing is a live signal, not part of the conversation an agent resumes into', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    const root = ws.messages.post({ channel: 'general', text: '@claude are you there?' });
+
+    ws.agents.typing(session.key, { on: true, threadId: root.id, channelId: root.channelId });
+    ws.agents.typing(session.key, { on: false, threadId: root.id, channelId: root.channelId });
+
+    const typingEvents = ws.events().filter((e) => e.type === 'agent.typing');
+    assert.equal(typingEvents.length, 2);
+    assert.equal(typingEvents[0].payload.on, true);
+    assert.equal(typingEvents[0].threadId, root.id);
+    assert.equal(typingEvents[0].actor.id, 'claude');
+    assert.equal(typingEvents[1].payload.on, false);
+
+    // Another session resuming should never see typing blips as unread work.
+    const other = ws.agents.start({ agentId: 'watcher', channel: 'general' });
+    const resumed = ws.agents.resume(other.key);
+    assert.ok(
+      resumed.missed.every((e) => e.type !== 'agent.typing'),
+      'typing must not show up as something to handle'
+    );
+  });
 });
 
 describe('search', () => {

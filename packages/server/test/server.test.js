@@ -5,7 +5,11 @@ import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { Workspace } from '@slick/core';
 import { createServer } from '../src/index.js';
+import { createPushService } from '../src/push.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const TOKEN = 'test-token-abc';
 
@@ -196,6 +200,134 @@ describe('agent sessions over HTTP', () => {
     const res = await call('POST', '/api/agents/sessions/slk_h1_00000000000000000000/resume', {});
     assert.equal(res.status, 404);
     assert.equal(res.body.error.code, 'unknown_history_key');
+  });
+
+  test('typing is a live signal that never shows up as something to resume', async () => {
+    const started = await call('POST', '/api/agents/sessions', { agentId: 'typer', channel: 'general' });
+    const key = started.body.session.key;
+    const root = await call('POST', '/api/channels/general/messages', { text: '@typer you there?' });
+    const rootId = root.body.message.id;
+
+    const on = await call('POST', `/api/agents/sessions/${key}/typing`, {
+      on: true,
+      threadId: rootId,
+      channelId: root.body.message.channelId,
+    });
+    assert.equal(on.status, 200);
+    await call('POST', `/api/agents/sessions/${key}/typing`, { on: false, threadId: rootId });
+
+    const events = await call('GET', '/api/events?since=0');
+    const typingEvents = events.body.events.filter((e) => e.type === 'agent.typing');
+    assert.equal(typingEvents.length, 2);
+    assert.equal(typingEvents[0].payload.on, true);
+    assert.equal(typingEvents[0].threadId, rootId);
+
+    const resumed = await call('POST', `/api/agents/sessions/${key}/resume`, {});
+    assert.ok(resumed.body.missed.every((e) => e.type !== 'agent.typing'));
+  });
+});
+
+describe('push notifications', () => {
+  // Its own server + workspace, with a fake `webpush` swapped in — real
+  // delivery always speaks TLS regardless of the endpoint's scheme, so a
+  // fake HTTP push endpoint can't stand in for it. This still exercises the
+  // real subscribe/unsubscribe/prune logic in push.js and the real
+  // agent-vs-human filtering in hub.js; only the actual network hop is fake.
+  let pushHome;
+  let pushApp;
+  let pushBase;
+  let calls;
+  const PUSH_TOKEN = 'push-test-token';
+
+  before(async () => {
+    pushHome = mkdtempSync(join(tmpdir(), 'slick-server-push-'));
+    calls = [];
+    const fakeWebpush = {
+      generateVAPIDKeys: () => ({ publicKey: 'fake-public-key', privateKey: 'fake-private-key' }),
+      setVapidDetails: () => {},
+      sendNotification: (sub, payload) => {
+        calls.push({ endpoint: sub.endpoint, payload: JSON.parse(payload) });
+        if (sub.endpoint.endsWith('/gone')) {
+          const err = new Error('subscription expired');
+          err.statusCode = 410;
+          return Promise.reject(err);
+        }
+        return Promise.resolve();
+      },
+    };
+    const workspace = Workspace.open({ home: pushHome });
+    const push = createPushService(workspace, fakeWebpush);
+    pushApp = createServer({ workspace, token: PUSH_TOKEN, push });
+    const bound = await pushApp.listen(0);
+    pushBase = bound.url;
+  });
+
+  after(async () => {
+    await pushApp.close();
+    rmSync(pushHome, { recursive: true, force: true });
+  });
+
+  async function pushCall(method, path, body) {
+    const res = await fetch(`${pushBase}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${PUSH_TOKEN}`,
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const text = await res.text();
+    return { status: res.status, body: text ? JSON.parse(text) : null };
+  }
+
+  test('hands out the VAPID public key from the injected push service', async () => {
+    const res = await pushCall('GET', '/api/push/vapid-public-key');
+    assert.equal(res.status, 200);
+    assert.equal(res.body.publicKey, 'fake-public-key');
+  });
+
+  test('a human message does not notify anyone, an agent message does', async () => {
+    await pushCall('POST', '/api/push/subscribe', { endpoint: 'https://push.example/one', keys: {} });
+
+    calls.length = 0;
+    await pushCall('POST', '/api/channels/general/messages', { text: 'a human, not pushed' });
+    await sleep(50);
+    assert.equal(calls.length, 0, 'human messages do not page anyone');
+
+    const started = await pushCall('POST', '/api/agents/sessions', { agentId: 'pushbot', channel: 'general' });
+    const key = started.body.session.key;
+    await pushCall('POST', `/api/agents/sessions/${key}/messages`, { text: 'an agent reply, pushed' });
+    await sleep(50);
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].endpoint, 'https://push.example/one');
+    assert.equal(calls[0].payload.body, 'an agent reply, pushed');
+
+    await pushCall('POST', '/api/push/unsubscribe', { endpoint: 'https://push.example/one' });
+  });
+
+  test('a subscription the push service reports gone is pruned and not retried', async () => {
+    await pushCall('POST', '/api/push/subscribe', { endpoint: 'https://push.example/gone', keys: {} });
+    await pushCall('POST', '/api/push/subscribe', { endpoint: 'https://push.example/still-good', keys: {} });
+
+    calls.length = 0;
+    const first = await pushCall('POST', '/api/agents/sessions', { agentId: 'pruner', channel: 'general' });
+    await pushCall('POST', `/api/agents/sessions/${first.body.session.key}/messages`, { text: 'round one' });
+    await sleep(50);
+    assert.deepEqual(
+      calls.map((c) => c.endpoint).sort(),
+      ['https://push.example/gone', 'https://push.example/still-good']
+    );
+
+    calls.length = 0;
+    const second = await pushCall('POST', '/api/agents/sessions', { agentId: 'pruner2', channel: 'general' });
+    await pushCall('POST', `/api/agents/sessions/${second.body.session.key}/messages`, { text: 'round two' });
+    await sleep(50);
+    assert.deepEqual(
+      calls.map((c) => c.endpoint),
+      ['https://push.example/still-good'],
+      'the gone subscription was dropped after its first 410'
+    );
   });
 });
 

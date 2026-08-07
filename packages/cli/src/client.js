@@ -72,6 +72,7 @@ class RemoteWorkspace {
       post: (ref, input) => call('POST', `/api/agents/sessions/${enc(ref)}/messages`, input),
       reply: (ref, rootId, input) =>
         call('POST', `/api/agents/sessions/${enc(ref)}/messages`, { ...input, threadId: rootId }),
+      typing: (ref, input) => call('POST', `/api/agents/sessions/${enc(ref)}/typing`, input),
       end: (ref) => call('POST', `/api/agents/sessions/${enc(ref)}/end`).then((r) => r.session),
       remove: (ref) => call('DELETE', `/api/agents/sessions/${enc(ref)}`).then((r) => r.session),
     };

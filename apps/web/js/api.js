@@ -134,6 +134,18 @@ export class Api {
     return this.get('/api/agents/sessions?includeEnded=1').then((r) => r.sessions);
   }
 
+  pushVapidKey() {
+    return this.get('/api/push/vapid-public-key').then((r) => r.publicKey);
+  }
+
+  pushSubscribe(subscription) {
+    return this.post('/api/push/subscribe', subscription);
+  }
+
+  pushUnsubscribe(endpoint) {
+    return this.post('/api/push/unsubscribe', { endpoint });
+  }
+
   /**
    * Live events. Reconnects on its own; `Last-Event-ID` means a dropped
    * connection resumes exactly where it stopped, so nothing is missed. Pass

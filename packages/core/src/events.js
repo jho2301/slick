@@ -22,6 +22,7 @@ export const EVENT_TYPES = Object.freeze({
   sessionUpdated: 'agent.session.updated',
   sessionResumed: 'agent.session.resumed',
   sessionEnded: 'agent.session.ended',
+  agentTyping: 'agent.typing',
 });
 
 /** Events an agent cares about when catching up on a conversation. */

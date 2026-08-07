@@ -166,17 +166,28 @@ export async function serve(ws, ref, ctx) {
         continue;
       }
 
-      const result = await callAgent({
-        cmd,
-        prompt,
-        resumeId: claudeSessionId,
-        permissionMode: flags['permission-mode'],
-        allowedTools: flags['allowed-tools'],
-        skipPermissions: Boolean(flags['dangerously-skip-permissions']),
-        model: flags.model,
-        appendSystemPrompt: flags['append-system-prompt'],
-        timeoutMs,
-      });
+      const typingOpts = {
+        agentId: ctx.agentId,
+        threadId: event.message.threadId,
+        channelId: event.message.channelId,
+      };
+      await ws.agents.typing(ref, { ...typingOpts, on: true });
+      let result;
+      try {
+        result = await callAgent({
+          cmd,
+          prompt,
+          resumeId: claudeSessionId,
+          permissionMode: flags['permission-mode'],
+          allowedTools: flags['allowed-tools'],
+          skipPermissions: Boolean(flags['dangerously-skip-permissions']),
+          model: flags.model,
+          appendSystemPrompt: flags['append-system-prompt'],
+          timeoutMs,
+        });
+      } finally {
+        await ws.agents.typing(ref, { ...typingOpts, on: false });
+      }
 
       if (result.sessionId) claudeSessionId = result.sessionId;
 

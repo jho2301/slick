@@ -30,10 +30,15 @@ import {
   openModal,
   toast,
 } from './ui.js';
+import { createMentionMenu } from './mentions.js';
+import { currentSubscription, disablePush, enablePush, pushSupported } from './push.js';
 
 const api = new Api();
 const LAST_CHANNEL_KEY = 'slick.channel';
 const GROUP_WINDOW_MS = 5 * 60 * 1000;
+// A stuck "on" with no matching "off" (the agent process died mid-call)
+// should not leave the indicator spinning forever.
+const TYPING_TIMEOUT_MS = 5 * 60 * 1000;
 
 const state = {
   workspace: null,
@@ -47,6 +52,8 @@ const state = {
   unread: new Map(),
   editing: null,
   atBottom: true,
+  /** threadId -> Map<agentId, timeout handle> */
+  typing: new Map(),
   seq: 0,
 };
 
@@ -110,6 +117,33 @@ function threadSummary(message) {
   );
 }
 
+const typingDots = () => el('span', { class: 'typing-dots' }, el('span'), el('span'), el('span'));
+
+function typingLabel(agentIds) {
+  return `${agentIds.join(', ')} ${agentIds.length === 1 ? 'is' : 'are'} typing`;
+}
+
+/** The little pill under a channel-row message, in place of the reply count while an agent works on it. */
+function typingChip(agentIds, threadId) {
+  return el(
+    'button',
+    { class: 'msg__thread msg__thread--typing', onclick: () => openThread(threadId) },
+    el('span', { class: 'stack' }, agentIds.map((id) => avatar({ id, label: id, kind: 'agent' }))),
+    typingLabel(agentIds),
+    typingDots()
+  );
+}
+
+/** A transient row at the bottom of an open thread, styled like a message. */
+function typingBubble(agentIds) {
+  return el(
+    'div',
+    { class: 'msg is-typing' },
+    el('div', { class: 'msg__gutter' }, agentIds.map((id) => avatar({ id, label: id, kind: 'agent' }))),
+    el('div', {}, el('div', { class: 'msg__body msg__body--typing' }, typingLabel(agentIds), typingDots()))
+  );
+}
+
 /**
  * One message row. `previous` decides whether it is visually grouped under
  * the message above it.
@@ -151,7 +185,11 @@ function messageRow(message, previous, opts = {}) {
     }
   }
 
-  if (!opts.inThread && message.replyCount > 0) main.append(threadSummary(message));
+  if (!opts.inThread) {
+    const typers = typingAgents(message.threadId);
+    if (typers.length > 0) main.append(typingChip(typers, message.threadId));
+    else if (message.replyCount > 0) main.append(threadSummary(message));
+  }
 
   row.append(main);
   if (!message.deleted) row.append(messageActions(message, { inThread: opts.inThread }));
@@ -243,6 +281,27 @@ function dropMessage(id) {
 
 // ------------------------------------------------------------------ rail ---
 
+/**
+ * The narrow-viewport rail is an off-canvas drawer. Opening it pushes a
+ * history entry so the phone's physical/gesture back button closes the
+ * drawer instead of leaving the app; every other way of closing it (the
+ * scrim, picking a channel, Escape) just plays that back-navigation itself
+ * so the history stack never grows a trail of stale "drawer" entries.
+ */
+function openRail() {
+  if ($('#app').classList.contains('rail-open')) return;
+  $('#app').classList.add('rail-open');
+  $('#scrim').hidden = false;
+  history.pushState({ rail: true }, '');
+}
+
+function closeRail({ viaPopstate = false } = {}) {
+  if (!$('#app').classList.contains('rail-open')) return;
+  $('#app').classList.remove('rail-open');
+  $('#scrim').hidden = true;
+  if (!viaPopstate && history.state?.rail) history.back();
+}
+
 function renderRail() {
   const active = state.channels.filter((c) => !c.archived);
   const archived = state.channels.filter((c) => c.archived);
@@ -323,6 +382,21 @@ function renderAgents() {
   }
 }
 
+/** Known agents for the `@mention` picker: one entry per agent id, most recently active first. */
+function agentSuggestions() {
+  const byId = new Map();
+  for (const session of state.sessions) {
+    const current = byId.get(session.agentId);
+    if (!current || (session.lastSeenAt ?? 0) > (current.lastSeenAt ?? 0)) byId.set(session.agentId, session);
+  }
+  return [...byId.values()]
+    .sort((a, b) => (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0))
+    .map((session) => ({
+      id: session.agentId,
+      hint: session.channelSlug ? `#${session.channelSlug} · ${ago(session.lastSeenAt)}` : ago(session.lastSeenAt),
+    }));
+}
+
 function renderChannelHeader() {
   const channel = state.current;
   $('#chan-title').textContent = channel ? `#${channel.slug}` : 'Slick';
@@ -360,7 +434,7 @@ async function selectChannel(ref, { flash } = {}) {
   await loadMessages();
   scrollToBottom(true);
   if (flash) flashMessage(flash);
-  $('#app').classList.remove('rail-open');
+  closeRail();
 }
 
 async function loadMessages() {
@@ -541,6 +615,8 @@ function renderThread() {
     host.append(messageRow(reply, previous, { inThread: true }));
     previous = reply;
   }
+  const typers = typingAgents(root.id);
+  if (typers.length > 0) host.append(typingBubble(typers));
   host.scrollTop = host.scrollHeight;
 }
 
@@ -671,6 +747,33 @@ function bumpUnread(channelId) {
   renderRail();
 }
 
+function typingAgents(threadId) {
+  return [...(state.typing.get(threadId)?.keys() ?? [])];
+}
+
+/** `off` normally arrives from the agent itself; the timeout is only a backstop for a process that died mid-call. */
+function setTyping(threadId, agentId, on) {
+  let entry = state.typing.get(threadId);
+  if (on) {
+    if (!entry) {
+      entry = new Map();
+      state.typing.set(threadId, entry);
+    }
+    clearTimeout(entry.get(agentId));
+    entry.set(
+      agentId,
+      setTimeout(() => setTyping(threadId, agentId, false), TYPING_TIMEOUT_MS)
+    );
+  } else if (entry) {
+    clearTimeout(entry.get(agentId));
+    entry.delete(agentId);
+    if (entry.size === 0) state.typing.delete(threadId);
+  }
+  const message = state.editing === threadId ? null : state.messages.find((m) => m.id === threadId);
+  if (message) patchMessage(message);
+  if (state.thread?.root.id === threadId) renderThread();
+}
+
 async function handleEvent(event) {
   if (event.type === 'stream.ready') {
     state.seq = event.seq;
@@ -741,6 +844,12 @@ async function handleEvent(event) {
           renderThread();
         }
       }
+      return;
+    }
+
+    case 'agent.typing': {
+      if (!event.threadId) return;
+      setTyping(event.threadId, event.actor?.id ?? 'agent', Boolean(event.payload?.on));
       return;
     }
 
@@ -876,15 +985,17 @@ function fail(err, fallback) {
   if (!(err instanceof ApiError)) console.error(err);
 }
 
-function wireComposer(inputId, formId, buttonId, submit) {
+function wireComposer(inputId, formId, buttonId, submit, menuId) {
   const input = $(inputId);
   const button = $(buttonId);
   const resize = autosize(input);
+  const mentions = menuId ? createMentionMenu(input, $(menuId), agentSuggestions) : null;
   const sync = () => {
     button.disabled = input.value.trim().length === 0 || input.disabled;
   };
   input.addEventListener('input', sync);
   input.addEventListener('keydown', (event) => {
+    if (mentions?.handleKeydown(event)) return;
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       $(formId).requestSubmit();
@@ -894,6 +1005,7 @@ function wireComposer(inputId, formId, buttonId, submit) {
     event.preventDefault();
     const text = input.value;
     if (!text.trim()) return;
+    mentions?.close();
     input.value = '';
     resize();
     sync();
@@ -905,8 +1017,8 @@ function wireComposer(inputId, formId, buttonId, submit) {
 function wire() {
   initModal();
 
-  const syncMain = wireComposer('#composer-input', '#composer', '#btn-send', send);
-  wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply);
+  const syncMain = wireComposer('#composer-input', '#composer', '#btn-send', send, '#mention-menu-main');
+  wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply, '#mention-menu-thread');
 
   $('#btn-new-channel').addEventListener('click', createChannel);
   $('#btn-edit-channel').addEventListener('click', editChannel);
@@ -914,8 +1026,15 @@ function wire() {
   $('#btn-delete-channel').addEventListener('click', deleteChannel);
   $('#btn-close-thread').addEventListener('click', closeThread);
   $('#btn-search').addEventListener('click', openPalette);
+  $('#btn-notifications').addEventListener('click', toggleNotifications);
   $('#btn-jump').addEventListener('click', () => scrollToBottom(true));
-  $('#btn-menu').addEventListener('click', () => $('#app').classList.toggle('rail-open'));
+  $('#btn-menu').addEventListener('click', () => {
+    $('#app').classList.contains('rail-open') ? closeRail() : openRail();
+  });
+  $('#scrim').addEventListener('click', () => closeRail());
+  window.addEventListener('popstate', (event) => {
+    if (!event.state?.rail) closeRail({ viaPopstate: true });
+  });
   $('#chan-topic').addEventListener('click', editChannel);
 
   for (const [button, list] of [
@@ -971,6 +1090,7 @@ function wire() {
     } else if (event.key === 'Escape') {
       if (palette.open) closePalette();
       else if (state.thread) closeThread();
+      else if ($('#app').classList.contains('rail-open')) closeRail();
     }
   });
 
@@ -980,6 +1100,44 @@ function wire() {
   });
 
   syncMain();
+}
+
+// ------------------------------------------------------------ notifications ---
+
+async function syncNotificationButton() {
+  const btn = $('#btn-notifications');
+  if (!pushSupported()) {
+    btn.hidden = true;
+    return;
+  }
+  btn.hidden = false;
+  const subscription = await currentSubscription().catch(() => null);
+  const on = Boolean(subscription) && Notification.permission === 'granted';
+  btn.classList.toggle('is-active', on);
+  btn.setAttribute('aria-pressed', String(on));
+  const label = on ? 'Notifications on — click to turn off' : 'Enable notifications';
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+}
+
+async function toggleNotifications() {
+  const btn = $('#btn-notifications');
+  const subscription = await currentSubscription().catch(() => null);
+  btn.disabled = true;
+  try {
+    if (subscription) {
+      await disablePush(api);
+      toast('Notifications turned off');
+    } else {
+      await enablePush(api);
+      toast('Notifications on — you will get a ping when an agent replies');
+    }
+  } catch (err) {
+    toast(err.message || 'Could not change notification settings', 'error');
+  } finally {
+    btn.disabled = false;
+    await syncNotificationButton();
+  }
 }
 
 function setConnection(status) {
@@ -1024,6 +1182,7 @@ async function boot() {
   }
 
   $('#app').classList.remove('is-loading');
+  syncNotificationButton();
 
   api.stream({
     since: () => state.seq,

@@ -13,7 +13,8 @@
     "slickd": "./bin/slickd.js"
   },
   "dependencies": {
-    "@slick/core": "0.1.0"
+    "@slick/core": "0.1.0",
+    "web-push": "^3.6.7"
   },
   "engines": {
     "node": ">=22.5.0"

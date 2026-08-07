@@ -15,20 +15,43 @@ const HEARTBEAT_MS = 20_000;
 export function createHub(ws, opts = {}) {
   const activePoll = opts.activePollMs ?? ACTIVE_POLL_MS;
   const idlePoll = opts.idlePollMs ?? IDLE_POLL_MS;
+  const push = opts.push ?? null;
   /** @type {Set<{res: import('node:http').ServerResponse, cursor: number, channelId: string|null}>} */
   const clients = new Set();
   let timer = null;
   let heartbeat = null;
   let closed = false;
+  // Independent of any connected browser tab — the whole point of a push
+  // notification is to reach a phone that has no tab open at all.
+  let notifiedCursor = ws.seq();
 
   function write(client, event) {
     if (client.channelId && event.channelId && event.channelId !== client.channelId) return;
     client.res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
   }
 
+  function checkPush(latest) {
+    if (!push || latest <= notifiedCursor) return;
+    const events = ws.hydratedEvents({ since: notifiedCursor, limit: 200 });
+    notifiedCursor = latest;
+    for (const event of events) {
+      if (event.type !== 'message.created' || event.message?.author?.kind !== 'agent') continue;
+      const message = event.message;
+      push
+        .notify({
+          title: message.channelSlug ? `${message.author.label} in #${message.channelSlug}` : message.author.label,
+          body: message.text,
+          url: './',
+          tag: message.threadId,
+        })
+        .catch((err) => console.error('[slick] push notify failed:', err.message));
+    }
+  }
+
   function flush() {
-    if (clients.size === 0) return;
     const latest = ws.seq();
+    checkPush(latest);
+    if (clients.size === 0) return;
     for (const client of clients) {
       if (client.cursor >= latest) continue;
       let cursor = client.cursor;

@@ -27,6 +27,16 @@
               <div class="rail__user" id="workspace-user"></div>
             </div>
           </div>
+          <button
+            class="icon-btn icon-btn--ghost"
+            id="btn-notifications"
+            title="Enable notifications"
+            aria-label="Enable notifications"
+            aria-pressed="false"
+            hidden
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2a1.5 1.5 0 00-1.5 1.5v.6C6 4.8 4.5 6.9 4.5 9.5V13L3 15v1h14v-1l-1.5-2V9.5c0-2.6-1.5-4.7-4-5.4v-.6A1.5 1.5 0 0010 2zm0 16a2 2 0 002-2H8a2 2 0 002 2z"/></svg>
+          </button>
           <button class="icon-btn icon-btn--ghost" id="btn-search" title="Search (⌘K)" aria-label="Search">
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9 3a6 6 0 104.47 10.03l3.25 3.25 1.06-1.06-3.25-3.25A6 6 0 009 3zm0 1.5a4.5 4.5 0 110 9 4.5 4.5 0 010-9z"/></svg>
           </button>
@@ -86,6 +96,7 @@
 
         <form class="composer" id="composer">
           <div class="composer__box">
+            <ul class="mention-menu" id="mention-menu-main" hidden></ul>
             <textarea
               id="composer-input"
               class="composer__input"
@@ -117,6 +128,7 @@
         <div class="thread__scroll" id="thread-body"></div>
         <form class="composer composer--thread" id="thread-composer">
           <div class="composer__box">
+            <ul class="mention-menu" id="mention-menu-thread" hidden></ul>
             <textarea id="thread-input" class="composer__input" rows="1" placeholder="Reply…"></textarea>
             <div class="composer__row">
               <span class="composer__hint">Replying in thread</span>
