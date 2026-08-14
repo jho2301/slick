@@ -140,7 +140,9 @@ Serving
   --allowed-tools <tools>        passed through to claude as --allowedTools
   --dangerously-skip-permissions passed through to claude
   --model <name>                 passed through to claude
-  --timeout <ms>                 kill the child if it runs this long (default 10m)`,
+  --timeout <ms>                 kill the child if it runs this long (default 10m)
+  --max-attempts <n>             give up on a message after n failures (default 3)
+  --no-lock                      allow a second watcher on the same session key`,
   spec: {
     booleans: [
       'peek',

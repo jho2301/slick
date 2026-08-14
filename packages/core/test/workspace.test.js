@@ -384,6 +384,28 @@ describe('agent sessions', () => {
     assert.deepEqual(ws.agents.get(session.key).state, { only: true });
   });
 
+  test('polling costs nothing: an idle resume and an unchanged state write no events', () => {
+    const session = ws.agents.start({ agentId: 'claude', name: 'poller', channel: 'general' });
+    ws.agents.pull(session.key); // catch up so there is genuinely nothing new
+    ws.agents.setState(session.key, { _serveSessionId: 'abc' });
+
+    const start = ws.seq();
+    for (let i = 0; i < 20; i++) {
+      ws.agents.resume(session.key);
+      ws.agents.setState(session.key, { _serveSessionId: 'abc' }); // the same value, again
+    }
+    assert.equal(ws.seq(), start, 'a watcher that finds nothing new is not a writer');
+    assert.equal(ws.agents.get(session.key).resumeCount, 20, 'but the resume is still counted');
+
+    // Real news still lands in the log, for both.
+    ws.messages.post({ channel: 'general', text: 'something to catch up on' });
+    ws.agents.resume(session.key);
+    ws.agents.setState(session.key, { _serveSessionId: 'def' });
+    const types = ws.hydratedEvents({ since: start }).map((e) => e.type);
+    assert.ok(types.includes('agent.session.resumed'), 'a resume with news is recorded');
+    assert.ok(types.includes('agent.session.updated'), 'a state change is recorded');
+  });
+
   test('scoping a session to a channel filters what it sees', () => {
     ws.channels.create({ slug: 'noise' });
     const session = ws.agents.start({ agentId: 'claude', channel: 'general' });

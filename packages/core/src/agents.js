@@ -36,6 +36,16 @@ function parseState(value) {
   }
 }
 
+/** Key-order-independent JSON, so "did this actually change?" has one answer. */
+function stableJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`)
+    .join(',')}}`;
+}
+
 export function createAgentService(ctx) {
   const { db, channels, messages } = ctx;
 
@@ -305,13 +315,19 @@ export function createAgentService(ctx) {
         'UPDATE agent_sessions SET resume_count = resume_count + 1, updated_at = ?, last_seen_at = ? WHERE key = ?'
       ).run(Date.now(), Date.now(), session.key);
 
-      recordEvent(db, {
-        type: EVENT_TYPES.sessionResumed,
-        actor: { id: session.agentId, kind: 'agent' },
-        channelId: session.channelId,
-        sessionKey: session.key,
-        payload: { pending: missed.length },
-      });
+      // `serve` resumes every couple of seconds, and the docs promise resuming
+      // is free. Writing a row for a poll that found nothing made an idle
+      // watcher the busiest writer in the workspace — 200k rows of "nothing
+      // happened". Nothing reads these, so only record an actual catch-up.
+      if (missed.length > 0) {
+        recordEvent(db, {
+          type: EVENT_TYPES.sessionResumed,
+          actor: { id: session.agentId, kind: 'agent' },
+          channelId: session.channelId,
+          sessionKey: session.key,
+          payload: { pending: missed.length },
+        });
+      }
 
       return {
         session: get(session.key),
@@ -355,13 +371,18 @@ export function createAgentService(ctx) {
         });
       }
       const next = opts.merge === false ? value : { ...session.state, ...value };
+      const changed = stableJson(session.state) !== stableJson(next);
       touch(session.key, { state: JSON.stringify(next) });
-      recordEvent(db, {
-        type: EVENT_TYPES.sessionUpdated,
-        actor: { id: session.agentId, kind: 'agent' },
-        sessionKey: session.key,
-        payload: { keys: Object.keys(value) },
-      });
+      // Re-writing the identical object is what a polling loop does on every
+      // pass. That is not a state change and does not belong in the log.
+      if (changed) {
+        recordEvent(db, {
+          type: EVENT_TYPES.sessionUpdated,
+          actor: { id: session.agentId, kind: 'agent' },
+          sessionKey: session.key,
+          payload: { keys: Object.keys(value) },
+        });
+      }
       return get(session.key);
     });
   }

@@ -17,6 +17,19 @@ if (process.env.FAKE_AGENT_FAIL) {
   process.exit(0);
 }
 
+// The real failure that prompted the retry rework: a resumed transcript that
+// has outgrown the request limit fails every time, while a fresh one is fine.
+if (process.env.FAKE_AGENT_OVERSIZED_RESUME && resumed) {
+  process.stdout.write(
+    JSON.stringify({
+      is_error: true,
+      result: "Request too large for the API's 32MB request limit: this conversation cannot continue as is.",
+      session_id: 'fake-session-1',
+    })
+  );
+  process.exit(0);
+}
+
 process.stdout.write(
   JSON.stringify({
     is_error: false,

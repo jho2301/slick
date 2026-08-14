@@ -1,7 +1,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -291,6 +291,76 @@ describe('agent serve', () => {
     const result = await slick(['agent', 'serve', key, '--once', '--all', '--cmd', FAKE_AGENT, '--json']);
     const line = JSON.parse(result.stdout.trim());
     assert.match(line.message.text, /no mention here$/);
+  });
+
+  test('a transcript too big to send retires the session instead of retrying into it', async () => {
+    const before = (await slick(['agent', 'state', 'get', key, '--json'])).json;
+    assert.equal(before.state._serveSessionId, 'fake-session-1', 'a session is saved to resume');
+
+    await slick(['send', 'general', '@claude answer despite the oversized history']);
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_OVERSIZED_RESUME: '1' },
+    });
+
+    assert.match(result.stderr, /Retiring the resumed/);
+    const line = JSON.parse(result.stdout.trim());
+    assert.match(line.message.text, /^echo\(resumed=false\)/, 'answered from a fresh session');
+    assert.match(line.message.text, /oversized history$/, 'and it answered the real message');
+
+    const pulled = (await slick(['agent', 'pull', key, '--json', '--peek'])).json;
+    assert.equal(pulled.events.length, 0, 'the message was consumed, not left to retry forever');
+  });
+
+  test('the id of a failed call is never saved as the session to resume', async () => {
+    await slick(['agent', 'state', 'set', key, '--replace', '{}']);
+    await slick(['send', 'general', '@claude this one fails']);
+    await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_FAIL: '1' },
+    });
+    const state = (await slick(['agent', 'state', 'get', key, '--json'])).json;
+    assert.equal(state.state._serveSessionId, undefined, 'a broken session is not carried into the next run');
+  });
+
+  test('after --max-attempts it says so in the thread and stops blocking the queue', async () => {
+    const result = await slick(
+      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--max-attempts', '1', '--json'],
+      { env: { FAKE_AGENT_FAIL: '1' } }
+    );
+    assert.match(result.stderr, /\(1\/1\)/);
+
+    const thread = (await slick(['read', 'general', '--limit', '20', '--replies', '--json'])).json;
+    const note = thread.messages.find((m) => m.text.includes('could not answer this'));
+    assert.ok(note, 'the failure is visible to the human, not just in stderr');
+    assert.match(note.text, /boom/);
+
+    const pulled = (await slick(['agent', 'pull', key, '--json', '--peek'])).json;
+    assert.ok(
+      !pulled.events.some((e) => e.message?.text?.includes('this one fails')),
+      'the unanswerable message no longer wedges everything behind it'
+    );
+  });
+
+  test('a second watcher on the same session key is refused', async () => {
+    const lock = join(home, `serve-${key}.lock`);
+    writeFileSync(lock, String(process.pid)); // a live pid: the test runner itself
+    try {
+      const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT]);
+      assert.equal(result.code, 5, 'conflict');
+      assert.match(result.stderr, /already watching/);
+      assert.match(result.stderr, new RegExp(String(process.pid)));
+    } finally {
+      rmSync(lock, { force: true });
+    }
+  });
+
+  test('but a lock left behind by a dead process does not', async () => {
+    const lock = join(home, `serve-${key}.lock`);
+    writeFileSync(lock, '2147483646'); // a pid that cannot be running
+    await slick(['send', 'general', '@claude after the crash']);
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json']);
+    assert.equal(result.code, 0);
+    assert.match(JSON.parse(result.stdout.trim()).message.text, /after the crash$/);
+    assert.equal(existsSync(lock), false, 'and the lock is released on the way out');
   });
 });
 
