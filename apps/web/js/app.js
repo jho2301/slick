@@ -43,6 +43,9 @@ const TYPING_TIMEOUT_MS = 5 * 60 * 1000;
 const state = {
   workspace: null,
   channels: [],
+  categories: [],
+  /** Channel id being dragged between categories, if any. */
+  dragging: null,
   sessions: [],
   current: null,
   messages: [],
@@ -279,35 +282,90 @@ function dropMessage(id) {
   nodes.delete(id);
 }
 
-// ------------------------------------------------------------------ rail ---
+// ---------------------------------------------------------------- layers ---
 
 /**
- * The narrow-viewport rail is an off-canvas drawer. Opening it pushes a
- * history entry so the phone's physical/gesture back button closes the
- * drawer instead of leaving the app; every other way of closing it (the
- * scrim, picking a channel, Escape) just plays that back-navigation itself
- * so the history stack never grows a trail of stale "drawer" entries.
+ * On a phone the app is a stack: the channel list is home, a channel slides in
+ * over it, and a thread slides in over that. Each layer puts a history entry
+ * behind itself so the physical/gesture back button peels one off instead of
+ * leaving the app. Every other way of closing a layer (a back arrow, Escape,
+ * picking another channel) just plays that navigation itself, so the stack
+ * never grows a trail of stale entries.
+ *
+ * Each entry records the whole stack rather than the one layer it added:
+ * history can only pop from the top, so a close needs to know how deep its own
+ * entry is buried to rewind the right amount.
+ *
+ * Wide viewports show list, channel and thread side by side, so nothing
+ * stacks and nothing touches history — hence the breakpoint below, which has
+ * to stay in step with the responsive one in styles.css.
  */
-function openRail() {
-  if ($('#app').classList.contains('rail-open')) return;
-  $('#app').classList.add('rail-open');
-  $('#scrim').hidden = false;
-  history.pushState({ rail: true }, '');
+const stacks = () => window.matchMedia('(max-width: 900px)').matches;
+
+let layers = [];
+
+function pushLayer(name) {
+  layers = [...layers, name];
+  history.pushState({ layers }, '');
 }
 
-function closeRail({ viaPopstate = false } = {}) {
-  if (!$('#app').classList.contains('rail-open')) return;
-  $('#app').classList.remove('rail-open');
-  $('#scrim').hidden = true;
-  if (!viaPopstate && history.state?.rail) history.back();
+/**
+ * Rewind past `name`'s entry — and any layer stacked on top of it, since those
+ * sit between us and it. The resulting popstate is what actually tears their
+ * UI down.
+ */
+function dropLayer(name) {
+  const at = layers.indexOf(name);
+  if (at === -1) return;
+  const depth = layers.length - at;
+  layers = layers.slice(0, at);
+  history.go(-depth);
 }
+
+/** Bring the layers in line with the entry a back/forward landed us on. */
+function syncLayers(entry) {
+  layers = entry?.layers ?? [];
+  if (!layers.includes('thread')) closeThread({ viaPopstate: true });
+  if (!layers.includes('channel')) closeChannel({ viaPopstate: true });
+}
+
+/**
+ * Reveal the channel over the list. The channel stays loaded underneath when
+ * it is dismissed, so coming back to it costs nothing.
+ */
+function openChannel() {
+  if (!stacks() || $('#app').classList.contains('with-channel')) return;
+  $('#app').classList.add('with-channel');
+  pushLayer('channel');
+}
+
+function closeChannel({ viaPopstate = false } = {}) {
+  if (!$('#app').classList.contains('with-channel')) return;
+  $('#app').classList.remove('with-channel');
+  if (!viaPopstate) dropLayer('channel');
+}
+
+// ------------------------------------------------------------------ rail ---
 
 function renderRail() {
   const active = state.channels.filter((c) => !c.archived);
   const archived = state.channels.filter((c) => c.archived);
 
+  const sections = clear($('#category-sections'));
+  for (const category of state.categories) {
+    sections.append(categorySection(category, active.filter((c) => c.categoryId === category.id)));
+  }
+
+  const loose = active.filter((c) => !c.categoryId);
   const list = clear($('#channel-list'));
-  for (const channel of active) list.append(channelRow(channel));
+  for (const channel of loose) list.append(channelRow(channel));
+  // An empty bucket is a heading over nothing, so it goes away — but it is also
+  // the only way back out of a category, which is why the CSS brings it back
+  // for as long as a channel is in the air.
+  $('#channels-section').classList.toggle('is-empty', loose.length === 0);
+  if (loose.length === 0 && state.categories.length > 0) {
+    list.append(el('li', { class: 'chan-drop' }, 'Drag a channel here to take it out of its category'));
+  }
 
   const archivedSection = $('#archived-section');
   archivedSection.hidden = archived.length === 0;
@@ -316,6 +374,77 @@ function renderRail() {
 
   renderAgents();
   renderUnreadTitle();
+}
+
+function categorySection(category, channels) {
+  const list = el('ul', { class: 'channel-list', hidden: category.collapsed || undefined });
+  for (const channel of channels) list.append(channelRow(channel));
+  if (channels.length === 0) list.append(el('li', { class: 'chan-drop' }, 'Empty — drag channels here'));
+
+  const section = el(
+    'section',
+    { class: 'rail__section rail__section--category', dataset: { category: category.id } },
+    el(
+      'div',
+      { class: 'rail__headrow' },
+      el(
+        'button',
+        {
+          class: 'rail__heading',
+          'aria-expanded': String(!category.collapsed),
+          onclick: () => toggleCategory(category),
+          title: category.collapsed ? 'Expand' : 'Collapse',
+        },
+        el('span', { class: 'rail__chev' }, category.collapsed ? '▸' : '▾'),
+        el('span', { class: 'rail__label' }, category.name),
+        category.collapsed && channels.length
+          ? el('span', { class: 'rail__tally' }, String(channels.length))
+          : null
+      ),
+      el(
+        'button',
+        { class: 'rail__cog', title: `Edit ${category.name}`, onclick: () => editCategory(category) },
+        '···'
+      )
+    ),
+    list
+  );
+  dropTarget(section, category.id);
+  return section;
+}
+
+/**
+ * Make a rail section accept channels dropped anywhere inside it — heading
+ * included, so a collapsed category is still a target.
+ * @param {HTMLElement} section
+ * @param {string|null} categoryId
+ */
+function dropTarget(section, categoryId) {
+  section.addEventListener('dragover', (event) => {
+    if (!state.dragging) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    section.classList.add('is-drop');
+  });
+  section.addEventListener('dragleave', (event) => {
+    if (!section.contains(event.relatedTarget)) section.classList.remove('is-drop');
+  });
+  section.addEventListener('drop', async (event) => {
+    event.preventDefault();
+    section.classList.remove('is-drop');
+    // A drop that lands ends the drag; waiting for dragend would leave an empty
+    // bucket on screen if the browser never sends one.
+    $('#rail').classList.remove('has-drag');
+    const id = state.dragging ?? event.dataTransfer.getData('text/plain');
+    state.dragging = null;
+    const channel = state.channels.find((c) => c.id === id);
+    if (!channel || channel.categoryId === categoryId) return;
+    try {
+      await api.updateChannel(channel.id, { category: categoryId });
+    } catch (err) {
+      fail(err, 'Could not move that channel');
+    }
+  });
 }
 
 function channelRow(channel) {
@@ -330,6 +459,19 @@ function channelRow(channel) {
         class: `chan${isActive ? ' is-active' : ''}${unread && !isActive ? ' is-unread' : ''}`,
         onclick: () => selectChannel(channel.slug),
         title: channel.topic || `#${channel.slug}`,
+        draggable: 'true',
+        ondragstart: (event) => {
+          state.dragging = channel.id;
+          event.dataTransfer.setData('text/plain', channel.id);
+          event.dataTransfer.effectAllowed = 'move';
+          event.currentTarget.classList.add('is-dragging');
+          $('#rail').classList.add('has-drag');
+        },
+        ondragend: (event) => {
+          state.dragging = null;
+          event.currentTarget.classList.remove('is-dragging');
+          $('#rail').classList.remove('has-drag');
+        },
       },
       el('span', { class: 'chan__hash' }, '#'),
       el('span', { class: 'chan__name' }, channel.slug),
@@ -422,7 +564,12 @@ function renderUnreadTitle() {
 
 // =============================================================== behaviour ===
 
-async function selectChannel(ref, { flash } = {}) {
+/**
+ * @param {{flash?: string, reveal?: boolean}} [opts] `reveal: false` loads the
+ *   channel without bringing it to the front — how the phone restores the last
+ *   channel behind the list on boot.
+ */
+async function selectChannel(ref, { flash, reveal = true } = {}) {
   const channel = state.channels.find((c) => c.slug === ref || c.id === ref);
   if (!channel) return;
   state.current = channel;
@@ -431,10 +578,10 @@ async function selectChannel(ref, { flash } = {}) {
   closeThread();
   renderRail();
   renderChannelHeader();
+  if (reveal) openChannel();
   await loadMessages();
   scrollToBottom(true);
   if (flash) flashMessage(flash);
-  closeRail();
 }
 
 async function loadMessages() {
@@ -585,7 +732,42 @@ async function copyId(id) {
 
 // ---------------------------------------------------------------- threads ---
 
+/**
+ * The layer only goes on once the fetch succeeds — a thread that failed to
+ * open is not something to back out of.
+ */
+/**
+ * Jump to a channel, and optionally a thread inside it. The one place that
+ * knows how a push notification's target becomes screen state.
+ */
+async function goTo(channel, thread) {
+  if (channel) {
+    const target = state.channels.find((c) => c.slug === channel && !c.archived);
+    // A notification can outlive its channel. Land on the workspace rather
+    // than failing silently — the message body was already in the banner.
+    if (target) await selectChannel(target.slug, { reveal: true });
+  }
+  if (thread) await openThread(thread);
+}
+
+/**
+ * A cold start from a notification carries its target in the query string.
+ * Consume it once and strip it: a later reload should not re-open a thread
+ * the user has since left, and the params would outlive the tap that set them.
+ */
+function takeDeepLink() {
+  const url = new URL(location.href);
+  const channel = url.searchParams.get('channel');
+  const thread = url.searchParams.get('thread');
+  if (!channel && !thread) return null;
+  url.searchParams.delete('channel');
+  url.searchParams.delete('thread');
+  history.replaceState(history.state, '', url);
+  return { channel, thread };
+}
+
 async function openThread(rootId) {
+  const wasOpen = state.thread !== null;
   try {
     state.thread = await api.thread(rootId);
   } catch (err) {
@@ -593,8 +775,9 @@ async function openThread(rootId) {
   }
   $('#app').classList.add('with-thread');
   $('#thread').hidden = false;
+  // Jumping straight from one thread to another stays on the same layer.
+  if (!wasOpen && stacks()) pushLayer('thread');
   renderThread();
-  $('#thread-input').focus();
 }
 
 function renderThread() {
@@ -620,13 +803,43 @@ function renderThread() {
   host.scrollTop = host.scrollHeight;
 }
 
-function closeThread() {
+function closeThread({ viaPopstate = false } = {}) {
+  if (!state.thread) return;
   state.thread = null;
   $('#app').classList.remove('with-thread');
   $('#thread').hidden = true;
+  if (!viaPopstate) dropLayer('thread');
 }
 
 // --------------------------------------------------------------- channels ---
+
+/** The category picker shared by the create and edit dialogs. */
+const NEW_CATEGORY = '__new__';
+
+function categoryField(value = '') {
+  return {
+    name: 'category',
+    label: 'Category',
+    type: 'select',
+    value,
+    options: [
+      { value: '', label: 'No category' },
+      ...state.categories.map((c) => ({ value: c.id, label: c.name })),
+      { value: NEW_CATEGORY, label: '＋ New category…' },
+    ],
+  };
+}
+
+/**
+ * Turn what the picker returned into something the API takes. `null` clears
+ * the category; picking "New category…" asks for a name first.
+ * @returns {Promise<string|null|undefined>} undefined if the prompt was cancelled
+ */
+async function resolveCategoryChoice(choice) {
+  if (choice !== NEW_CATEGORY) return choice || null;
+  const created = await createCategory({ select: false });
+  return created ? created.id : undefined;
+}
 
 async function createChannel() {
   const values = await openModal({
@@ -641,11 +854,14 @@ async function createChannel() {
         help: 'Lowercase letters, digits, <code>-</code> and <code>_</code>.',
       },
       { name: 'topic', label: 'Topic', placeholder: 'What is this channel about?' },
+      categoryField(state.current?.categoryId ?? ''),
     ],
   });
   if (!values) return;
   try {
-    const channel = await api.createChannel({ slug: values.slug, topic: values.topic });
+    const category = await resolveCategoryChoice(values.category);
+    if (category === undefined) return;
+    const channel = await api.createChannel({ slug: values.slug, topic: values.topic, category });
     await refreshChannels();
     await selectChannel(channel.slug);
     toast(`Created #${channel.slug}`);
@@ -663,15 +879,19 @@ async function editChannel() {
       { name: 'slug', label: 'Name', value: channel.slug, required: true },
       { name: 'topic', label: 'Topic', value: channel.topic },
       { name: 'purpose', label: 'Purpose', type: 'textarea', value: channel.purpose, rows: 3 },
+      categoryField(channel.categoryId ?? ''),
     ],
   });
   if (!values) return;
   try {
+    const category = await resolveCategoryChoice(values.category);
+    if (category === undefined) return;
     const updated = await api.updateChannel(channel.id, {
       slug: values.slug,
       name: values.slug,
       topic: values.topic,
       purpose: values.purpose,
+      category,
     });
     await refreshChannels();
     state.current = state.channels.find((c) => c.id === updated.id) ?? updated;
@@ -680,6 +900,103 @@ async function editChannel() {
     toast('Channel updated');
   } catch (err) {
     fail(err, 'Could not update that channel');
+  }
+}
+
+// ------------------------------------------------------------- categories ---
+
+/**
+ * @param {{select?: boolean}} [opts] `select: false` when this is a step inside
+ *   another dialog rather than the thing the user asked for.
+ */
+async function createCategory({ select = true } = {}) {
+  const values = await openModal({
+    title: 'New category',
+    okLabel: 'Create',
+    fields: [
+      {
+        name: 'name',
+        label: 'Name',
+        placeholder: 'e.g. Engineering',
+        required: true,
+        help: 'A section in the sidebar. Channels can be dragged in and out of it.',
+      },
+    ],
+  });
+  if (!values) return null;
+  try {
+    const category = await api.createCategory({ name: values.name });
+    await refreshCategories();
+    renderRail();
+    if (select) toast(`Created ${category.name}`);
+    return category;
+  } catch (err) {
+    fail(err, 'Could not create that category');
+    return null;
+  }
+}
+
+async function editCategory(category) {
+  const others = state.categories.filter((c) => c.id !== category.id);
+  const index = state.categories.findIndex((c) => c.id === category.id);
+  const values = await openModal({
+    title: `Edit ${category.name}`,
+    fields: [
+      { name: 'name', label: 'Name', value: category.name, required: true },
+      {
+        name: 'after',
+        label: 'Place it',
+        type: 'select',
+        value: index > 0 ? state.categories[index - 1].id : '',
+        options: [{ value: '', label: 'First' }, ...others.map((c) => ({ value: c.id, label: `After ${c.name}` }))],
+      },
+    ],
+    extra: [{ label: 'Delete', value: 'delete', danger: true }],
+  });
+  if (!values) return;
+  if (values._action === 'delete') return deleteCategory(category);
+  try {
+    if (values.name !== category.name) await api.updateCategory(category.id, { name: values.name });
+    const order = [...others.map((c) => c.id)];
+    order.splice(values.after ? order.indexOf(values.after) + 1 : 0, 0, category.id);
+    if (order.some((id, i) => state.categories[i]?.id !== id)) await api.reorderCategories(order);
+    await refreshCategories();
+    renderRail();
+    toast('Category updated');
+  } catch (err) {
+    fail(err, 'Could not update that category');
+  }
+}
+
+async function deleteCategory(category) {
+  const inside = state.channels.filter((c) => c.categoryId === category.id).length;
+  const okay = await confirmModal({
+    title: `Delete ${category.name}?`,
+    body: 'The section goes away. Every channel in it stays exactly where it is.',
+    note: inside > 0 ? `${inside} channel${inside === 1 ? '' : 's'} will move to "Channels".` : undefined,
+    okLabel: 'Delete category',
+  });
+  if (!okay) return;
+  try {
+    await api.deleteCategory(category.id);
+    await Promise.all([refreshCategories(), refreshChannels()]);
+    renderRail();
+    toast(`Deleted ${category.name}`);
+  } catch (err) {
+    fail(err, 'Could not delete that category');
+  }
+}
+
+async function toggleCategory(category) {
+  // Optimistic: the fold should happen under the cursor, not a round trip later.
+  category.collapsed = !category.collapsed;
+  renderRail();
+  try {
+    await api.updateCategory(category.id, { collapsed: category.collapsed });
+  } catch (err) {
+    category.collapsed = !category.collapsed;
+    renderRail();
+    fail(err, 'Could not save that');
   }
 }
 
@@ -728,6 +1045,10 @@ async function deleteChannel() {
 
 async function refreshChannels() {
   state.channels = await api.listChannels(true);
+}
+
+async function refreshCategories() {
+  state.categories = await api.listCategories();
 }
 
 async function refreshSessions() {
@@ -853,6 +1174,17 @@ async function handleEvent(event) {
       return;
     }
 
+    case 'category.created':
+    case 'category.updated':
+    case 'category.deleted':
+    case 'category.reordered': {
+      await refreshCategories();
+      // A deleted category leaves its channels behind pointing at nothing.
+      if (event.type === 'category.deleted') await refreshChannels();
+      renderRail();
+      return;
+    }
+
     case 'channel.created':
     case 'channel.updated':
     case 'channel.archived':
@@ -893,6 +1225,9 @@ const palette = {
 };
 
 function openPalette() {
+  // A <dialog> sits in the top layer and would cover the palette whatever its
+  // z-index, so the sheet gets out of the way first.
+  closeSettings();
   palette.open = true;
   $('#palette').hidden = false;
   const input = $('#palette-input');
@@ -1020,21 +1355,28 @@ function wire() {
   const syncMain = wireComposer('#composer-input', '#composer', '#btn-send', send, '#mention-menu-main');
   wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply, '#mention-menu-thread');
 
-  $('#btn-new-channel').addEventListener('click', createChannel);
+  // The uncategorised bucket outlives every re-render, so it is wired once.
+  dropTarget($('#channels-section'), null);
   $('#btn-edit-channel').addEventListener('click', editChannel);
   $('#btn-archive-channel').addEventListener('click', toggleArchive);
   $('#btn-delete-channel').addEventListener('click', deleteChannel);
-  $('#btn-close-thread').addEventListener('click', closeThread);
+  // Wrapped rather than passed straight through: closeThread takes an options
+  // object, and a raw listener would hand it the click event instead.
+  $('#btn-close-thread').addEventListener('click', () => closeThread());
+  // Narrow viewports stack the views, so the thread's back arrow drops you to
+  // the channel and the channel's drops you to the rail — one step each.
+  $('#btn-thread-back').addEventListener('click', () => closeThread());
   $('#btn-search').addEventListener('click', openPalette);
-  $('#btn-notifications').addEventListener('click', toggleNotifications);
+  $('#btn-settings').addEventListener('click', openSettings);
+  $('#btn-close-settings').addEventListener('click', closeSettings);
+  $('#settings').addEventListener('click', (event) => {
+    // A dialog's backdrop counts as the dialog itself, so a click that lands
+    // on no row at all is a click outside the sheet.
+    if (event.target === $('#settings')) closeSettings();
+  });
   $('#btn-jump').addEventListener('click', () => scrollToBottom(true));
-  $('#btn-menu').addEventListener('click', () => {
-    $('#app').classList.contains('rail-open') ? closeRail() : openRail();
-  });
-  $('#scrim').addEventListener('click', () => closeRail());
-  window.addEventListener('popstate', (event) => {
-    if (!event.state?.rail) closeRail({ viaPopstate: true });
-  });
+  $('#btn-menu').addEventListener('click', () => closeChannel());
+  window.addEventListener('popstate', (event) => syncLayers(event.state));
   $('#chan-topic').addEventListener('click', editChannel);
 
   for (const [button, list] of [
@@ -1088,9 +1430,12 @@ function wire() {
       event.preventDefault();
       palette.open ? closePalette() : openPalette();
     } else if (event.key === 'Escape') {
+      // An open dialog closes itself on Escape; without this the layer behind
+      // it would be dismissed by the same keypress.
+      if ($('#modal').open || $('#settings').open) return;
       if (palette.open) closePalette();
       else if (state.thread) closeThread();
-      else if ($('#app').classList.contains('rail-open')) closeRail();
+      else closeChannel();
     }
   });
 
@@ -1102,28 +1447,105 @@ function wire() {
   syncMain();
 }
 
-// ------------------------------------------------------------ notifications ---
+// ---------------------------------------------------------------- settings ---
 
-async function syncNotificationButton() {
-  const btn = $('#btn-notifications');
-  if (!pushSupported()) {
-    btn.hidden = true;
-    return;
-  }
-  btn.hidden = false;
-  const subscription = await currentSubscription().catch(() => null);
-  const on = Boolean(subscription) && Notification.permission === 'granted';
-  btn.classList.toggle('is-active', on);
-  btn.setAttribute('aria-pressed', String(on));
-  const label = on ? 'Notifications on — click to turn off' : 'Enable notifications';
-  btn.title = label;
-  btn.setAttribute('aria-label', label);
+function openSettings() {
+  const dialog = $('#settings');
+  if (dialog.open) return;
+  renderSettings();
+  dialog.showModal();
 }
 
-async function toggleNotifications() {
-  const btn = $('#btn-notifications');
+function closeSettings() {
+  const dialog = $('#settings');
+  if (dialog.open) dialog.close();
+}
+
+function settingRow(name, hint, action) {
+  return el(
+    'div',
+    { class: 'setting' },
+    el('div', { class: 'setting__text' }, el('div', { class: 'setting__name' }, name), hint ? el('div', { class: 'setting__hint' }, hint) : null),
+    action ?? null
+  );
+}
+
+function settingGroup(title, ...rows) {
+  return [el('h3', { class: 'settings__legend' }, title), ...rows];
+}
+
+/**
+ * Creating things opens the shared modal, and two dialogs stacked on top of
+ * each other is one Escape away from confusion — so this one steps aside first.
+ */
+function fromSettings(action) {
+  return () => {
+    closeSettings();
+    action();
+  };
+}
+
+function renderSettings() {
+  const body = clear($('#settings-body'));
+  const workspace = state.workspace;
+
+  body.append(
+    ...settingGroup(
+      'Workspace',
+      settingRow(workspace?.name ?? 'Slick', workspace ? `Signed in as ${workspace.user.name}` : 'Not connected yet')
+    ),
+    ...settingGroup(
+      'Channels',
+      settingRow(
+        'New channel',
+        'A new place to talk, on its own or inside a category.',
+        el(
+          'button',
+          { class: 'btn btn--primary', type: 'button', id: 'btn-new-channel', onclick: fromSettings(createChannel) },
+          'Create'
+        )
+      ),
+      settingRow(
+        'New category',
+        'A section in the sidebar. Channels can be dragged in and out of it.',
+        el(
+          'button',
+          { class: 'btn', type: 'button', id: 'btn-new-category', onclick: fromSettings(() => createCategory()) },
+          'Create'
+        )
+      )
+    ),
+    ...settingGroup('Notifications', notificationRow())
+  );
+}
+
+function notificationRow() {
+  if (!pushSupported()) {
+    return settingRow('Push notifications', 'This browser cannot receive them.');
+  }
+  const button = el(
+    'button',
+    { class: 'btn', type: 'button', id: 'btn-notifications', disabled: true },
+    'Checking…'
+  );
+  button.addEventListener('click', () => toggleNotifications(button));
+  // The subscription lives in the service worker, so the label lands a tick
+  // after the row does.
+  syncNotificationButton(button);
+  return settingRow('Push notifications', 'Get a ping when an agent replies to you.', button);
+}
+
+async function syncNotificationButton(button) {
   const subscription = await currentSubscription().catch(() => null);
-  btn.disabled = true;
+  const on = Boolean(subscription) && Notification.permission === 'granted';
+  button.disabled = false;
+  button.textContent = on ? 'Turn off' : 'Enable';
+  button.className = `btn${on ? '' : ' btn--primary'}`;
+}
+
+async function toggleNotifications(button) {
+  const subscription = await currentSubscription().catch(() => null);
+  button.disabled = true;
   try {
     if (subscription) {
       await disablePush(api);
@@ -1135,8 +1557,7 @@ async function toggleNotifications() {
   } catch (err) {
     toast(err.message || 'Could not change notification settings', 'error');
   } finally {
-    btn.disabled = false;
-    await syncNotificationButton();
+    await syncNotificationButton(button);
   }
 }
 
@@ -1149,10 +1570,18 @@ function setConnection(status) {
 
 async function boot() {
   wire();
+  // A reload restores whichever entry was current, but none of the overlays it
+  // describes are open any more — reset it so the first back press still counts.
+  if (history.state?.layers) history.replaceState(null, '');
   try {
-    const [workspace, channels] = await Promise.all([api.workspace(), api.listChannels(true)]);
+    const [workspace, channels, categories] = await Promise.all([
+      api.workspace(),
+      api.listChannels(true),
+      api.listCategories(),
+    ]);
     state.workspace = workspace;
     state.channels = channels;
+    state.categories = categories;
     state.seq = workspace.seq;
     $('#workspace-name').textContent = workspace.name;
     $('#workspace-user').textContent = workspace.user.name;
@@ -1172,17 +1601,24 @@ async function boot() {
   await refreshSessions();
   renderRail();
 
-  const preferred = localStorage.getItem(LAST_CHANNEL_KEY);
+  const deepLink = takeDeepLink();
+  const preferred = deepLink?.channel ?? localStorage.getItem(LAST_CHANNEL_KEY);
   const target =
     state.channels.find((c) => c.slug === preferred && !c.archived) ?? state.channels.find((c) => !c.archived);
-  if (target) await selectChannel(target.slug);
+  // The phone opens on the list, with the last channel loaded behind it; wide
+  // viewports show that channel straight away because nothing covers it.
+  // Arriving from a notification is the exception — that tap asked for the
+  // message, so reveal it instead of the list.
+  if (target) await selectChannel(target.slug, { reveal: Boolean(deepLink) });
   else {
     renderChannelHeader();
     renderTimeline();
   }
 
   $('#app').classList.remove('is-loading');
-  syncNotificationButton();
+
+  // After the shell is up, so the thread pane opens over a rendered channel.
+  if (deepLink?.thread) await openThread(deepLink.thread).catch(() => {});
 
   api.stream({
     since: () => state.seq,
@@ -1203,5 +1639,36 @@ boot();
 // A bare inline <script> would be blocked by the page's CSP, so registration
 // lives here instead — this module is already an allowed same-origin source.
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js'));
+  // A notification tapped while a window is already open cannot be delivered
+  // by URL without discarding that window's state, so the worker posts the
+  // target here instead.
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    const { type, channel, thread } = event.data ?? {};
+    if (type !== 'navigate') return;
+    goTo(channel, thread).catch((err) => console.error('notification navigation failed', err));
+  });
+
+  // Whether this page booted under a worker decides what a handover below
+  // means, and claiming one during startup would blur that — so read it now.
+  const wasControlled = Boolean(navigator.serviceWorker.controller);
+  let reloading = false;
+
+  window.addEventListener('load', async () => {
+    const registration = await navigator.serviceWorker.register('./sw.js');
+    // An installed app is launched, not reloaded, and can sit open for days;
+    // asking on the way in is what makes a new worker land the same day.
+    registration.update().catch(() => {
+      /* offline, or the daemon is down — the worker we have still serves */
+    });
+  });
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    // A worker that skipped waiting now owns a page built against the last one.
+    // One reload lines the HTML, CSS, and JS back up. Not on a first install,
+    // where the handover is to a page that has been served from the network all
+    // along and is already current.
+    if (!wasControlled || reloading) return;
+    reloading = true;
+    location.reload();
+  });
 }

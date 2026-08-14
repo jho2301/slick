@@ -67,6 +67,7 @@ export function newId(prefix, now = Date.now()) {
 
 export const ID_PREFIX = Object.freeze({
   channel: 'ch',
+  category: 'cat',
   message: 'msg',
   session: 'ses',
 });

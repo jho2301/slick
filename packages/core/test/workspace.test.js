@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { Workspace } from '../src/workspace.js';
 import { ConflictError, NotFoundError, ValidationError } from '../src/errors.js';
@@ -45,7 +46,33 @@ describe('bootstrap', () => {
     const info = ws.info();
     assert.equal(info.counts.channels, 2);
     assert.equal(info.counts.messages, 0);
+    assert.equal(info.counts.categories, 0);
     assert.ok(info.seq > 0, 'bootstrap emits events');
+  });
+
+  test('a workspace made before categories existed picks them up on open', () => {
+    const file = join(home, 'legacy.db');
+    const before = Workspace.open({ file, home });
+    before.messages.post({ channel: 'general', text: 'written before categories' });
+    before.close();
+
+    // Rewind the file to the shape a v1 workspace had on disk.
+    const raw = new DatabaseSync(file);
+    raw.exec('DROP INDEX ix_channels_category');
+    raw.exec('ALTER TABLE channels DROP COLUMN category_id');
+    raw.exec('DROP TABLE channel_categories');
+    raw.exec('PRAGMA user_version = 1');
+    raw.close();
+
+    const after = Workspace.open({ file, home });
+    try {
+      assert.equal(after.info().counts.categories, 0);
+      const eng = after.categories.create({ name: 'Engineering' });
+      assert.equal(after.channels.update('general', { category: eng.id }).categoryId, eng.id);
+      assert.equal(after.messages.list('general').messages.length, 1, 'the old contents are untouched');
+    } finally {
+      after.close();
+    }
   });
 });
 
@@ -85,6 +112,121 @@ describe('channels', () => {
     assert.throws(() => ws.channels.remove('general'), ConflictError);
     const forced = ws.channels.remove('general', { force: true });
     assert.equal(forced.deletedMessages, 1);
+  });
+});
+
+describe('channel categories', () => {
+  test('create, rename, collapse, delete', () => {
+    const created = ws.categories.create({ name: 'Engineering & Ops' });
+    assert.equal(created.slug, 'engineering-ops', 'the handle comes from the name');
+    assert.equal(created.name, 'Engineering & Ops');
+    assert.equal(created.collapsed, false);
+    assert.deepEqual(ws.categories.list().map((c) => c.channelCount), [0], 'counts come with the listing');
+
+    assert.equal(ws.categories.get('engineering-ops').id, created.id);
+    assert.equal(ws.categories.get(created.id).name, created.name);
+
+    const renamed = ws.categories.update(created.id, { name: 'Engineering', slug: 'eng' });
+    assert.equal(renamed.slug, 'eng');
+    assert.equal(renamed.name, 'Engineering');
+
+    assert.equal(ws.categories.setCollapsed('eng', true).collapsed, true);
+    assert.equal(ws.categories.get('eng').collapsed, true, 'collapse is stored, not per-session');
+
+    assert.equal(ws.categories.remove('eng').deleted, true);
+    assert.throws(() => ws.categories.get('eng'), NotFoundError);
+  });
+
+  test('rejects duplicate handles and bad names', () => {
+    ws.categories.create({ name: 'Design' });
+    assert.throws(() => ws.categories.create({ name: 'design' }), ConflictError);
+    assert.throws(() => ws.categories.create({ name: '   ' }), ValidationError);
+    assert.throws(() => ws.categories.create({ name: '!!!' }), ValidationError);
+  });
+
+  test('a channel belongs to one category and can be taken out again', () => {
+    const eng = ws.categories.create({ name: 'Engineering' });
+    const product = ws.categories.create({ name: 'Product' });
+
+    const deploys = ws.channels.create({ slug: 'deploys', category: 'engineering' });
+    assert.equal(deploys.categoryId, eng.id);
+    assert.deepEqual(deploys.category, { id: eng.id, slug: 'engineering', name: 'Engineering', position: eng.position });
+
+    const moved = ws.channels.update('deploys', { category: product.id });
+    assert.equal(moved.categoryId, product.id, 'moving replaces rather than adds');
+    assert.equal(ws.categories.list().find((c) => c.id === eng.id).channelCount, 0);
+    assert.equal(ws.categories.list().find((c) => c.id === product.id).channelCount, 1);
+
+    const loose = ws.channels.update('deploys', { category: null });
+    assert.equal(loose.categoryId, null);
+    assert.equal(loose.category, null);
+
+    // Not mentioning it at all leaves it where it is.
+    ws.channels.update('deploys', { category: 'product' });
+    assert.equal(ws.channels.update('deploys', { topic: 'ship logs' }).categoryId, product.id);
+
+    assert.throws(() => ws.channels.update('deploys', { category: 'nope' }), NotFoundError);
+  });
+
+  test('listing can be filtered to one category, or to the channels in none', () => {
+    ws.categories.create({ name: 'Engineering' });
+    ws.channels.create({ slug: 'deploys', category: 'engineering' });
+
+    assert.deepEqual(
+      ws.channels.list({ category: 'engineering' }).map((c) => c.slug),
+      ['deploys']
+    );
+    assert.deepEqual(
+      ws.channels.list({ category: null }).map((c) => c.slug),
+      ['general', 'agents'],
+      'the default channels start uncategorised'
+    );
+  });
+
+  test('deleting a category keeps its channels, uncategorised', () => {
+    const eng = ws.categories.create({ name: 'Engineering' });
+    ws.channels.create({ slug: 'deploys', category: eng.id });
+    ws.messages.post({ channel: 'deploys', text: 'still here' });
+
+    const removed = ws.categories.remove(eng.id);
+    assert.equal(removed.uncategorisedChannels, 1);
+    assert.equal(ws.channels.get('deploys').categoryId, null);
+    assert.equal(ws.messages.list('deploys').messages.length, 1);
+  });
+
+  test('reorder puts the named categories first and leaves the rest in order', () => {
+    ws.categories.create({ name: 'One' });
+    ws.categories.create({ name: 'Two' });
+    ws.categories.create({ name: 'Three' });
+    assert.deepEqual(ws.categories.list().map((c) => c.slug), ['one', 'two', 'three']);
+
+    assert.deepEqual(
+      ws.categories.reorder(['three']).map((c) => c.slug),
+      ['three', 'one', 'two']
+    );
+    assert.deepEqual(
+      ws.categories.reorder(['two', 'two', 'one']).map((c) => c.slug),
+      ['two', 'one', 'three'],
+      'a repeated name is not a second slot'
+    );
+    assert.throws(() => ws.categories.reorder([]), ValidationError);
+    assert.throws(() => ws.categories.reorder(['nope']), NotFoundError);
+  });
+
+  test('grouping shows up in the event log without waking agents', () => {
+    const start = ws.seq();
+    const eng = ws.categories.create({ name: 'Engineering' });
+    ws.channels.update('general', { category: eng.id });
+    ws.categories.remove(eng.id);
+
+    assert.deepEqual(
+      ws.events({ since: start }).map((e) => e.type),
+      ['category.created', 'channel.updated', 'category.deleted']
+    );
+
+    const session = ws.agents.start({ agentId: 'claude' });
+    ws.categories.create({ name: 'Product' });
+    assert.deepEqual(ws.agents.pull(session.key).events, [], 'sidebar changes are not an agent inbox item');
   });
 });
 

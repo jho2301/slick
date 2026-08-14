@@ -71,11 +71,13 @@ function closeModal(value) {
  * @param {{
  *   title: string,
  *   fields?: Array<{name: string, label?: string, value?: string, type?: string,
- *                   placeholder?: string, help?: string, required?: boolean, rows?: number}>,
+ *                   placeholder?: string, help?: string, required?: boolean, rows?: number,
+ *                   options?: Array<{value: string, label: string}>}>,
  *   note?: string,
  *   body?: string,
  *   okLabel?: string,
  *   danger?: boolean,
+ *   extra?: Array<{label: string, value: string, danger?: boolean}>,
  * }} config
  * @returns {Promise<Record<string, string>|null>}
  */
@@ -95,15 +97,21 @@ export function openModal(config) {
   for (const field of config.fields ?? []) {
     const id = `field-${field.name}`;
     const input =
-      field.type === 'textarea'
-        ? el('textarea', { id, name: field.name, rows: field.rows ?? 3, placeholder: field.placeholder ?? '' })
-        : el('input', {
-            id,
-            name: field.name,
-            type: field.type ?? 'text',
-            placeholder: field.placeholder ?? '',
-            autocomplete: 'off',
-          });
+      field.type === 'select'
+        ? el(
+            'select',
+            { id, name: field.name },
+            (field.options ?? []).map((option) => el('option', { value: option.value }, option.label))
+          )
+        : field.type === 'textarea'
+          ? el('textarea', { id, name: field.name, rows: field.rows ?? 3, placeholder: field.placeholder ?? '' })
+          : el('input', {
+              id,
+              name: field.name,
+              type: field.type ?? 'text',
+              placeholder: field.placeholder ?? '',
+              autocomplete: 'off',
+            });
     input.value = field.value ?? '';
     if (field.required) input.required = true;
     body.append(
@@ -117,15 +125,33 @@ export function openModal(config) {
     );
   }
 
+  // Secondary verbs ("Delete this category") that belong to the same form but
+  // are not the primary action. They resolve with `_action` set to their value.
+  const extras = clear($('#modal-extra'));
+  extras.hidden = !config.extra?.length;
+
   return new Promise((resolve) => {
     modalResolve = resolve;
+    const values = () => Object.fromEntries(new FormData(form).entries());
+    for (const action of config.extra ?? []) {
+      extras.append(
+        el(
+          'button',
+          {
+            type: 'button',
+            class: `btn ${action.danger ? 'btn--danger' : 'btn--ghost'}`,
+            onclick: () => closeModal({ ...values(), _action: action.value }),
+          },
+          action.label
+        )
+      );
+    }
     form.onsubmit = (event) => {
       event.preventDefault();
-      const values = Object.fromEntries(new FormData(form).entries());
-      closeModal(values);
+      closeModal(values());
     };
     dialog.showModal();
-    const first = body.querySelector('input, textarea');
+    const first = body.querySelector('input, textarea, select');
     if (first) {
       first.focus();
       first.select?.();

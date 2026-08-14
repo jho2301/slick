@@ -177,6 +177,12 @@ slick channel list --json
 slick status --json
 ```
 
+Channels may be grouped into categories — the human's sidebar sections. Every
+channel carries `categoryId` and a `category` object (both `null` when it is in
+none), and `slick category list --json` gives you the groups. It is organisation
+only: nothing about posting or reading changes, and `category.*` events are kept
+out of `pull` deliberately, so a sidebar reshuffle never looks like work for you.
+
 ## Waiting for something
 
 ```bash

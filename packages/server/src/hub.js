@@ -41,7 +41,16 @@ export function createHub(ws, opts = {}) {
         .notify({
           title: message.channelSlug ? `${message.author.label} in #${message.channelSlug}` : message.author.label,
           body: message.text,
-          url: './',
+          // Where the notification came from, so tapping it lands on the
+          // message instead of the app's front door. The worker reads
+          // channel/thread directly; `url` is the fallback for a cold start,
+          // where there is no open window to route in place.
+          channel: message.channelSlug ?? null,
+          thread: message.threadId ?? null,
+          url: message.channelSlug
+            ? `./?channel=${encodeURIComponent(message.channelSlug)}` +
+              (message.threadId ? `&thread=${encodeURIComponent(message.threadId)}` : '')
+            : './',
           tag: message.threadId,
         })
         .catch((err) => console.error('[slick] push notify failed:', err.message));

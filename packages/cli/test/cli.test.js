@@ -114,6 +114,42 @@ describe('the basics', () => {
     assert.equal((await slick(['channel', 'delete', 'cli-den', '--json'])).json.channel.deleted, true);
   });
 
+  test('channel categories', async () => {
+    const created = (await slick(['category', 'create', 'Ops & Deploys', '--json'])).json.category;
+    assert.equal(created.slug, 'ops-deploys');
+
+    const inside = (await slick(['channel', 'create', 'cli-deploys', '--category', 'ops-deploys', '--json'])).json
+      .channel;
+    assert.equal(inside.category.name, 'Ops & Deploys');
+
+    // `channel list` reports the grouping, `category list` reports the groups.
+    const listed = (await slick(['channel', 'list', '--json'])).json.channels;
+    assert.equal(listed.find((c) => c.slug === 'cli-deploys').categoryId, created.id);
+    const grouped = (await slick(['category', 'list', '--json'])).json;
+    assert.equal(grouped.categories.find((c) => c.id === created.id).channelCount, 1);
+
+    await slick(['category', 'create', 'Design', '--json']);
+    assert.deepEqual(
+      (await slick(['category', 'reorder', 'design', '--json'])).json.categories.map((c) => c.slug),
+      ['design', 'ops-deploys']
+    );
+
+    assert.equal((await slick(['category', 'collapse', 'design', '--json'])).json.category.collapsed, true);
+    assert.equal((await slick(['category', 'expand', 'design', '--json'])).json.category.collapsed, false);
+
+    // Taking a channel out, then deleting the category, both leave it standing.
+    assert.equal((await slick(['category', 'move', 'cli-deploys', 'design', '--json'])).json.channel.category.slug, 'design');
+    assert.equal((await slick(['category', 'move', 'cli-deploys', 'none', '--json'])).json.channel.categoryId, null);
+    await slick(['category', 'move', 'cli-deploys', 'design', '--json']);
+    assert.equal((await slick(['category', 'delete', 'design', '--json'])).json.category.uncategorisedChannels, 1);
+    assert.equal((await slick(['channel', 'show', 'cli-deploys', '--json'])).json.channel.categoryId, null);
+
+    assert.equal((await slick(['category', 'move', 'cli-deploys', 'nope', '--json'])).code, 4);
+    assert.equal((await slick(['category', 'create', 'ops-deploys', '--json'])).code, 5);
+    await slick(['channel', 'delete', 'cli-deploys', '--json']);
+    await slick(['category', 'delete', 'ops-deploys', '--json']);
+  });
+
   test('threads', async () => {
     const root = (await slick(['send', 'general', 'thread root', '--json'])).json.message;
     await slick(['thread', 'reply', root.id, 'first reply', '--json']);

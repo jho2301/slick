@@ -127,6 +127,52 @@ describe('channels over HTTP', () => {
   });
 });
 
+describe('categories over HTTP', () => {
+  test('create, group channels, reorder, delete', async () => {
+    const created = await call('POST', '/api/categories', { name: 'Engineering' });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.category.slug, 'engineering');
+
+    const second = await call('POST', '/api/categories', { name: 'Product' });
+    assert.deepEqual(
+      (await call('GET', '/api/categories')).body.categories.map((c) => c.slug),
+      ['engineering', 'product']
+    );
+
+    await call('POST', '/api/channels', { slug: 'http-deploys', category: 'engineering' });
+    const grouped = await call('GET', '/api/categories/engineering/channels');
+    assert.deepEqual(grouped.body.channels.map((c) => c.slug), ['http-deploys']);
+    assert.ok(
+      !(await call('GET', '/api/channels?category=')).body.channels.some((c) => c.slug === 'http-deploys'),
+      'an empty category filter means "the uncategorised ones"'
+    );
+
+    const moved = await call('PATCH', '/api/channels/http-deploys', { category: second.body.category.id });
+    assert.equal(moved.body.channel.category.name, 'Product');
+
+    const collapsed = await call('PATCH', '/api/categories/product', { collapsed: true });
+    assert.equal(collapsed.body.category.collapsed, true);
+
+    const reordered = await call('POST', '/api/categories/reorder', { order: ['product'] });
+    assert.deepEqual(reordered.body.categories.map((c) => c.slug), ['product', 'engineering']);
+
+    const removed = await call('DELETE', '/api/categories/product');
+    assert.equal(removed.body.category.uncategorisedChannels, 1);
+    assert.equal((await call('GET', '/api/channels/http-deploys')).body.channel.categoryId, null);
+    await call('DELETE', '/api/categories/engineering');
+    await call('DELETE', '/api/channels/http-deploys');
+  });
+
+  test('maps domain errors onto status codes', async () => {
+    await call('POST', '/api/categories', { name: 'Dupe' });
+    assert.equal((await call('POST', '/api/categories', { name: 'dupe' })).status, 409);
+    assert.equal((await call('POST', '/api/categories', { name: '  ' })).status, 422);
+    assert.equal((await call('GET', '/api/categories/nope')).status, 404);
+    assert.equal((await call('PATCH', '/api/channels/general', { category: 'nope' })).status, 404);
+    await call('DELETE', '/api/categories/dupe');
+  });
+});
+
 describe('messages and threads over HTTP', () => {
   test('post, reply, edit, delete', async () => {
     const posted = await call('POST', '/api/channels/general/messages', { text: 'over http' });
@@ -403,5 +449,31 @@ describe('web UI hosting', () => {
       assert.equal(res.status, 200, `${path} should be served`);
       await res.text();
     }
+  });
+
+  // An installed app launches with what the manifest gave it and nothing else,
+  // so a bare start_url strands it on the 401 page the moment its storage has
+  // no cookie — a fresh profile, a cleared jar, or iOS, where a home-screen app
+  // never had Safari's to begin with.
+  test('the manifest hands the installed app a way back in', async () => {
+    const res = await fetch(`${base}/manifest.webmanifest`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /application\/manifest\+json/);
+
+    const manifest = await res.json();
+    assert.equal(manifest.start_url, `./?token=${encodeURIComponent(TOKEN)}`);
+    // Relative, so it survives the daemon coming up on another port, and inside
+    // `scope` — a start_url outside it is not installable at all.
+    assert.ok(manifest.start_url.startsWith('./'));
+    assert.equal(manifest.name, 'Slick');
+    assert.ok(manifest.icons.length >= 2);
+  });
+
+  test('and the manifest is no more readable than anything else', async () => {
+    const res = await fetch(`${base}/manifest.webmanifest`);
+    assert.equal(res.status, 401);
+    assert.doesNotMatch(await res.text(), new RegExp(TOKEN));
   });
 });

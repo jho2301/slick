@@ -94,7 +94,7 @@ async function main() {
     console.log('\nloading');
     check('token was traded for a cookie', !(await js('location.search.includes("token")')));
     check('workspace name rendered', await js('document.querySelector("#workspace-name").textContent.length > 0'));
-    const channelCount = await js('document.querySelectorAll("#channel-list .chan").length');
+    const channelCount = await js('document.querySelectorAll(".rail__scroll .chan").length');
     check('channels in the sidebar', channelCount >= 4, `${channelCount} channels`);
     const messageCount = await js('document.querySelectorAll("#messages .msg").length');
     check('messages rendered', messageCount > 0, `${messageCount} rows`);
@@ -102,10 +102,9 @@ async function main() {
     check('no loading class left', !(await js('document.querySelector("#app").classList.contains("is-loading")')));
     check('thread pane starts hidden', !(await visible('#thread')));
     check('palette starts hidden', !(await visible('#palette')));
-    check('scrim starts hidden', !(await visible('#scrim')));
 
     console.log('\nnavigating');
-    await js('[...document.querySelectorAll("#channel-list .chan")].find(b => b.textContent.includes("deploys")).click()');
+    await js('[...document.querySelectorAll(".rail__scroll .chan")].find(b => b.textContent.includes("deploys")).click()');
     await sleep(500);
     check('switched channel', (await js('document.querySelector("#chan-title").textContent')) === '#deploys');
     const deployRows = await js('document.querySelectorAll("#messages .msg").length');
@@ -191,10 +190,136 @@ async function main() {
     await sleep(200);
     check('palette closed again', !(await visible('#palette')));
 
+    console.log('\ncategories');
+    const sections = await js('document.querySelectorAll("#category-sections .rail__section").length');
+    check('category sections rendered', sections >= 2, `${sections} sections`);
+    check(
+      'channels are grouped under their category',
+      await js(`
+        (() => {
+          const section = [...document.querySelectorAll('#category-sections .rail__section')]
+            .find(s => s.textContent.includes('Engineering'));
+          return !!section && !![...section.querySelectorAll('.chan')].find(c => c.textContent.includes('deploys'));
+        })()
+      `)
+    );
+    check(
+      'uncategorised channels stay in the bottom bucket',
+      await js('[...document.querySelectorAll("#channel-list .chan")].some(c => c.textContent.includes("general"))')
+    );
+    await shoot('05-categories');
+
+    // Collapse is persisted server-side, so the list really has to disappear.
+    await js(`
+      [...document.querySelectorAll('#category-sections .rail__heading')]
+        .find(h => h.textContent.includes('Product')).click()
+    `);
+    await sleep(600);
+    check(
+      'collapsing a category hides its channels',
+      await js(`
+        (() => {
+          const section = [...document.querySelectorAll('#category-sections .rail__section')]
+            .find(s => s.textContent.includes('Product'));
+          return section.querySelector('.channel-list').hidden === true;
+        })()
+      `)
+    );
+    check(
+      'collapse survives a reload',
+      await js('fetch("/api/categories").then(r => r.json()).then(d => d.categories.some(c => c.collapsed))')
+    );
+
+    // Drag #deploys out of Engineering and into the uncategorised bucket, the
+    // way a mouse would: dragstart on the row, then dragover/drop on the
+    // section. Synthetic DragEvents run the same handlers a real drag does.
+    const highlighted = await js(`
+      (() => {
+        const row = [...document.querySelectorAll('#category-sections .chan')]
+          .find(c => c.textContent.includes('deploys'));
+        const target = document.querySelector('#channels-section');
+        const dataTransfer = new DataTransfer();
+        row.dispatchEvent(new DragEvent('dragstart', { dataTransfer, bubbles: true }));
+        target.dispatchEvent(new DragEvent('dragover', { dataTransfer, bubbles: true, cancelable: true }));
+        const lit = target.classList.contains('is-drop');
+        target.dispatchEvent(new DragEvent('drop', { dataTransfer, bubbles: true, cancelable: true }));
+        return lit;
+      })()
+    `);
+    check('the drop target lights up while dragging', highlighted);
+    await sleep(1200);
+    check(
+      'dropping a channel moves it out of its category',
+      await js('[...document.querySelectorAll("#channel-list .chan")].some(c => c.textContent.includes("deploys"))')
+    );
+    check(
+      'and the drag highlight is cleaned up',
+      !(await js('!!document.querySelector(".rail__section.is-drop")'))
+    );
+
+    // The bucket with no channels in it hides — but it is still the only way
+    // back out of a category, so a drag has to be able to find it again.
+    const loose = await js('[...document.querySelectorAll("#channel-list .chan__name")].map(n => n.textContent)');
+    const [firstCategory] = server.ws.categories.list();
+    for (const slug of loose) server.ws.channels.update(slug, { category: firstCategory.id });
+    await sleep(1200);
+    check('the uncategorised bucket hides when it is empty', !(await visible('#channels-section')), loose.join(', '));
+    check(
+      'a drag brings the empty bucket back as a target',
+      await js(`
+        (() => {
+          const row = document.querySelector('#category-sections .chan');
+          const dataTransfer = new DataTransfer();
+          row.dispatchEvent(new DragEvent('dragstart', { dataTransfer, bubbles: true }));
+          const shown = document.querySelector('#channels-section').getBoundingClientRect().height > 0;
+          row.dispatchEvent(new DragEvent('dragend', { dataTransfer, bubbles: true }));
+          return shown;
+        })()
+      `)
+    );
+    check('and it hides again once the drag ends', !(await visible('#channels-section')));
+    for (const slug of loose) server.ws.channels.update(slug, { category: null });
+    await sleep(1200);
+    check('the bucket comes back with its channels', await visible('#channels-section'));
+
+    await js(`
+      [...document.querySelectorAll('#category-sections .rail__cog')]
+        .find(b => b.title.includes('Engineering')).click()
+    `);
+    await sleep(400);
+    check('the category dialog opened', await js('document.querySelector("#modal").open'));
+    check('it can reorder', await js('!!document.querySelector("#field-after")'));
+    check('it offers delete without leaving', await js('!document.querySelector("#modal-extra").hidden'));
+    await shoot('06-category-edit');
+    await js(`
+      (() => {
+        document.querySelector('#field-name').value = 'Engineering Ops';
+        document.querySelector('#field-after').value =
+          [...document.querySelectorAll('#field-after option')].at(-1).value;
+        document.querySelector('#modal-form').requestSubmit();
+      })()
+    `);
+    await sleep(1000);
+    check(
+      'renaming and reordering a category takes effect',
+      await js(`
+        (() => {
+          const headings = [...document.querySelectorAll('#category-sections .rail__label')].map(h => h.textContent);
+          return headings.join('|') === 'Product|Engineering Ops';
+        })()
+      `),
+      await js('[...document.querySelectorAll("#category-sections .rail__label")].map(h => h.textContent).join(" | ")')
+    );
+
     console.log('\nchannel crud');
+    await js('document.querySelector("#btn-settings").click()');
+    await sleep(300);
+    check('the ☰ menu opens settings', await js('document.querySelector("#settings").open'));
     await js('document.querySelector("#btn-new-channel").click()');
     await sleep(400);
+    check('settings steps aside for the create dialog', await js('!document.querySelector("#settings").open'));
     check('create-channel modal opened', await js('document.querySelector("#modal").open'));
+    check('the channel dialog offers a category', await js('!!document.querySelector("#field-category")'));
     await js(`
       (() => {
         document.querySelector('#field-slug').value = 'smoke-room';
@@ -208,10 +333,10 @@ async function main() {
       'empty state shown for a new channel',
       await js('!!document.querySelector("#messages .empty")')
     );
-    await shoot('05-new-channel');
+    await shoot('07-new-channel');
 
     console.log('\nediting a message');
-    await js('[...document.querySelectorAll("#channel-list .chan")].find(b => b.textContent.includes("deploys")).click()');
+    await js('[...document.querySelectorAll(".rail__scroll .chan")].find(b => b.textContent.includes("deploys")).click()');
     await sleep(600);
     await js(`
       (() => {
@@ -235,7 +360,7 @@ async function main() {
       await js('[...document.querySelectorAll("#messages .msg__edited")].length > 0')
     );
 
-    const shot = await shoot('06-final');
+    const shot = await shoot('08-final');
     check('screenshot is not blank', shot > 20000, `${(shot / 1024).toFixed(0)} KB`);
   } catch (err) {
     problems.push(`threw: ${err.message}`);

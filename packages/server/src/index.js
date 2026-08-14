@@ -15,7 +15,7 @@ import { Workspace } from '@slick/core';
 import { createRoutes, RAW } from './routes.js';
 import { createHub } from './hub.js';
 import { createPushService } from './push.js';
-import { createStaticHandler, resolveWebRoot } from './static.js';
+import { createStaticHandler, manifestWithToken, resolveWebRoot } from './static.js';
 import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.js';
 
 export const VERSION = '0.1.0';
@@ -140,6 +140,21 @@ export function createServer(opts = {}) {
       return sendJson(res, 404, {
         error: { code: 'no_such_route', message: `No route for ${req.method} ${url.pathname}` },
       });
+    }
+
+    // Ahead of the static handler, which would serve the file as written: the
+    // copy on disk has no token in its `start_url`, and an installed app has
+    // nowhere else to get one. See `manifestWithToken`.
+    if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
+      const manifest = manifestWithToken(webRoot, token);
+      if (manifest) {
+        res.writeHead(200, {
+          'content-type': 'application/manifest+json',
+          'content-length': Buffer.byteLength(manifest),
+          'cache-control': 'no-cache',
+        });
+        return res.end(manifest);
+      }
     }
 
     if (req.method === 'GET' && serveStatic(req, res, url.pathname)) return;

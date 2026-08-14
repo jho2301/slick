@@ -56,7 +56,7 @@ async function main() {
   await win.loadURL(`${bound.url}?token=${TOKEN}`);
   await sleep(1500);
 
-  await js('[...document.querySelectorAll("#channel-list .chan")].find(b => b.textContent.includes("deploys"))?.click()');
+  await js('[...document.querySelectorAll(".rail__scroll .chan")].find(b => b.textContent.includes("deploys"))?.click()');
   await shoot('a-channel');
 
   await js('document.querySelector(".msg__thread")?.click()');
@@ -74,12 +74,15 @@ async function main() {
   await shoot('c-search');
 
   await js('document.dispatchEvent(new KeyboardEvent("keydown", {key: "Escape"}))');
+  await js('document.querySelector("#btn-settings").click()');
+  await shoot('d-settings');
+
   await js('document.querySelector("#btn-new-channel").click()');
-  await shoot('d-modal');
+  await shoot('e-modal');
 
   await js('document.querySelector("#modal-cancel").click()');
-  await js('[...document.querySelectorAll("#channel-list .chan")].find(b => b.textContent.includes("general"))?.click()');
-  await shoot('e-general');
+  await js('[...document.querySelectorAll(".rail__scroll .chan")].find(b => b.textContent.includes("general"))?.click()');
+  await shoot('f-general');
 
   console.log(`\nwrote to ${OUT}`);
   await server.close();

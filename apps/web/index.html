@@ -8,7 +8,10 @@
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='23' font-size='20' font-family='system-ui' font-weight='700' fill='white' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E" />
     <link rel="stylesheet" href="./styles.css" />
 
-    <link rel="manifest" href="./manifest.webmanifest" />
+    <!-- A manifest is fetched with credentials omitted unless it says otherwise
+         — which against a daemon that wants a token on everything means a 401,
+         no manifest, and a browser that never offers to install the app. -->
+    <link rel="manifest" href="./manifest.webmanifest" crossorigin="use-credentials" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#16171d" media="(prefers-color-scheme: dark)" />
     <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
@@ -27,37 +30,30 @@
               <div class="rail__user" id="workspace-user"></div>
             </div>
           </div>
-          <button
-            class="icon-btn icon-btn--ghost"
-            id="btn-notifications"
-            title="Enable notifications"
-            aria-label="Enable notifications"
-            aria-pressed="false"
-            hidden
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2a1.5 1.5 0 00-1.5 1.5v.6C6 4.8 4.5 6.9 4.5 9.5V13L3 15v1h14v-1l-1.5-2V9.5c0-2.6-1.5-4.7-4-5.4v-.6A1.5 1.5 0 0010 2zm0 16a2 2 0 002-2H8a2 2 0 002 2z"/></svg>
-          </button>
           <button class="icon-btn icon-btn--ghost" id="btn-search" title="Search (⌘K)" aria-label="Search">
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9 3a6 6 0 104.47 10.03l3.25 3.25 1.06-1.06-3.25-3.25A6 6 0 009 3zm0 1.5a4.5 4.5 0 110 9 4.5 4.5 0 010-9z"/></svg>
+          </button>
+          <button
+            class="icon-btn icon-btn--ghost"
+            id="btn-settings"
+            title="Menu"
+            aria-label="Menu"
+            aria-haspopup="dialog"
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14v1.7H3zM3 9.15h14v1.7H3zM3 13.3h14V15H3z"/></svg>
           </button>
         </header>
 
         <nav class="rail__scroll" id="rail-scroll">
-          <section class="rail__section">
+          <!-- One section per category, rendered by app.js; the bucket below
+               holds every channel that is not in one. -->
+          <div id="category-sections"></div>
+
+          <section class="rail__section" id="channels-section">
             <button class="rail__heading" id="toggle-channels" aria-expanded="true">
               <span class="rail__chev">▾</span> Channels
             </button>
             <ul class="channel-list" id="channel-list"></ul>
-            <button class="rail__add" id="btn-new-channel">
-              <span class="rail__plus">+</span> Add channel
-            </button>
-          </section>
-
-          <section class="rail__section" id="agents-section">
-            <button class="rail__heading" id="toggle-agents" aria-expanded="true">
-              <span class="rail__chev">▾</span> Agents
-            </button>
-            <ul class="agent-list" id="agent-list"></ul>
           </section>
 
           <section class="rail__section rail__section--archived" id="archived-section" hidden>
@@ -68,6 +64,16 @@
           </section>
         </nav>
 
+        <!-- Pinned under the scroller: the agents are for looking up a history
+             key, so they stay put rather than scrolling away with the channels.
+             Folded by default — not something to keep an eye on. -->
+        <section class="rail__section rail__pinned" id="agents-section">
+          <button class="rail__heading" id="toggle-agents" aria-expanded="false">
+            <span class="rail__chev">▸</span> Agents
+          </button>
+          <ul class="agent-list" id="agent-list" hidden></ul>
+        </section>
+
         <footer class="rail__foot">
           <span class="dot" id="conn-dot"></span>
           <span id="conn-label">connecting…</span>
@@ -77,7 +83,9 @@
       <main class="main" id="main">
         <header class="chan-head" id="chan-head">
           <div class="chan-head__left">
-            <button class="icon-btn icon-btn--ghost only-narrow" id="btn-menu" aria-label="Channels">☰</button>
+            <button class="icon-btn icon-btn--ghost only-narrow" id="btn-menu" aria-label="Back to channels">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 3.5L6 10l6.5 6.5 1.4-1.4L8.8 10l5.1-5.1z"/></svg>
+            </button>
             <h1 class="chan-head__title" id="chan-title">#general</h1>
             <button class="chan-head__topic" id="chan-topic" title="Edit topic"></button>
           </div>
@@ -119,9 +127,14 @@
 
       <aside class="thread" id="thread" hidden>
         <header class="thread__head">
-          <div>
-            <div class="thread__title">Thread</div>
-            <div class="thread__sub" id="thread-sub"></div>
+          <div class="thread__head-left">
+            <button class="icon-btn icon-btn--ghost only-narrow" id="btn-thread-back" aria-label="Back to channel">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 3.5L6 10l6.5 6.5 1.4-1.4L8.8 10l5.1-5.1z"/></svg>
+            </button>
+            <div>
+              <div class="thread__title">Thread</div>
+              <div class="thread__sub" id="thread-sub"></div>
+            </div>
           </div>
           <button class="icon-btn icon-btn--ghost" id="btn-close-thread" aria-label="Close thread">✕</button>
         </header>
@@ -129,29 +142,33 @@
         <form class="composer composer--thread" id="thread-composer">
           <div class="composer__box">
             <ul class="mention-menu" id="mention-menu-thread" hidden></ul>
-            <textarea id="thread-input" class="composer__input" rows="1" placeholder="Reply…"></textarea>
-            <div class="composer__row">
-              <span class="composer__hint">Replying in thread</span>
-              <button type="submit" class="send-btn" id="btn-thread-send" disabled aria-label="Send reply">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10l16-7-7 16-2-6-7-3z"/></svg>
-              </button>
-            </div>
+            <textarea id="thread-input" class="composer__input" rows="3" placeholder="Reply…"></textarea>
+            <button type="submit" class="send-btn" id="btn-thread-send" disabled aria-label="Send reply">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10l16-7-7 16-2-6-7-3z"/></svg>
+            </button>
           </div>
         </form>
       </aside>
     </div>
-
-    <div class="scrim" id="scrim" hidden></div>
 
     <dialog class="modal" id="modal">
       <form method="dialog" id="modal-form">
         <h2 class="modal__title" id="modal-title">Title</h2>
         <div class="modal__body" id="modal-body"></div>
         <footer class="modal__foot">
+          <div class="modal__extra" id="modal-extra" hidden></div>
           <button type="button" class="btn btn--ghost" id="modal-cancel">Cancel</button>
           <button type="submit" class="btn btn--primary" id="modal-ok">Save</button>
         </footer>
       </form>
+    </dialog>
+
+    <dialog class="modal settings" id="settings" aria-label="Settings">
+      <header class="settings__head">
+        <h2>Settings</h2>
+        <button class="icon-btn icon-btn--ghost" id="btn-close-settings" aria-label="Close settings">✕</button>
+      </header>
+      <div class="settings__body" id="settings-body"></div>
     </dialog>
 
     <div class="palette" id="palette" hidden>

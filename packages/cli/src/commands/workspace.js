@@ -62,6 +62,8 @@ export const status = {
     line();
     line(
       `  ${style.bold(String(info.counts.channels))} channels   ` +
+        // Only worth a column once the workspace actually uses categories.
+        (info.counts.categories ? `${style.bold(String(info.counts.categories))} categories   ` : '') +
         `${style.bold(String(info.counts.messages))} messages   ` +
         `${style.bold(String(info.counts.threads))} threads   ` +
         `${style.bold(String(info.counts.agentSessions))} agent sessions`

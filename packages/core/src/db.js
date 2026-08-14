@@ -10,7 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const MIGRATIONS = [
   {
@@ -92,6 +92,28 @@ const MIGRATIONS = [
       CREATE UNIQUE INDEX ux_agent_sessions_name
         ON agent_sessions(agent_id, name) WHERE name IS NOT NULL;
       CREATE INDEX ix_agent_sessions_agent ON agent_sessions(agent_id, updated_at);
+    `,
+  },
+  {
+    version: 2,
+    sql: /* sql */ `
+      CREATE TABLE channel_categories (
+        id          TEXT PRIMARY KEY,
+        slug        TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        position    INTEGER NOT NULL DEFAULT 0,
+        collapsed   INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        created_by  TEXT NOT NULL DEFAULT 'system'
+      );
+      CREATE UNIQUE INDEX ux_channel_categories_slug ON channel_categories(slug);
+
+      -- Deleting a category is a grouping change, not a destructive one: its
+      -- channels fall back to uncategorised rather than going away with it.
+      ALTER TABLE channels
+        ADD COLUMN category_id TEXT REFERENCES channel_categories(id) ON DELETE SET NULL;
+      CREATE INDEX ix_channels_category ON channels(category_id, position);
     `,
   },
 ];

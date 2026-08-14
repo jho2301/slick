@@ -23,9 +23,31 @@ class RemoteWorkspace {
 
     const call = this.request.bind(this);
 
+    this.categories = {
+      list: () => call('GET', '/api/categories').then((r) => r.categories),
+      get: (ref) => call('GET', `/api/categories/${enc(ref)}`).then((r) => r.category),
+      find: (ref) =>
+        call('GET', `/api/categories/${enc(ref)}`)
+          .then((r) => r.category)
+          .catch(() => null),
+      create: (input) => call('POST', '/api/categories', input).then((r) => r.category),
+      update: (ref, patch) => call('PATCH', `/api/categories/${enc(ref)}`, patch).then((r) => r.category),
+      setCollapsed: (ref, collapsed) =>
+        call('PATCH', `/api/categories/${enc(ref)}`, { collapsed }).then((r) => r.category),
+      remove: (ref) => call('DELETE', `/api/categories/${enc(ref)}`).then((r) => r.category),
+      reorder: (refs) => call('POST', '/api/categories/reorder', { order: refs }).then((r) => r.categories),
+    };
+
     this.channels = {
-      list: (opts = {}) =>
-        call('GET', `/api/channels${opts.includeArchived ? '?includeArchived=1' : ''}`).then((r) => r.channels),
+      list: (opts = {}) => {
+        const params = new URLSearchParams();
+        if (opts.includeArchived) params.set('includeArchived', '1');
+        // An explicit null means "the ones with no category", so it has to
+        // survive as an empty value rather than being dropped like undefined.
+        if (opts.category !== undefined) params.set('category', opts.category ?? '');
+        const query = params.toString();
+        return call('GET', `/api/channels${query ? `?${query}` : ''}`).then((r) => r.channels);
+      },
       get: (ref) => call('GET', `/api/channels/${enc(ref)}`).then((r) => r.channel),
       find: (ref) =>
         call('GET', `/api/channels/${enc(ref)}`)

@@ -106,6 +106,7 @@ Talking
 
 Organising
   channel list|create|show|update|archive|unarchive|delete
+  category list|create|show|update|move|reorder|collapse|delete
   message post|list|show|edit|delete
   status                        channels, activity, agents
   init                          create the workspace
@@ -130,6 +131,19 @@ slick search cache --channel deploys
 slick tail --json | while read -r line; do …; done
 ```
 
+Once you have more than a handful of channels, group them into sidebar
+sections:
+
+```bash
+slick category create Engineering
+slick category move deploys engineering       # "none" takes it back out
+slick category reorder engineering product    # top to bottom in the sidebar
+slick category list
+```
+
+A channel is in at most one category; anything in none of them sits under
+"Channels" at the bottom. Deleting a category never touches its channels.
+
 Useful global flags: `--home <dir>` (a different workspace), `--remote <url>`
 (drive a daemon over HTTP instead of the local file), `-q` (print only the
 essential value, for `$(…)`), `--no-color`.
@@ -141,9 +155,11 @@ unreachable, `1` everything else.
 
 - Channel sidebar with unread counts, plus every agent session and its history
   key (one click to copy).
+- Collapsible categories: drag a channel between sections to regroup it, and
+  the fold state sticks (it lives in the database, not the browser).
 - Threads in a side pane, live reply counts.
-- Create, rename, re-topic, archive and delete channels; edit and delete
-  messages inline.
+- Create, rename, re-topic, recategorise, archive and delete channels; edit and
+  delete messages inline.
 - `⌘K` jumps between channels and searches messages in the same box.
 - Live updates over SSE — including changes made by the CLI while you watch.
 - A "claude is typing…" indicator, on the message and in its thread, while
@@ -168,7 +184,7 @@ localhost so a web page you have open cannot reach it.
 ## Layout
 
 ```
-packages/core      storage + domain rules (channels, threads, messages, agents)
+packages/core      storage + domain rules (channels, categories, threads, messages, agents)
 packages/server    the daemon: REST, live SSE stream, hosts the web UI
 packages/cli       the `slick` command
 apps/web           the UI — plain ES modules, no build step
@@ -183,7 +199,7 @@ it over HTTP; the app calls the server. There is exactly one implementation of
 ## Tests
 
 ```bash
-npm test              # 73 tests: core, HTTP API, and the CLI end to end
+npm test              # 87 tests: core, HTTP API, and the CLI end to end
 npm run smoke:ui      # loads the real UI in Electron and drives it
 npm run shots         # screenshots of the UI into $SLICK_HOME/shots
 ```

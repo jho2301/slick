@@ -1,4 +1,5 @@
 import { channel } from './channel.js';
+import { category } from './category.js';
 import { message, read, send, thread } from './message.js';
 import { agent } from './agent.js';
 import { doctor, init, search, status, tail } from './workspace.js';
@@ -11,6 +12,7 @@ export const COMMANDS = [
   send,
   read,
   channel,
+  category,
   message,
   thread,
   agent,
@@ -37,7 +39,7 @@ export const NO_WORKSPACE = new Set(['daemon', 'serve', 'app', 'doctor']);
 
 const GROUPS = [
   ['Talking', ['send', 'read', 'thread', 'search', 'tail']],
-  ['Organising', ['channel', 'message', 'status', 'init']],
+  ['Organising', ['channel', 'category', 'message', 'status', 'init']],
   ['Agents', ['agent']],
   ['Apps', ['app', 'daemon', 'serve', 'doctor']],
 ];

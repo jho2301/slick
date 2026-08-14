@@ -15,6 +15,10 @@ export const EVENT_TYPES = Object.freeze({
   channelArchived: 'channel.archived',
   channelUnarchived: 'channel.unarchived',
   channelDeleted: 'channel.deleted',
+  categoryCreated: 'category.created',
+  categoryUpdated: 'category.updated',
+  categoryDeleted: 'category.deleted',
+  categoryReordered: 'category.reordered',
   messageCreated: 'message.created',
   messageUpdated: 'message.updated',
   messageDeleted: 'message.deleted',
@@ -25,7 +29,11 @@ export const EVENT_TYPES = Object.freeze({
   agentTyping: 'agent.typing',
 });
 
-/** Events an agent cares about when catching up on a conversation. */
+/**
+ * Events an agent cares about when catching up on a conversation. `category.*`
+ * is deliberately absent: rearranging the sidebar is not something an agent
+ * should wake up to handle.
+ */
 export const CONVERSATION_EVENTS = Object.freeze([
   EVENT_TYPES.messageCreated,
   EVENT_TYPES.messageUpdated,

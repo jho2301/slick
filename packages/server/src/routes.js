@@ -40,7 +40,10 @@ export function createRoutes({ ws, hub, push, version }) {
   // ---------------------------------------------------------- channels ---
 
   r('GET /api/channels', ({ q }) => ({
-    channels: ws.channels.list({ includeArchived: q.bool('includeArchived') }),
+    channels: ws.channels.list({
+      includeArchived: q.bool('includeArchived'),
+      category: q.raw.has('category') ? q.get('category') : undefined,
+    }),
   }));
 
   r('POST /api/channels', ({ body }) => CREATED({ channel: ws.channels.create(body) }));
@@ -72,6 +75,29 @@ export function createRoutes({ ws, hub, push, version }) {
   r('POST /api/channels/:ref/messages', ({ params, body }) =>
     CREATED({ message: ws.messages.post({ ...body, channel: params.ref }) })
   );
+
+  // -------------------------------------------------------- categories ---
+
+  r('GET /api/categories', () => ({ categories: ws.categories.list() }));
+
+  r('POST /api/categories', ({ body }) => CREATED({ category: ws.categories.create(body) }));
+
+  // Declared before `:ref` so "reorder" is never read as a category name.
+  r('POST /api/categories/reorder', ({ body }) => ({
+    categories: ws.categories.reorder(body.order ?? body.categories ?? []),
+  }));
+
+  r('GET /api/categories/:ref', ({ params }) => ({ category: ws.categories.get(params.ref) }));
+
+  r('PATCH /api/categories/:ref', ({ params, body }) => ({
+    category: ws.categories.update(params.ref, body),
+  }));
+
+  r('DELETE /api/categories/:ref', ({ params }) => ({ category: ws.categories.remove(params.ref) }));
+
+  r('GET /api/categories/:ref/channels', ({ params, q }) => ({
+    channels: ws.channels.list({ category: params.ref, includeArchived: q.bool('includeArchived') }),
+  }));
 
   // ---------------------------------------------------------- messages ---
 

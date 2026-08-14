@@ -25,15 +25,33 @@ export function slugify(input) {
   return slug;
 }
 
-export function assertSlug(slug) {
+/** @param {string} slug @param {string} [what] what to call it in the error */
+export function assertSlug(slug, what = 'channel') {
   if (!SLUG_RE.test(slug)) {
     throw new ValidationError(
-      `"${slug}" is not a valid channel name. Use 1–64 lowercase letters, digits, "-", "_" or "."`,
+      `"${slug}" is not a valid ${what} name. Use 1–64 lowercase letters, digits, "-", "_" or "."`,
       { details: { slug } }
     );
   }
   return slug;
 }
+
+/**
+ * Every read joins the category in so one channel object is enough to draw a
+ * sidebar row — no second lookup per channel.
+ */
+const selectChannels = (extra = '') => `SELECT c.*,
+                cat.slug     AS category_slug,
+                cat.name     AS category_name,
+                cat.position AS category_position${extra}
+           FROM channels c
+           LEFT JOIN channel_categories cat ON cat.id = c.category_id`;
+
+const CHANNEL_STATS = `,
+                (SELECT COUNT(*) FROM messages m
+                   WHERE m.channel_id = c.id AND m.deleted_at IS NULL) AS message_count,
+                (SELECT MAX(m.created_at) FROM messages m
+                   WHERE m.channel_id = c.id AND m.deleted_at IS NULL) AS last_message_at`;
 
 function serialize(record) {
   const c = row(record);
@@ -45,6 +63,16 @@ function serialize(record) {
     topic: c.topic,
     purpose: c.purpose,
     kind: c.kind,
+    categoryId: c.category_id ?? null,
+    category:
+      c.category_slug == null
+        ? null
+        : {
+            id: c.category_id,
+            slug: c.category_slug,
+            name: c.category_name,
+            position: Number(c.category_position),
+          },
     position: Number(c.position),
     archived: c.archived_at != null,
     archivedAt: c.archived_at == null ? null : Number(c.archived_at),
@@ -63,9 +91,9 @@ export function createChannelService(ctx) {
   function find(ref) {
     if (!ref) return null;
     const raw = String(ref).trim().replace(/^#/, '');
-    const byId = db.prepare('SELECT * FROM channels WHERE id = ?').get(raw);
+    const byId = db.prepare(`${selectChannels()} WHERE c.id = ?`).get(raw);
     if (byId) return serialize(byId);
-    const bySlug = db.prepare('SELECT * FROM channels WHERE slug = ?').get(raw.toLowerCase());
+    const bySlug = db.prepare(`${selectChannels()} WHERE c.slug = ?`).get(raw.toLowerCase());
     return bySlug ? serialize(bySlug) : null;
   }
 
@@ -80,25 +108,40 @@ export function createChannelService(ctx) {
     return found;
   }
 
-  /** @param {{includeArchived?: boolean, withStats?: boolean}} [opts] */
+  /**
+   * `category` takes a slug, an id, or null/'' to clear it; `categoryId` is the
+   * already-resolved form. Returns `undefined` when neither was mentioned, so
+   * an update can tell "leave it alone" from "remove it".
+   */
+  function resolveCategoryId(input) {
+    const ref = input.categoryId !== undefined ? input.categoryId : input.category;
+    if (ref === undefined) return undefined;
+    if (ref === null || ref === '' || ref === false) return null;
+    return ctx.categories.get(ref).id;
+  }
+
+  /** @param {{includeArchived?: boolean, withStats?: boolean, category?: string}} [opts] */
   function list(opts = {}) {
-    const where = opts.includeArchived ? '1 = 1' : 'c.archived_at IS NULL';
-    const sql = opts.withStats === false
-      ? `SELECT c.* FROM channels c WHERE ${where} ORDER BY c.position ASC, c.slug ASC`
-      : `SELECT c.*,
-                (SELECT COUNT(*) FROM messages m
-                   WHERE m.channel_id = c.id AND m.deleted_at IS NULL) AS message_count,
-                (SELECT MAX(m.created_at) FROM messages m
-                   WHERE m.channel_id = c.id AND m.deleted_at IS NULL) AS last_message_at
-           FROM channels c
-          WHERE ${where}
+    const where = [opts.includeArchived ? '1 = 1' : 'c.archived_at IS NULL'];
+    const params = [];
+    if (opts.category !== undefined) {
+      const categoryId = resolveCategoryId({ category: opts.category });
+      if (categoryId === null) where.push('c.category_id IS NULL');
+      else {
+        where.push('c.category_id = ?');
+        params.push(categoryId);
+      }
+    }
+    const sql = `${selectChannels(opts.withStats === false ? '' : CHANNEL_STATS)}
+          WHERE ${where.join(' AND ')}
           ORDER BY c.position ASC, c.slug ASC`;
-    return rows(db.prepare(sql).all()).map(serialize);
+    return rows(db.prepare(sql).all(...params)).map(serialize);
   }
 
   /**
    * @param {{slug: string, name?: string, topic?: string, purpose?: string,
-   *          kind?: string, actor?: {id: string, kind: string}}} input
+   *          kind?: string, category?: string|null, categoryId?: string|null,
+   *          actor?: {id: string, kind: string}}} input
    */
   function create(input) {
     const slug = assertSlug(slugify(input.slug ?? input.name));
@@ -108,13 +151,14 @@ export function createChannelService(ctx) {
       if (existing) {
         throw new ConflictError(`Channel #${slug} already exists.`, { details: { slug } });
       }
+      const categoryId = resolveCategoryId(input) ?? null;
       const now = Date.now();
       const id = newId(ID_PREFIX.channel, now);
       const nextPosition =
         Number(db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS p FROM channels').get().p);
       db.prepare(
-        `INSERT INTO channels (id, slug, name, topic, purpose, kind, position, created_at, updated_at, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO channels (id, slug, name, topic, purpose, kind, category_id, position, created_at, updated_at, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         slug,
@@ -122,6 +166,7 @@ export function createChannelService(ctx) {
         input.topic?.trim() ?? '',
         input.purpose?.trim() ?? '',
         input.kind ?? 'channel',
+        categoryId,
         nextPosition,
         now,
         now,
@@ -142,7 +187,8 @@ export function createChannelService(ctx) {
   /**
    * @param {string} ref
    * @param {{slug?: string, name?: string, topic?: string, purpose?: string,
-   *          position?: number, actor?: {id: string, kind: string}}} patch
+   *          position?: number, category?: string|null, categoryId?: string|null,
+   *          actor?: {id: string, kind: string}}} patch
    */
   function update(ref, patch) {
     const actor = patch.actor ?? defaultActor;
@@ -154,6 +200,7 @@ export function createChannelService(ctx) {
         topic: current.topic,
         purpose: current.purpose,
         position: current.position,
+        categoryId: current.categoryId,
       };
 
       if (patch.slug !== undefined && patch.slug !== null) {
@@ -168,15 +215,17 @@ export function createChannelService(ctx) {
       if (patch.topic !== undefined && patch.topic !== null) next.topic = String(patch.topic).trim();
       if (patch.purpose !== undefined && patch.purpose !== null) next.purpose = String(patch.purpose).trim();
       if (patch.position !== undefined && patch.position !== null) next.position = Number(patch.position);
+      const categoryId = resolveCategoryId(patch);
+      if (categoryId !== undefined) next.categoryId = categoryId;
 
       const changed = Object.keys(next).filter((k) => next[k] !== current[k]);
       if (changed.length === 0) return current;
 
       const now = Date.now();
       db.prepare(
-        `UPDATE channels SET slug = ?, name = ?, topic = ?, purpose = ?, position = ?, updated_at = ?
+        `UPDATE channels SET slug = ?, name = ?, topic = ?, purpose = ?, position = ?, category_id = ?, updated_at = ?
           WHERE id = ?`
-      ).run(next.slug, next.name, next.topic, next.purpose, next.position, now, current.id);
+      ).run(next.slug, next.name, next.topic, next.purpose, next.position, next.categoryId, now, current.id);
 
       const channel = get(current.id);
       recordEvent(db, {

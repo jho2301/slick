@@ -24,13 +24,35 @@ ws.setUser({ id: 'fano', name: 'Fano' });
 const HOUR = 3600_000;
 
 function ensureChannel(def) {
-  return ws.channels.find(def.slug) ?? ws.channels.create(def);
+  const existing = ws.channels.find(def.slug);
+  if (!existing) return ws.channels.create(def);
+  // Re-running against an older workspace should still land the grouping.
+  return def.category && existing.categoryId !== ws.categories.get(def.category).id
+    ? ws.channels.update(existing.id, { category: def.category })
+    : existing;
 }
 
+function ensureCategory(name) {
+  return ws.categories.find(name) ?? ws.categories.create({ name });
+}
+
+const engineering = ensureCategory('Engineering');
+const product = ensureCategory('Product');
+
 ensureChannel({ slug: 'general', topic: 'Everything that does not have a home yet' });
-ensureChannel({ slug: 'agents', topic: 'Where your AI agents report in' });
-ensureChannel({ slug: 'deploys', name: 'deploys', topic: 'Ship logs and incident chatter' });
-ensureChannel({ slug: 'design', name: 'design', topic: 'Screens, copy, and arguments about spacing' });
+ensureChannel({ slug: 'agents', topic: 'Where your AI agents report in', category: engineering.id });
+ensureChannel({
+  slug: 'deploys',
+  name: 'deploys',
+  topic: 'Ship logs and incident chatter',
+  category: engineering.id,
+});
+ensureChannel({
+  slug: 'design',
+  name: 'design',
+  topic: 'Screens, copy, and arguments about spacing',
+  category: product.id,
+});
 
 const claude = ws.agents.find('inbox', { agentId: 'claude' })
   ?? ws.agents.start({ agentId: 'claude', name: 'inbox', channel: 'deploys', title: 'Release watch' });
@@ -92,8 +114,8 @@ if (ws.messages.list('design').messages.length === 0) {
 
 const info = ws.info();
 console.log(
-  `seeded ${info.counts.channels} channels, ${info.counts.messages} messages, ` +
-    `${info.counts.agentSessions} agent sessions in ${info.file}`
+  `seeded ${info.counts.channels} channels in ${info.counts.categories} categories, ` +
+    `${info.counts.messages} messages, ${info.counts.agentSessions} agent sessions in ${info.file}`
 );
 console.log(`claude history key:   ${claude.key}`);
 console.log(`reviewer history key: ${reviewer.key}`);

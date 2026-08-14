@@ -5,7 +5,7 @@
  * nothing new to talk to.
  */
 
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,6 +40,37 @@ export function resolveWebRoot(explicit) {
     if (existsSync(join(candidate, 'index.html'))) return resolve(candidate);
   }
   return null;
+}
+
+/**
+ * The manifest, with the token folded into `start_url`.
+ *
+ * An installed app launches with what the manifest told it and nothing else. A
+ * bare `start_url` leaves it relying on a cookie it has no guarantee of — its
+ * storage may be a fresh profile, a jar the user cleared, or, on iOS, a
+ * home-screen app that was never given Safari's to begin with. Missing that
+ * cookie it launches into the 401 page, whose advice is to run `slick app` —
+ * which opens a browser, not the app you are standing in. So it carries its own
+ * way in.
+ *
+ * This is not a wider exposure than the manifest already was: it 401s like
+ * everything else, so only a caller that could already read the token gets it.
+ *
+ * @returns {string|null} JSON, or null if there is no manifest to serve
+ */
+export function manifestWithToken(webRoot, token) {
+  if (!webRoot || !token) return null;
+  const file = join(resolve(webRoot), 'manifest.webmanifest');
+  if (!existsSync(file)) return null;
+  try {
+    const manifest = JSON.parse(readFileSync(file, 'utf8'));
+    // Relative, so it keeps working whatever port the daemon came up on, and
+    // stays inside `scope` — a start_url outside it is not installable.
+    manifest.start_url = `./?token=${encodeURIComponent(token)}`;
+    return JSON.stringify(manifest);
+  } catch {
+    return null;
+  }
 }
 
 export function createStaticHandler(webRoot) {

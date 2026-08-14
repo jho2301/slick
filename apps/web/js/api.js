@@ -98,6 +98,26 @@ export class Api {
     return this.del(`/api/channels/${encodeURIComponent(ref)}${force ? '?force=1' : ''}`).then((r) => r.channel);
   }
 
+  listCategories() {
+    return this.get('/api/categories').then((r) => r.categories);
+  }
+
+  createCategory(input) {
+    return this.post('/api/categories', input).then((r) => r.category);
+  }
+
+  updateCategory(ref, patch) {
+    return this.patch(`/api/categories/${encodeURIComponent(ref)}`, patch).then((r) => r.category);
+  }
+
+  deleteCategory(ref) {
+    return this.del(`/api/categories/${encodeURIComponent(ref)}`).then((r) => r.category);
+  }
+
+  reorderCategories(order) {
+    return this.post('/api/categories/reorder', { order }).then((r) => r.categories);
+  }
+
   listMessages(ref, { limit = 60, before } = {}) {
     const params = new URLSearchParams({ limit: String(limit) });
     if (before) params.set('before', String(before));

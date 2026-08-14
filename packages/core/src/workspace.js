@@ -7,6 +7,7 @@
 
 import { openDatabase, row, transact } from './db.js';
 import { paths } from './paths.js';
+import { createCategoryService } from './categories.js';
 import { createChannelService } from './channels.js';
 import { createMessageService } from './messages.js';
 import { createAgentService } from './agents.js';
@@ -33,6 +34,9 @@ export class Workspace {
     this.actor = { id: user.id, kind: 'human', label: user.name };
 
     const ctx = { db, actor: this.actor };
+    // Categories first: channels resolve `category: 'engineering'` through them.
+    this.categories = createCategoryService(ctx);
+    ctx.categories = this.categories;
     this.channels = createChannelService(ctx);
     ctx.channels = this.channels;
     this.messages = createMessageService(ctx);
@@ -127,6 +131,7 @@ export class Workspace {
       counts: {
         channels: count('SELECT COUNT(*) AS n FROM channels WHERE archived_at IS NULL'),
         archivedChannels: count('SELECT COUNT(*) AS n FROM channels WHERE archived_at IS NOT NULL'),
+        categories: count('SELECT COUNT(*) AS n FROM channel_categories'),
         messages: count('SELECT COUNT(*) AS n FROM messages WHERE deleted_at IS NULL'),
         threads: count(
           'SELECT COUNT(*) AS n FROM messages WHERE parent_id IS NULL AND reply_count > 0 AND deleted_at IS NULL'

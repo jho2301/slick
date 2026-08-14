@@ -10,7 +10,7 @@ export const channel = {
   list                          channels you can post in
   create <name> [options]       make a channel
   show <channel>                topic, purpose and activity
-  update <channel> [options]    change name, topic, purpose or slug
+  update <channel> [options]    change name, topic, purpose, slug or category
   archive <channel>             hide it without losing anything
   unarchive <channel>           bring it back
   delete <channel> [--force]    remove it permanently
@@ -21,10 +21,13 @@ Options
   --topic <text>                one-line topic
   --purpose <text>              what the channel is for
   --rename <slug>               change the #handle
-  --force                       allow deleting a channel that still has messages`,
+  --category <category>         put it in a sidebar category ("none" to take it out)
+  --force                       allow deleting a channel that still has messages
+
+Sidebar sections live in \`slick category\`.`,
   spec: {
     booleans: ['all', 'force'],
-    strings: ['name', 'topic', 'purpose', 'rename'],
+    strings: ['name', 'topic', 'purpose', 'rename', 'category'],
   },
 
   async run(ctx) {
@@ -40,12 +43,14 @@ Options
         table(
           channels.map((c) => ({
             channel: `${c.archived ? style.dim('#') : style.bold('#')}${c.archived ? style.dim(c.slug) : c.slug}`,
+            category: c.category ? style.dim(c.category.name) : style.dim('—'),
             messages: String(c.messageCount ?? 0),
             active: c.lastMessageAt ? ago(c.lastMessageAt) : style.dim('—'),
             topic: c.archived ? style.yellow('archived') : style.dim(c.topic || ''),
           })),
           [
             { key: 'channel', label: 'channel' },
+            { key: 'category', label: 'category' },
             { key: 'messages', label: 'msgs', align: 'right' },
             { key: 'active', label: 'last activity' },
             { key: 'topic', label: 'topic' },
@@ -64,9 +69,13 @@ Options
           name: flags.name,
           topic: flags.topic,
           purpose: flags.purpose,
+          category: flags.category === undefined || isClear(flags.category) ? null : flags.category,
         });
         if (ctx.json) return json({ channel: created });
-        ok(`Created ${style.bold(`#${created.slug}`)}`);
+        ok(
+          `Created ${style.bold(`#${created.slug}`)}` +
+            (created.category ? ` in ${style.bold(created.category.name)}` : '')
+        );
         note(`  ${created.id}`);
         return;
       }
@@ -81,6 +90,7 @@ Options
         const rows = [
           ['id', found.id],
           ['name', found.name],
+          ['category', found.category ? found.category.name : style.dim('—')],
           ['purpose', found.purpose || style.dim('—')],
           ['created', `${new Date(found.createdAt).toLocaleString()} by ${found.createdBy}`],
           ['messages', String(found.messageCount ?? 0)],
@@ -99,9 +109,10 @@ Options
         if (flags.topic !== undefined) patch.topic = flags.topic;
         if (flags.purpose !== undefined) patch.purpose = flags.purpose;
         if (flags.rename !== undefined) patch.slug = flags.rename;
+        if (flags.category !== undefined) patch.category = isClear(flags.category) ? null : flags.category;
         if (Object.keys(patch).length === 0) {
           throw new ValidationError('Nothing to change.', {
-            hint: 'Pass --name, --topic, --purpose or --rename.',
+            hint: 'Pass --name, --topic, --purpose, --rename or --category.',
           });
         }
         const updated = await ws.channels.update(ref, patch);
@@ -150,3 +161,11 @@ export function requireRef(value, what) {
   if (!value) throw new ValidationError(`Which ${what}?`, { hint: `Pass a ${what} as the next argument.` });
   return value;
 }
+
+/**
+ * Wherever a category can be named, these all mean "no category" — so both
+ * `--category none` here and `slick category move #deploys none` clear it.
+ */
+const CLEARED = new Set(['none', '-', 'clear', 'null', 'uncategorised', 'uncategorized']);
+
+export const isClear = (value) => value === undefined || CLEARED.has(String(value).trim().toLowerCase());
