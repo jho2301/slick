@@ -31,6 +31,7 @@ import {
   toast,
 } from './ui.js';
 import { createMentionMenu } from './mentions.js';
+import { initPaneResizer } from './panes.js';
 import { currentSubscription, disablePush, enablePush, pushSupported } from './push.js';
 
 const api = new Api();
@@ -96,17 +97,23 @@ function dayDivider(ts) {
 function messageActions(message, { inThread }) {
   const editable = message.author.kind !== 'system';
   const scope = inThread ? 'thread' : 'timeline';
+  // The bar rides a full-height rail so it can stick to the top of the
+  // scrollport while a long message is still on screen.
   return el(
     'div',
-    { class: 'msg__actions' },
-    !inThread && message.isThreadRoot
-      ? el('button', { onclick: () => openThread(message.id), title: 'Reply in thread' }, 'Reply')
-      : null,
-    editable ? el('button', { onclick: () => startEdit(message.id, scope), title: 'Edit' }, 'Edit') : null,
-    el('button', { onclick: () => copyId(message.id), title: 'Copy message id' }, 'Copy id'),
-    editable
-      ? el('button', { class: 'is-danger', onclick: () => removeMessage(message), title: 'Delete' }, 'Delete')
-      : null
+    { class: 'msg__rail' },
+    el(
+      'div',
+      { class: 'msg__actions' },
+      !inThread && message.isThreadRoot
+        ? el('button', { onclick: () => openThread(message.id), title: 'Reply in thread' }, 'Reply')
+        : null,
+      editable ? el('button', { onclick: () => startEdit(message.id, scope), title: 'Edit' }, 'Edit') : null,
+      el('button', { onclick: () => copyId(message.id), title: 'Copy message id' }, 'Copy id'),
+      editable
+        ? el('button', { class: 'is-danger', onclick: () => removeMessage(message), title: 'Delete' }, 'Delete')
+        : null
+    )
   );
 }
 
@@ -1351,6 +1358,7 @@ function wireComposer(inputId, formId, buttonId, submit, menuId) {
 
 function wire() {
   initModal();
+  initPaneResizer();
 
   const syncMain = wireComposer('#composer-input', '#composer', '#btn-send', send, '#mention-menu-main');
   wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply, '#mention-menu-thread');

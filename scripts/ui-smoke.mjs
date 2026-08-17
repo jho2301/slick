@@ -127,6 +127,73 @@ async function main() {
       check('thread shows root + replies', replies >= 2, `${replies} rows`);
       check('fenced code rendered in thread', await js('!!document.querySelector("#thread-body pre code")'));
       await shoot('02-thread');
+
+      console.log('\nresizing the thread pane');
+      check('the split handle is there once a thread is open', await visible('#thread-resizer'));
+      // Where a real pointer lands, not where an event can be aimed: the
+      // handle is an overlay, and anything painting over it would leave it
+      // looking fine and still be impossible to grab.
+      const grabbable = await js(`
+        (() => {
+          const b = document.querySelector('#thread-resizer').getBoundingClientRect();
+          const x = b.left + b.width / 2;
+          return [80, 300, 600].map(y => {
+            const hit = document.elementFromPoint(x, y);
+            return hit && hit.id === 'thread-resizer';
+          });
+        })()
+      `);
+      check('and a pointer on it hits it at any height', grabbable.every(Boolean), grabbable.join(', '));
+      // A real drag, in the events one produces: press on the handle, move the
+      // pointer left, let go. Left is wider — the thread is the right column.
+      const dragged = await js(`
+        (() => {
+          const handle = document.querySelector('#thread-resizer');
+          const box = handle.getBoundingClientRect();
+          const before = document.querySelector('#thread').getBoundingClientRect().width;
+          const at = (x) => ({ clientX: x, clientY: box.top + 40, button: 0, bubbles: true });
+          handle.dispatchEvent(new PointerEvent('pointerdown', at(box.left + box.width / 2)));
+          const lit = handle.classList.contains('is-dragging');
+          window.dispatchEvent(new PointerEvent('pointermove', at(box.left + box.width / 2 - 120)));
+          const after = document.querySelector('#thread').getBoundingClientRect().width;
+          window.dispatchEvent(new PointerEvent('pointerup', at(box.left + box.width / 2 - 120)));
+          return { lit, before, after, dragging: handle.classList.contains('is-dragging') };
+        })()
+      `);
+      check('the handle lights up while dragging', dragged.lit);
+      check(
+        'dragging left widens the thread by what the pointer moved',
+        Math.abs(dragged.after - dragged.before - 120) < 2,
+        `${Math.round(dragged.before)}px → ${Math.round(dragged.after)}px`
+      );
+      check('and the drag state is cleaned up on release', !dragged.dragging);
+      check(
+        'the width is remembered',
+        (await js('localStorage.getItem("slick.thread-width")')) === String(Math.round(dragged.after))
+      );
+      // Past the clamp the channel would be unreadable, so the handle stops.
+      const clamped = await js(`
+        (() => {
+          const handle = document.querySelector('#thread-resizer');
+          const box = handle.getBoundingClientRect();
+          const at = (x) => ({ clientX: x, clientY: box.top + 40, button: 0, bubbles: true });
+          handle.dispatchEvent(new PointerEvent('pointerdown', at(box.left)));
+          window.dispatchEvent(new PointerEvent('pointermove', at(-4000)));
+          window.dispatchEvent(new PointerEvent('pointerup', at(-4000)));
+          return {
+            thread: document.querySelector('#thread').getBoundingClientRect().width,
+            channel: document.querySelector('#main').getBoundingClientRect().width,
+          };
+        })()
+      `);
+      check('a drag past the end leaves the channel readable', clamped.channel >= 420, `${Math.round(clamped.channel)}px`);
+      await shoot('02b-thread-wide');
+      await js('document.querySelector("#thread-resizer").dispatchEvent(new MouseEvent("dblclick", {bubbles: true}))');
+      await sleep(200);
+      check(
+        'double-click puts it back to the default width',
+        Math.abs((await js('document.querySelector("#thread").getBoundingClientRect().width')) - 400) < 1
+      );
     }
 
     console.log('\nsending');

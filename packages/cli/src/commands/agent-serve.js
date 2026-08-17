@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ConflictError, NotFoundError, slickHome } from '@slick/core';
@@ -119,22 +120,35 @@ function plainTranscript(messages) {
     .join('\n');
 }
 
-/** What we hand the model: who said what, the recent conversation, its own memory. */
-function buildPrompt({ agentId, event, context, state, extra }) {
+/**
+ * The agent's own memory, minus our bookkeeping. `serve` keeps its resume id
+ * (and the signature below) in the same bag the human writes to with
+ * `slick agent state set`, and neither belongs in a prompt: the model cannot
+ * use them, and they would make "has the state changed?" fire on our writes.
+ */
+function publicState(state) {
+  const out = {};
+  for (const [key, value] of Object.entries(state ?? {})) {
+    if (!key.startsWith('_')) out[key] = value;
+  }
+  return out;
+}
+
+const stateSignature = (json) => createHash('sha256').update(json).digest('hex').slice(0, 16);
+
+/**
+ * What we hand the model: the recent conversation, its memory, the message.
+ * No standing "you are X, reply with only the post" preamble — every agent
+ * behind `--cmd` already knows what it is from its own configuration, and one
+ * resumed transcript would otherwise carry a fresh copy per message forever.
+ */
+function buildPrompt({ event, context, stateJson, extra }) {
   const message = event.message;
-  const parts = [
-    `You are "${agentId}", a participant in a Slick workspace (a small Slack-shaped ` +
-      `chat for one person and their AI agents). Someone just wrote a message that ` +
-      `addresses you. Reply with only the message you want posted in the thread as ` +
-      `your answer — no preamble like "Sure, here's my reply", no meta-commentary ` +
-      `about being an AI.`,
-  ];
+  const parts = [];
   if (context?.length > 0) {
     parts.push(`Recent conversation in #${event.channelSlug ?? message.channelSlug ?? '?'}:\n${plainTranscript(context)}`);
   }
-  if (state && Object.keys(state).length > 0) {
-    parts.push(`Your saved state from earlier runs:\n${JSON.stringify(state)}`);
-  }
+  if (stateJson) parts.push(`Your saved state from earlier runs:\n${stateJson}`);
   parts.push(`The message to answer, from ${message.author.label}:\n${message.text}`);
   if (extra) parts.push(extra);
   return parts.join('\n\n');
@@ -234,6 +248,13 @@ export async function serve(ws, ref, ctx) {
   }
 
   let claudeSessionId = session.state?._serveSessionId ?? null;
+  /**
+   * Signature of the state the resumed transcript has already been shown. It
+   * lives in the database next to the resume id because the transcript
+   * outlives this process: a `--once` run would otherwise re-send the same
+   * memory on every invocation.
+   */
+  let stateSig = session.state?._serveStateSig ?? null;
   /** message id → consecutive failed attempts, so one bad message cannot wedge the queue. */
   const failures = new Map();
   let backoff = interval;
@@ -250,18 +271,26 @@ export async function serve(ws, ref, ctx) {
       // clears) than silently skip something nobody ever saw.
       let failedAtSeq = null;
 
+      const memory = publicState(resumed.state);
+      const stateJson = Object.keys(memory).length > 0 ? JSON.stringify(memory) : null;
+      const currentSig = stateJson ? stateSignature(stateJson) : null;
+
       for (const event of targets) {
-        const prompt = buildPrompt({
-          agentId: respondAgentId,
-          event,
-          context: resumed.context,
-          state: resumed.state,
-          extra: flags.system,
-        });
+        // A fresh session has never seen the agent's memory; a resumed one is
+        // still holding the copy we sent it, so it only needs the new value
+        // when the human (or the agent) has actually changed something.
+        const includeState = (fresh) => Boolean(stateJson) && (fresh || !claudeSessionId || currentSig !== stateSig);
+        const promptFor = (fresh) =>
+          buildPrompt({
+            event,
+            context: resumed.context,
+            stateJson: includeState(fresh) ? stateJson : null,
+            extra: flags.system,
+          });
 
         if (dryRun) {
           line(style.dim(`--- would call ${cmd} for ${event.message.id} ---`));
-          line(prompt);
+          line(promptFor(false));
           line();
           continue;
         }
@@ -277,8 +306,9 @@ export async function serve(ws, ref, ctx) {
         try {
           await ws.agents.typing(ref, { ...typingOpts, on: true });
           let result;
+          let sentState = includeState(false);
           try {
-            const call = (resumeId) =>
+            const call = (resumeId, prompt) =>
               callAgent({
                 cmd,
                 prompt,
@@ -290,7 +320,7 @@ export async function serve(ws, ref, ctx) {
                 appendSystemPrompt: flags['append-system-prompt'],
                 timeoutMs,
               });
-            result = await call(claudeSessionId);
+            result = await call(claudeSessionId, promptFor(false));
 
             // One resumed transcript is reused for every message forever, so it
             // only ever grows. Once it outgrows the request limit every later
@@ -300,8 +330,14 @@ export async function serve(ws, ref, ctx) {
             if (result.error && claudeSessionId && isSessionFatal(result.error)) {
               warn(`Retiring the resumed ${cmd} session — ${result.error}`);
               claudeSessionId = null;
-              await ws.agents.setState(ref, { _serveSessionId: null }, { agentId: ctx.agentId, merge: true });
-              result = await call(null);
+              stateSig = null; // the new transcript starts out knowing nothing
+              await ws.agents.setState(
+                ref,
+                { _serveSessionId: null, _serveStateSig: null },
+                { agentId: ctx.agentId, merge: true }
+              );
+              sentState = includeState(true);
+              result = await call(null, promptFor(true));
             }
           } finally {
             await ws.agents.typing(ref, { ...typingOpts, on: false });
@@ -310,6 +346,8 @@ export async function serve(ws, ref, ctx) {
           // Only a session that worked is worth remembering. Saving the id from
           // a failed call is what let the unusable one survive every restart.
           if (!result.error && result.sessionId) claudeSessionId = result.sessionId;
+          // Likewise: only a call that landed proves the memory got through.
+          if (!result.error && sentState) stateSig = currentSig;
 
           if (result.error) {
             const attempts = (failures.get(event.message.id) ?? 0) + 1;
@@ -366,8 +404,11 @@ export async function serve(ws, ref, ctx) {
       }
 
       if (!dryRun) {
-        if (claudeSessionId) {
-          await ws.agents.setState(ref, { _serveSessionId: claudeSessionId }, { agentId: ctx.agentId, merge: true });
+        const patch = {};
+        if (claudeSessionId) patch._serveSessionId = claudeSessionId;
+        if (stateSig) patch._serveStateSig = stateSig;
+        if (Object.keys(patch).length > 0) {
+          await ws.agents.setState(ref, patch, { agentId: ctx.agentId, merge: true });
         }
         const safeCount = failedAtSeq == null ? resumed.missed.length : resumed.missed.findIndex((e) => e.seq === failedAtSeq);
         if (safeCount > 0) {

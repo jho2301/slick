@@ -12,7 +12,7 @@
    the offline copy below in one pass and drops the old one. Freshness does not
    depend on remembering to, though — the network is asked first either way, so
    a shell that ships without a bump here still arrives on the next launch. */
-const CACHE = 'slick-shell-v8';
+const CACHE = 'slick-shell-v9';
 const SHELL = [
   './',
   './index.html',
@@ -22,6 +22,7 @@ const SHELL = [
   './js/format.js',
   './js/ui.js',
   './js/mentions.js',
+  './js/panes.js',
   './js/push.js',
   './js/vendor/markdown-it.esm.min.mjs',
   './manifest.webmanifest',

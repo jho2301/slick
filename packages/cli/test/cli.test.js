@@ -1,7 +1,7 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -351,6 +351,56 @@ describe('agent serve', () => {
     } finally {
       rmSync(lock, { force: true });
     }
+  });
+
+  /** Serve one round and return exactly what the child process was handed. */
+  async function serveDump(extra = [], env = {}) {
+    const dump = join(home, 'fake-agent-call.json');
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', ...extra], {
+      env: { FAKE_AGENT_DUMP: dump, ...env },
+    });
+    assert.equal(result.code, 0, result.stderr);
+    return JSON.parse(readFileSync(dump, 'utf8'));
+  }
+
+  test('the prompt carries the conversation and the message, and no role preamble', async () => {
+    await slick(['send', 'general', '@claude who are you']);
+    const call = await serveDump();
+    assert.equal(call.system, null, 'nothing is appended to the system prompt by default');
+    assert.doesNotMatch(call.prompt, /You are "claude"/, 'not re-sent on every turn');
+    assert.match(call.prompt, /Recent conversation in #general/);
+    assert.match(call.prompt, /who are you$/);
+  });
+
+  test('--append-system-prompt is passed through when asked for', async () => {
+    await slick(['send', 'general', '@claude with a house rule']);
+    const call = await serveDump(['--append-system-prompt', 'Answer in French.']);
+    assert.equal(call.system, 'Answer in French.');
+  });
+
+  test('saved state is sent when it changes, and not again until it does', async () => {
+    await slick(['agent', 'state', 'set', key, 'step=verifying']);
+    await slick(['send', 'general', '@claude first look']);
+    const first = await serveDump();
+    assert.match(first.prompt, /Your saved state from earlier runs/);
+    assert.match(first.prompt, /"step":"verifying"/);
+    assert.doesNotMatch(first.prompt, /_serveSessionId/, 'our bookkeeping is not the agent’s memory');
+
+    await slick(['send', 'general', '@claude nothing changed']);
+    const second = await serveDump();
+    assert.doesNotMatch(second.prompt, /Your saved state/, 'the resumed transcript is still holding it');
+
+    await slick(['agent', 'state', 'set', key, 'step=done']);
+    await slick(['send', 'general', '@claude changed now']);
+    const third = await serveDump();
+    assert.match(third.prompt, /"step":"done"/);
+  });
+
+  test('a retired session is told the state again, having never seen it', async () => {
+    await slick(['send', 'general', '@claude after the retirement']);
+    const call = await serveDump([], { FAKE_AGENT_OVERSIZED_RESUME: '1' });
+    assert.equal(call.resumed, false, 'the oversized resume was retired for a fresh session');
+    assert.match(call.prompt, /"step":"done"/, 'which starts out knowing nothing');
   });
 
   test('but a lock left behind by a dead process does not', async () => {

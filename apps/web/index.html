@@ -126,6 +126,19 @@
       </main>
 
       <aside class="thread" id="thread" hidden>
+        <!-- Laid over this pane's left border rather than given a column of its
+             own, so the split costs the layout nothing. Inside the thread and
+             not beside it for the same reason: out here it would be a grid item
+             and would have to be styled to stop being one. -->
+        <div
+          class="pane-resizer"
+          id="thread-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize thread panel"
+          tabindex="0"
+          title="Drag to resize · double-click to reset"
+        ></div>
         <header class="thread__head">
           <div class="thread__head-left">
             <button class="icon-btn icon-btn--ghost only-narrow" id="btn-thread-back" aria-label="Back to channel">

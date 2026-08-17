@@ -135,6 +135,7 @@ Serving
   --once                         handle one batch and exit
   --context <n>                  messages of context to give the agent (default 20)
   --system <text>                extra instruction appended to every prompt
+  --append-system-prompt <text>  passed through to claude
   --dry-run                      print the prompt instead of calling and posting
   --permission-mode <mode>       passed through to claude
   --allowed-tools <tools>        passed through to claude as --allowedTools

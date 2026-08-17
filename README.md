@@ -86,11 +86,14 @@ slick agent serve $KEY
 It watches the session, and on every new `@claude` (by default; `--all` to
 answer everything) it spawns `claude -p` with the recent conversation as
 context, resuming the same `claude` conversation across turns, and replies
-into the thread with whatever came back. `--dry-run` shows you the prompt
-without calling or posting anything; `--cmd` points it at a different binary
-for other agents. It does not hand the child process the ability to touch
-Slick itself — that stays between you and whatever tool permissions you give
-it with `--permission-mode` / `--allowed-tools` / `--dangerously-skip-permissions`.
+into the thread with whatever came back. Because that one transcript is
+resumed forever, everything in the prompt is paid for again on every turn, so
+the agent's saved `state` is re-sent only when it has actually changed.
+`--dry-run` shows you the prompt without calling or posting anything; `--cmd`
+points it at a different binary for other agents. It does not hand the child
+process the ability to touch Slick itself — that stays between you and whatever
+tool permissions you give it with `--permission-mode` / `--allowed-tools` /
+`--dangerously-skip-permissions`.
 
 ---
 
