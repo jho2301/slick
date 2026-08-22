@@ -84,11 +84,63 @@ slick agent serve $KEY
 ```
 
 It watches the session, and on every new `@claude` (by default; `--all` to
-answer everything) it spawns `claude -p` with the recent conversation as
-context, resuming the same `claude` conversation across turns, and replies
-into the thread with whatever came back. Because that one transcript is
-resumed forever, everything in the prompt is paid for again on every turn, so
-the agent's saved `state` is re-sent only when it has actually changed.
+answer everything) it spawns `claude -p` with the conversation as context and
+replies into the thread with whatever came back.
+
+**One thread is one conversation.** Each Slick thread gets its own `claude`
+session, resumed across every message in that thread and no other, so two
+threads running at once never read each other's turns — and the prompt for a
+thread is that thread, not the whole channel. A mention that starts a new
+thread starts a fresh session, with the recent channel messages as its
+orientation. Because a thread's transcript is resumed for as long as the thread
+lives, everything in the prompt is paid for again on every turn, so the agent's
+saved `state` is re-sent only when it has actually changed. The 50 most
+recently used threads are remembered (in `_serveThreads`); wake an older one
+and it simply starts a new session. `--shared-session` goes back to a single
+conversation shared by every thread.
+
+**Changing the model, without stopping anything.** `--model` picks one when the
+watcher starts, but a watcher can stay up for weeks — so the model is read out
+of the session on every pass, and `slick agent model` writes it there:
+
+```bash
+slick agent model $KEY anthropic/claude-opus-4   # from the next message answered
+slick agent model $KEY                           # what is it running?
+slick agent model $KEY --clear                   # back to the --model default
+```
+
+The app does the same thing without a terminal: open **Agents** at the foot of
+the sidebar and click the model under an agent's history key. Either way it is
+one setting in one place — change it in the app and `slick agent model` reads
+it back, and the rail updates itself when the CLI writes it.
+
+**Where the list comes from.** Nobody remembers model names, so `serve` asks
+the binary for them: `<cmd> --list-models`, answered with JSON, at most once
+every six hours.
+
+```json
+{"models": [{"id": "copilot::gpt-5.4", "label": "gpt-5.4", "group": "copilot"}]}
+```
+
+The answer is cached on the session, which is what turns the app's text box
+into a menu grouped by provider — and `slick agent model $KEY --list` prints
+the same list. `id` is opaque to Slick: it hands it straight back as
+`--model`, so an agent can encode whatever routing it needs in there. An agent
+that has never heard of the flag (the `claude` CLI, today) simply keeps the
+text box, and is not asked again for six hours.
+
+Threads keep their conversations across the switch, and the setting is our
+bookkeeping, not the agent's memory — it never shows up in a prompt.
+
+**Only agents that answer are offered.** A session that nothing watches — the
+cron job that posts a morning digest owns a history key and a cursor exactly
+like an agent does — is not something you can talk to, so the app keeps it out
+of the sidebar and out of the `@mention` picker. What counts is the lock a
+running `serve` holds plus the bookkeeping it leaves behind, so an agent stays
+listed while its watcher restarts. `slick agent sessions` still shows every
+session and a `serve` column saying which is which: `watching`, `idle` (served
+before, nothing up right now), or `posts only`.
+
 `--dry-run` shows you the prompt without calling or posting anything; `--cmd`
 points it at a different binary for other agents. It does not hand the child
 process the ability to touch Slick itself — that stays between you and whatever
@@ -115,7 +167,7 @@ Organising
   init                          create the workspace
 
 Agents
-  agent start|sessions|resume|pull|post|reply|state|ack|watch|serve|end
+  agent start|sessions|resume|pull|post|reply|state|model|ack|watch|serve|end
 
 Apps
   app                           open the desktop app
@@ -184,6 +236,12 @@ mode 600). The desktop app trades that token for an `HttpOnly` cookie on first
 load; scripts use `Authorization: Bearer`. The `Host` header is pinned to
 localhost so a web page you have open cannot reach it.
 
+To run without a token, create an empty `~/.slick/no-auth` file (or set
+`SLICK_NO_AUTH=1`, or pass `slickd --no-auth`) and restart the daemon. The
+loopback bind and the `Host` pin still apply, so only local processes can
+connect — but any of them can, including a page in your browser. Delete the
+file to turn auth back on.
+
 ## Layout
 
 ```
@@ -202,7 +260,7 @@ it over HTTP; the app calls the server. There is exactly one implementation of
 ## Tests
 
 ```bash
-npm test              # 87 tests: core, HTTP API, and the CLI end to end
+npm test              # 116 tests: core, HTTP API, and the CLI end to end
 npm run smoke:ui      # loads the real UI in Electron and drives it
 npm run shots         # screenshots of the UI into $SLICK_HOME/shots
 ```

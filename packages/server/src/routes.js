@@ -7,6 +7,8 @@
  * apart.
  */
 
+import { SERVE_MODELS_AT_KEY, readServeModel, readServeModelChoices } from '@slick/core';
+
 import { createRouter, query } from './http.js';
 
 /** Returned by handlers that wrote the response themselves. */
@@ -14,7 +16,7 @@ export const RAW = Symbol('raw');
 
 const CREATED = (body) => ({ status: 201, body });
 
-export function createRoutes({ ws, hub, push, version }) {
+export function createRoutes({ ws, hub, push, version, build }) {
   const router = createRouter();
   const r = router.add;
 
@@ -23,6 +25,9 @@ export function createRoutes({ ws, hub, push, version }) {
   r('GET /api/health', () => ({
     ok: true,
     version,
+    // Which build of the UI this daemon is serving right now. `version` is
+    // hand-written and answers a different question — see `buildStamp`.
+    build: build?.() ?? null,
     seq: ws.seq(),
     pid: process.pid,
     workspace: ws.getMeta('workspace.name', 'Slick'),
@@ -183,6 +188,24 @@ export function createRoutes({ ws, hub, push, version }) {
   r('PUT /api/agents/sessions/:ref/state', ({ params, body }) => ({
     session: ws.agents.setState(params.ref, body.state ?? {}, { merge: body.merge !== false }),
   }));
+
+  // Which model `slick agent serve` calls for this session. A running watcher
+  // re-reads it every pass, so this changes the answer without restarting it.
+  r('GET /api/agents/sessions/:ref/model', ({ params, q }) => {
+    const { state } = ws.agents.get(params.ref, { agentId: q.get('agent') });
+    return {
+      model: readServeModel(state),
+      // What the agent binary last told `serve` it can run, so a human picks
+      // from a list instead of remembering model names.
+      choices: readServeModelChoices(state),
+      checkedAt: Number(state?.[SERVE_MODELS_AT_KEY]) || null,
+    };
+  });
+
+  r('PUT /api/agents/sessions/:ref/model', ({ params, body }) => {
+    const session = ws.agents.setModel(params.ref, body.model ?? null, { agentId: body.agent });
+    return { model: readServeModel(session.state), session };
+  });
 
   r('POST /api/agents/sessions/:ref/messages', ({ params, body }) =>
     CREATED(ws.agents.post(params.ref, body))

@@ -15,7 +15,7 @@ import { Workspace } from '@slick/core';
 import { createRoutes, RAW } from './routes.js';
 import { createHub } from './hub.js';
 import { createPushService } from './push.js';
-import { createStaticHandler, manifestWithToken, resolveWebRoot } from './static.js';
+import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot, serviceWorkerWithBuild } from './static.js';
 import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.js';
 
 export const VERSION = '0.1.0';
@@ -42,7 +42,7 @@ export function createServer(opts = {}) {
   const webRoot = opts.webRoot === null ? null : resolveWebRoot(opts.webRoot);
   const push = opts.push ?? createPushService(ws);
   const hub = createHub(ws, { push });
-  const router = createRoutes({ ws, hub, push, version: VERSION });
+  const router = createRoutes({ ws, hub, push, version: VERSION, build: () => buildStamp(webRoot) });
   const serveStatic = createStaticHandler(webRoot);
 
   function authenticate(req, url) {
@@ -154,6 +154,20 @@ export function createServer(opts = {}) {
           'cache-control': 'no-cache',
         });
         return res.end(manifest);
+      }
+    }
+
+    // Also ahead of the static handler: the copy on disk has a placeholder
+    // where the build stamp goes. See `serviceWorkerWithBuild`.
+    if (req.method === 'GET' && url.pathname === '/sw.js') {
+      const source = serviceWorkerWithBuild(webRoot, buildStamp(webRoot));
+      if (source !== null) {
+        res.writeHead(200, {
+          'content-type': 'text/javascript; charset=utf-8',
+          'content-length': Buffer.byteLength(source),
+          'cache-control': 'no-cache',
+        });
+        return res.end(source);
       }
     }
 

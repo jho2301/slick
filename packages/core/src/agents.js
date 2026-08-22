@@ -16,6 +16,7 @@
 import { ConflictError, NotFoundError, ValidationError } from './errors.js';
 import { newHistoryKey, looksLikeHistoryKey } from './ids.js';
 import { row, rows, transact } from './db.js';
+import { serveStatus } from './serve.js';
 import {
   CONVERSATION_EVENTS,
   EVENT_TYPES,
@@ -26,6 +27,62 @@ import {
 } from './events.js';
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+/**
+ * Where a session records the model `slick agent serve` should call for it.
+ *
+ * It is underscore-prefixed because it is our bookkeeping, not the agent's
+ * memory: `serve` keeps those keys out of the prompt, so switching models
+ * never looks to the agent like something it wrote has changed.
+ */
+export const SERVE_MODEL_KEY = '_serveModel';
+
+/** The model set on a session, or null for "whatever the agent defaults to". */
+export function readServeModel(state) {
+  const value = state?.[SERVE_MODEL_KEY];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * The models the agent behind this session says it can run, as `serve` last
+ * asked it (`<cmd> --list-models`). It is a cache of someone else's answer,
+ * not a rule: a model missing from it is still allowed, because the binary is
+ * the authority on that and this list can be a day old.
+ */
+export const SERVE_MODELS_KEY = '_serveModelChoices';
+
+/** When that list was last fetched, so a watcher re-asks rather than never. */
+export const SERVE_MODELS_AT_KEY = '_serveModelsAt';
+
+/** How many we keep. A provider list this long is already a scrolling menu. */
+const MAX_CHOICES = 300;
+
+/**
+ * Normalise whatever the binary answered into `{id, label, group}` rows.
+ * Accepts a bare array of names, or objects with `id`/`name`/`model`, so an
+ * agent can answer in the shape that suits it.
+ * @returns {Array<{id: string, label: string, group: string|null}>}
+ */
+export function normalizeModelChoices(input) {
+  const list = Array.isArray(input) ? input : Array.isArray(input?.models) ? input.models : [];
+  const out = [];
+  const seen = new Set();
+  for (const entry of list) {
+    const id = String((typeof entry === 'string' ? entry : (entry?.id ?? entry?.name ?? entry?.model)) ?? '').trim();
+    if (!id || id.length > 200 || seen.has(id)) continue;
+    seen.add(id);
+    const label = String(entry?.label ?? entry?.name ?? id).trim().slice(0, 200) || id;
+    const group = entry?.group ?? entry?.provider ?? null;
+    out.push({ id, label, group: group ? String(group).trim().slice(0, 80) : null });
+    if (out.length >= MAX_CHOICES) break;
+  }
+  return out;
+}
+
+/** The choices stored on a session, normalised. Always an array. */
+export function readServeModelChoices(state) {
+  return normalizeModelChoices(state?.[SERVE_MODELS_KEY]);
+}
 
 function parseState(value) {
   try {
@@ -47,11 +104,16 @@ function stableJson(value) {
 }
 
 export function createAgentService(ctx) {
-  const { db, channels, messages } = ctx;
+  const { db, channels, messages, home } = ctx;
 
   function serialize(record) {
     const s = row(record);
     if (!s) return null;
+    const state = parseState(s.state);
+    // Whether anyone answers for this session, rather than only posts through
+    // it. Every caller that offers agents to a human needs this, and none of
+    // them can work it out from the row alone.
+    const serve = serveStatus({ key: s.key, status: s.status, state }, home);
     return {
       key: s.key,
       agentId: s.agent_id,
@@ -60,8 +122,10 @@ export function createAgentService(ctx) {
       channelId: s.channel_id,
       channelSlug: s.channel_slug ?? null,
       cursorSeq: Number(s.cursor_seq),
-      state: parseState(s.state),
+      state,
       status: s.status,
+      callable: serve.callable,
+      serve,
       messageCount: Number(s.message_count),
       resumeCount: Number(s.resume_count),
       createdAt: Number(s.created_at),
@@ -387,6 +451,56 @@ export function createAgentService(ctx) {
     });
   }
 
+  /**
+   * Choose the model `serve` calls for this session — from the CLI, the app,
+   * or anything else that can reach the database. A watcher re-reads it on
+   * every pass, so a running one switches without being restarted.
+   *
+   * @param {string} ref
+   * @param {string|null} model  a model name, or null/'' to go back to the default
+   * @param {{agentId?: string}} [opts]
+   */
+  function setModel(ref, model, opts = {}) {
+    if (model !== null && model !== undefined && typeof model !== 'string') {
+      throw new ValidationError('A model is a string, or null for the default.', {
+        details: { received: typeof model },
+      });
+    }
+    const wanted = (model ?? '').trim();
+    // It is spawned as one argv entry, so this is not about injection — a
+    // newline or a page of text is simply not a model name, and storing it
+    // would only fail later, inside the child, where it is harder to see.
+    if (wanted.length > 200 || /[\u0000-\u001f]/.test(wanted)) {
+      throw new ValidationError(`"${wanted.slice(0, 40)}…" is not a model name.`, {
+        hint: 'Use the name the agent binary expects, e.g. anthropic/claude-sonnet-4.',
+      });
+    }
+    return setState(ref, { [SERVE_MODEL_KEY]: wanted || null }, { ...opts, merge: true });
+  }
+
+  /**
+   * Record what the agent binary says it can run. Written by `serve` (which
+   * is the only thing that knows how to ask it), read by the app so a human
+   * picks from a list instead of typing a model name from memory.
+   *
+   * `null` means "I asked and got no answer": the time is stamped so the next
+   * ask waits for the TTL, but any list we already had survives — a provider
+   * being briefly unreachable is not a reason to empty the picker. Pass an
+   * empty array to actually clear it.
+   *
+   * @param {string} ref
+   * @param {unknown} choices  whatever `<cmd> --list-models` answered, or null
+   * @param {{agentId?: string, at?: number}} [opts]
+   */
+  function setModelChoices(ref, choices, opts = {}) {
+    const patch = { [SERVE_MODELS_AT_KEY]: opts.at ?? Date.now() };
+    if (choices !== null && choices !== undefined) {
+      const normalized = normalizeModelChoices(choices);
+      patch[SERVE_MODELS_KEY] = normalized.length > 0 ? normalized : null;
+    }
+    return setState(ref, patch, { ...opts, merge: true });
+  }
+
   function update(ref, patch, opts = {}) {
     return transact(db, () => {
       const session = get(ref, opts);
@@ -501,6 +615,8 @@ export function createAgentService(ctx) {
     pull,
     ack,
     setState,
+    setModel,
+    setModelChoices,
     update,
     post,
     reply,

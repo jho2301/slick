@@ -113,3 +113,14 @@ export function initPaneResizer() {
   // screen — a window pulled wide again should restore it.
   window.addEventListener('resize', () => apply(wanted));
 }
+
+/**
+ * Re-run the clamp without a resize event to hang it on.
+ *
+ * `limits()` measures the rail, so collapsing it frees up room the thread is
+ * allowed to take back — but hiding the rail is a class change, and a class
+ * change fires nothing. Whoever moves that column calls this.
+ */
+export function reflowPanes() {
+  apply(wanted);
+}

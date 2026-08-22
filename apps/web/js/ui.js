@@ -57,6 +57,33 @@ export function toast(text, kind = '') {
 
 // ----------------------------------------------------------------- modal ---
 
+/**
+ * Options, bucketed into `<optgroup>`s by their `group` — a list of 70-odd
+ * models is a different thing to read with the provider names left in.
+ * Consecutive options sharing a group stay together, so the caller decides
+ * the order.
+ */
+function groupedOptions(options) {
+  const out = [];
+  let bucket = null;
+  let group;
+  for (const option of options) {
+    const node = el('option', { value: option.value }, option.label);
+    if (!option.group) {
+      bucket = null;
+      out.push(node);
+      continue;
+    }
+    if (!bucket || group !== option.group) {
+      group = option.group;
+      bucket = el('optgroup', { label: group });
+      out.push(bucket);
+    }
+    bucket.append(node);
+  }
+  return out;
+}
+
 let modalResolve = null;
 
 function closeModal(value) {
@@ -98,11 +125,7 @@ export function openModal(config) {
     const id = `field-${field.name}`;
     const input =
       field.type === 'select'
-        ? el(
-            'select',
-            { id, name: field.name },
-            (field.options ?? []).map((option) => el('option', { value: option.value }, option.label))
-          )
+        ? el('select', { id, name: field.name }, groupedOptions(field.options ?? []))
         : field.type === 'textarea'
           ? el('textarea', { id, name: field.name, rows: field.rows ?? 3, placeholder: field.placeholder ?? '' })
           : el('input', {

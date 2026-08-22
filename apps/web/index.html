@@ -86,6 +86,20 @@
             <button class="icon-btn icon-btn--ghost only-narrow" id="btn-menu" aria-label="Back to channels">
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 3.5L6 10l6.5 6.5 1.4-1.4L8.8 10l5.1-5.1z"/></svg>
             </button>
+            <!-- Wide viewports only: down where the rail is the whole screen
+                 there is nothing to collapse it away from. -->
+            <button
+              class="icon-btn icon-btn--ghost only-wide"
+              id="btn-rail"
+              title="Hide sidebar (⌘B)"
+              aria-label="Hide sidebar"
+              aria-expanded="true"
+              aria-controls="rail"
+            >
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M3.5 3h13A1.5 1.5 0 0118 4.5v11a1.5 1.5 0 01-1.5 1.5h-13A1.5 1.5 0 012 15.5v-11A1.5 1.5 0 013.5 3zm0 1.5v11H8v-11H3.5zm6 0v11h7v-11h-7z"/>
+              </svg>
+            </button>
             <h1 class="chan-head__title" id="chan-title">#general</h1>
             <button class="chan-head__topic" id="chan-topic" title="Edit topic"></button>
           </div>

@@ -17,5 +17,14 @@ export {
   maxSeq,
   recordEvent,
 } from './events.js';
+export {
+  SERVE_MODEL_KEY,
+  SERVE_MODELS_KEY,
+  SERVE_MODELS_AT_KEY,
+  readServeModel,
+  readServeModelChoices,
+  normalizeModelChoices,
+} from './agents.js';
+export { serveLockPath, readServeLock, wasEverServed, serveStatus } from './serve.js';
 export { slugify, assertSlug } from './channels.js';
 export { extractMentions, serializeMessage } from './messages.js';

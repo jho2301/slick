@@ -9,19 +9,53 @@
  * Slick itself. We gather context, hand it a prompt, and post its final
  * answer. Whatever tools it used to get there (or didn't, by default) is
  * between it and its own permission settings.
+ *
+ * One Slick thread is one child conversation. A thread is where a topic lives
+ * here, so it is the unit the agent's own memory should follow: resuming per
+ * thread keeps two parallel conversations from reading each other's turns —
+ * and keeps one busy channel from growing a single transcript that every
+ * thread has to pay for on every turn.
  */
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { ConflictError, NotFoundError, slickHome } from '@slick/core';
+import {
+  ConflictError,
+  NotFoundError,
+  SERVE_MODELS_AT_KEY,
+  normalizeModelChoices,
+  readServeModel,
+  readServeLock,
+  serveLockPath,
+} from '@slick/core';
 import { line, note, ok, style, warn } from '../output.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Longest we will wait between passes once something is going wrong. */
 const MAX_BACKOFF_MS = 60_000;
+
+/**
+ * How many threads' child sessions we remember. Threads are cheap to start, so
+ * an uncapped map would grow the session state forever; forgetting the least
+ * recently used one costs that thread nothing but a fresh conversation if it
+ * ever wakes up again.
+ */
+const THREAD_MEMORY = 50;
+
+/** The single bucket every thread shares under `--shared-session`. */
+const SHARED_THREAD = '*';
+
+/**
+ * How often we re-ask the binary which models it can run. Providers add and
+ * retire models on their own schedule, so the answer goes stale — but not
+ * within a day, and asking is a whole process spawn.
+ */
+const MODELS_TTL_MS = 6 * 60 * 60 * 1000;
+
+/** Long enough for a provider round-trip, short enough to never hold a reply up. */
+const MODELS_TIMEOUT_MS = 20_000;
 
 const timeFmt = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 
@@ -43,15 +77,6 @@ const SESSION_FATAL = [
 
 const isSessionFatal = (message) => SESSION_FATAL.some((re) => re.test(message ?? ''));
 
-const isAlive = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === 'EPERM';
-  }
-};
-
 /**
  * One `serve` per history key, per machine. Two watchers sharing a key consume
  * each other's messages — AGENTS.md warns about it — and double every process
@@ -59,8 +84,10 @@ const isAlive = (pid) => {
  * @returns {() => void} release
  */
 function claimSession(home, key) {
-  const root = home ?? slickHome();
-  const file = join(root, `serve-${key}.lock`);
+  // The path comes from the core because the lock is not private bookkeeping:
+  // it is how everything else — the rail, the mention picker — knows this
+  // session answers when you talk to it.
+  const file = serveLockPath(key, home);
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -91,13 +118,10 @@ function claimSession(home, key) {
     } catch (err) {
       // An unwritable home is not a reason to refuse to work.
       if (err.code !== 'EEXIST') return () => {};
-      let owner = 0;
-      try {
-        owner = Number(readFileSync(file, 'utf8').trim());
-      } catch {
-        /* vanished under us — loop round and retry the claim */
-      }
-      if (owner && owner !== process.pid && isAlive(owner)) {
+      // Same reader the rest of Slick uses to decide whether this session has
+      // a watcher, so "someone holds the lock" means one thing everywhere.
+      const owner = readServeLock(key, home)?.pid ?? 0;
+      if (owner && owner !== process.pid) {
         throw new ConflictError(`Another \`slick agent serve\` (pid ${owner}) is already watching "${key}".`, {
           hint: `Stop it first, or run this one against a different session. Lock: ${file}`,
         });
@@ -137,17 +161,75 @@ function publicState(state) {
 const stateSignature = (json) => createHash('sha256').update(json).digest('hex').slice(0, 16);
 
 /**
+ * Which model the child should run *this pass*. `--model` fixes a default when
+ * the watcher starts, but a watcher can stay up for days, and a launch flag
+ * cannot be reached once it has. The session's own state can be, from the CLI
+ * (`slick agent model`), from the app, or from anything else holding the
+ * database — so that is where the answer lives, and it is re-read every pass.
+ */
+
+/**
+ * The child sessions this watcher is holding, as stored under `_serveThreads`:
+ * `threadId → {sessionId, stateSig, at}`. It lives in the database rather than
+ * in this process so a restart — or a `--once` cron run — picks every thread
+ * back up where it left off instead of starting each one over.
+ */
+function loadThreads(state) {
+  const threads = new Map();
+  const stored = state?._serveThreads;
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return threads;
+  for (const [threadId, entry] of Object.entries(stored)) {
+    if (!entry || typeof entry !== 'object') continue;
+    threads.set(threadId, {
+      sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : null,
+      stateSig: typeof entry.stateSig === 'string' ? entry.stateSig : null,
+      at: Number(entry.at) || 0,
+    });
+  }
+  return threads;
+}
+
+/** Drop the empty and the least recently used entries, in place. */
+function prune(threads) {
+  for (const [threadId, entry] of threads) {
+    if (!entry.sessionId && !entry.stateSig) threads.delete(threadId);
+  }
+  if (threads.size > THREAD_MEMORY) {
+    const stale = [...threads.entries()].sort((a, b) => b[1].at - a[1].at).slice(THREAD_MEMORY);
+    for (const [threadId] of stale) threads.delete(threadId);
+  }
+  return Object.fromEntries(threads);
+}
+
+/**
+ * The conversation this thread's session should be shown: the thread itself.
+ * The channel tail is the right context for a mention that *starts* a thread —
+ * it is what orients a brand-new session — but once a thread has a session of
+ * its own, other people's other threads are noise inside it.
+ *
+ * @returns {Promise<Array|null>} null when the caller should use the channel tail
+ */
+async function threadContext(ws, message, limit) {
+  if (limit <= 0 || !message.threadId || message.threadId === message.id) return null;
+  try {
+    const { root, replies } = await ws.messages.thread(message.threadId);
+    const earlier = [root, ...replies].filter((m) => m && !m.deleted && m.seq < message.seq);
+    return earlier.length > 0 ? earlier.slice(-limit) : null;
+  } catch {
+    return null; // context is a nicety — never fail an answer over it
+  }
+}
+
+/**
  * What we hand the model: the recent conversation, its memory, the message.
  * No standing "you are X, reply with only the post" preamble — every agent
  * behind `--cmd` already knows what it is from its own configuration, and one
  * resumed transcript would otherwise carry a fresh copy per message forever.
  */
-function buildPrompt({ event, context, stateJson, extra }) {
+function buildPrompt({ event, context, contextLabel, stateJson, extra }) {
   const message = event.message;
   const parts = [];
-  if (context?.length > 0) {
-    parts.push(`Recent conversation in #${event.channelSlug ?? message.channelSlug ?? '?'}:\n${plainTranscript(context)}`);
-  }
+  if (context?.length > 0) parts.push(`${contextLabel}\n${plainTranscript(context)}`);
   if (stateJson) parts.push(`Your saved state from earlier runs:\n${stateJson}`);
   parts.push(`The message to answer, from ${message.author.label}:\n${message.text}`);
   if (extra) parts.push(extra);
@@ -213,6 +295,44 @@ function callAgent({ cmd, prompt, resumeId, permissionMode, allowedTools, skipPe
 }
 
 /**
+ * Ask the agent binary what it can run: `<cmd> --list-models`, answered with
+ * JSON. Agents that have never heard of the flag (the `claude` CLI, today)
+ * fail or print something else, and that is a fine answer — it just means
+ * this session types its model rather than picking it.
+ *
+ * @returns {Promise<Array|null>} null when the binary did not answer with a list
+ */
+function askModels(cmd) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, ['--list-models'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      return resolve(null);
+    }
+    let stdout = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), MODELS_TIMEOUT_MS);
+    timer.unref?.();
+    child.stdout.on('data', (chunk) => (stdout += chunk));
+    child.stderr.on('data', () => {}); // drained so a chatty binary cannot block
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return resolve(null);
+      try {
+        const choices = normalizeModelChoices(JSON.parse(stdout));
+        resolve(choices.length > 0 ? choices : null);
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
  * Run the watch-and-respond loop for one session.
  * @param {import('@slick/core').Workspace} ws
  * @param {string} ref
@@ -231,6 +351,7 @@ export async function serve(ws, ref, ctx) {
   const cmd = flags.cmd ?? 'claude';
   const timeoutMs = flags.timeout ? Number(flags.timeout) : 10 * 60 * 1000;
   const maxAttempts = Math.max(Number(flags['max-attempts'] ?? 3), 1);
+  const shared = Boolean(flags['shared-session']);
 
   const readOpts = {
     agentId: ctx.agentId,
@@ -242,19 +363,33 @@ export async function serve(ws, ref, ctx) {
   if (!asJson) {
     note(
       `Serving as ${style.bold(respondAgentId)} — ${all ? 'every message' : '@mentions only'}, ` +
-        `via \`${cmd}\` — ctrl-c to stop.`
+        `via \`${cmd}\` — ${shared ? 'one shared conversation' : 'one conversation per thread'}, ctrl-c to stop.`
     );
     line();
   }
 
-  let claudeSessionId = session.state?._serveSessionId ?? null;
   /**
-   * Signature of the state the resumed transcript has already been shown. It
-   * lives in the database next to the resume id because the transcript
-   * outlives this process: a `--once` run would otherwise re-send the same
-   * memory on every invocation.
+   * One child conversation per thread, and against each the signature of the
+   * state that conversation has already been shown — a resumed transcript is
+   * still holding the copy we sent it, so re-sending unchanged memory would
+   * just be paid for again on every turn.
    */
-  let stateSig = session.state?._serveStateSig ?? null;
+  const threads = loadThreads(session.state);
+  // Before this was per-thread there was a single id for the whole watcher.
+  // Which thread it belongs to is unknowable now, so it is only worth keeping
+  // when this watcher is deliberately still sharing one conversation.
+  const legacyId = session.state?._serveSessionId ?? null;
+  if (shared && legacyId && !threads.has(SHARED_THREAD)) {
+    threads.set(SHARED_THREAD, {
+      sessionId: legacyId,
+      stateSig: session.state?._serveStateSig ?? null,
+      at: Date.now(),
+    });
+  }
+  let staleKeys = legacyId != null || session.state?._serveStateSig != null;
+  /** The model the last pass used, so a change is announced once, not per pass. */
+  let activeModel = readServeModel(session.state) ?? flags.model ?? null;
+  let threadsChanged = false;
   /** message id → consecutive failed attempts, so one bad message cannot wedge the queue. */
   const failures = new Map();
   let backoff = interval;
@@ -271,19 +406,49 @@ export async function serve(ws, ref, ctx) {
       // clears) than silently skip something nobody ever saw.
       let failedAtSeq = null;
 
+      // Keep the app's model picker stocked. It is the watcher that knows how
+      // to reach the binary, so it is the watcher that asks — on the way past,
+      // at most once a TTL, and never at the cost of an answer.
+      if (!dryRun && Date.now() - Number(resumed.state?.[SERVE_MODELS_AT_KEY] ?? 0) > MODELS_TTL_MS) {
+        const choices = await askModels(cmd);
+        try {
+          // The timestamp is written either way: a binary with no such flag
+          // must be asked once a TTL, not once a pass.
+          await ws.agents.setModelChoices(ref, choices, { agentId: ctx.agentId });
+          if (choices && !asJson) note(`${cmd} offers ${choices.length} model(s)`);
+        } catch (err) {
+          warn(`Could not save the model list: ${err.message}`);
+        }
+      }
+
+      // Re-read every pass, so `slick agent model` reaches a running watcher.
+      const model = readServeModel(resumed.state) ?? flags.model ?? null;
+      if (model !== activeModel) {
+        if (!asJson) note(`Model → ${style.bold(model ?? `${cmd} default`)}`);
+        activeModel = model;
+      }
+
       const memory = publicState(resumed.state);
       const stateJson = Object.keys(memory).length > 0 ? JSON.stringify(memory) : null;
       const currentSig = stateJson ? stateSignature(stateJson) : null;
 
       for (const event of targets) {
+        const threadKey = shared ? SHARED_THREAD : (event.message.threadId ?? event.message.id);
+        const thread = threads.get(threadKey) ?? { sessionId: null, stateSig: null, at: 0 };
+
         // A fresh session has never seen the agent's memory; a resumed one is
         // still holding the copy we sent it, so it only needs the new value
         // when the human (or the agent) has actually changed something.
-        const includeState = (fresh) => Boolean(stateJson) && (fresh || !claudeSessionId || currentSig !== stateSig);
+        const includeState = (fresh) =>
+          Boolean(stateJson) && (fresh || !thread.sessionId || currentSig !== thread.stateSig);
+        const inThread = shared ? null : await threadContext(ws, event.message, contextLimit);
         const promptFor = (fresh) =>
           buildPrompt({
             event,
-            context: resumed.context,
+            context: inThread ?? resumed.context,
+            contextLabel: inThread
+              ? 'Earlier in this thread:'
+              : `Recent conversation in #${event.channelSlug ?? event.message.channelSlug ?? '?'}:`,
             stateJson: includeState(fresh) ? stateJson : null,
             extra: flags.system,
           });
@@ -316,26 +481,26 @@ export async function serve(ws, ref, ctx) {
                 permissionMode: flags['permission-mode'],
                 allowedTools: flags['allowed-tools'],
                 skipPermissions: Boolean(flags['dangerously-skip-permissions']),
-                model: flags.model,
+                model,
                 appendSystemPrompt: flags['append-system-prompt'],
                 timeoutMs,
               });
-            result = await call(claudeSessionId, promptFor(false));
+            result = await call(thread.sessionId, promptFor(false));
 
-            // One resumed transcript is reused for every message forever, so it
+            // A thread's transcript is resumed for every message in it, so it
             // only ever grows. Once it outgrows the request limit every later
             // call fails identically — and because the id is saved, restarting
             // picks the same dead conversation right back up. Retire it and
             // answer from a clean session instead of retrying into the wall.
-            if (result.error && claudeSessionId && isSessionFatal(result.error)) {
-              warn(`Retiring the resumed ${cmd} session — ${result.error}`);
-              claudeSessionId = null;
-              stateSig = null; // the new transcript starts out knowing nothing
-              await ws.agents.setState(
-                ref,
-                { _serveSessionId: null, _serveStateSig: null },
-                { agentId: ctx.agentId, merge: true }
-              );
+            if (result.error && thread.sessionId && isSessionFatal(result.error)) {
+              warn(`Retiring the resumed ${cmd} session for ${threadKey} — ${result.error}`);
+              thread.sessionId = null;
+              thread.stateSig = null; // the new transcript starts out knowing nothing
+              threads.delete(threadKey);
+              // The whole map goes out, so nothing another thread earned
+              // earlier in this pass is left waiting to be written.
+              await ws.agents.setState(ref, { _serveThreads: prune(threads) }, { agentId: ctx.agentId, merge: true });
+              threadsChanged = false;
               sentState = includeState(true);
               result = await call(null, promptFor(true));
             }
@@ -345,9 +510,15 @@ export async function serve(ws, ref, ctx) {
 
           // Only a session that worked is worth remembering. Saving the id from
           // a failed call is what let the unusable one survive every restart.
-          if (!result.error && result.sessionId) claudeSessionId = result.sessionId;
-          // Likewise: only a call that landed proves the memory got through.
-          if (!result.error && sentState) stateSig = currentSig;
+          // Likewise, only a call that landed proves the memory got through.
+          if (!result.error && result.sessionId) {
+            threads.set(threadKey, {
+              sessionId: result.sessionId,
+              stateSig: sentState ? currentSig : thread.stateSig,
+              at: Date.now(),
+            });
+            threadsChanged = true;
+          }
 
           if (result.error) {
             const attempts = (failures.get(event.message.id) ?? 0) + 1;
@@ -405,10 +576,18 @@ export async function serve(ws, ref, ctx) {
 
       if (!dryRun) {
         const patch = {};
-        if (claudeSessionId) patch._serveSessionId = claudeSessionId;
-        if (stateSig) patch._serveStateSig = stateSig;
+        if (threadsChanged) patch._serveThreads = prune(threads);
+        // The one-session-for-everything bookkeeping this replaced. Nothing
+        // reads it any more, so clear it rather than leave a dead id behind
+        // that looks like it is still in use.
+        if (staleKeys) {
+          patch._serveSessionId = null;
+          patch._serveStateSig = null;
+        }
         if (Object.keys(patch).length > 0) {
           await ws.agents.setState(ref, patch, { agentId: ctx.agentId, merge: true });
+          threadsChanged = false;
+          staleKeys = false;
         }
         const safeCount = failedAtSeq == null ? resumed.missed.length : resumed.missed.findIndex((e) => e.seq === failedAtSeq);
         if (safeCount > 0) {
@@ -429,7 +608,7 @@ export async function serve(ws, ref, ctx) {
 }
 
 export const SERVE_SPEC = {
-  booleans: ['dry-run', 'dangerously-skip-permissions', 'no-lock'],
+  booleans: ['dry-run', 'dangerously-skip-permissions', 'no-lock', 'shared-session'],
   strings: [
     'cmd',
     'system',

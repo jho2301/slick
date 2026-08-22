@@ -31,7 +31,7 @@ import {
   toast,
 } from './ui.js';
 import { createMentionMenu } from './mentions.js';
-import { initPaneResizer } from './panes.js';
+import { initPaneResizer, reflowPanes } from './panes.js';
 import { currentSubscription, disablePush, enablePush, pushSupported } from './push.js';
 
 const api = new Api();
@@ -48,6 +48,8 @@ const state = {
   /** Channel id being dragged between categories, if any. */
   dragging: null,
   sessions: [],
+  /** Daemon version, fetched the first time Settings is opened. */
+  version: null,
   current: null,
   messages: [],
   hasMore: false,
@@ -354,6 +356,35 @@ function closeChannel({ viaPopstate = false } = {}) {
 
 // ------------------------------------------------------------------ rail ---
 
+const RAIL_HIDDEN_KEY = 'slick.rail-hidden';
+
+/**
+ * Collapse or restore the rail on wide viewports.
+ *
+ * Narrow ones stack instead: the rail *is* the first screen down there, so
+ * there is nowhere to collapse it to and the control is hidden. The stored
+ * preference is still kept — shrinking the window and pulling it wide again
+ * gives back the state you left.
+ */
+function setRail(hidden, { remember = true } = {}) {
+  $('#app').classList.toggle('rail-hidden', hidden);
+  const button = $('#btn-rail');
+  button.setAttribute('aria-expanded', String(!hidden));
+  const label = hidden ? 'Show sidebar' : 'Hide sidebar';
+  button.setAttribute('aria-label', label);
+  button.title = `${label} (⌘B)`;
+  if (remember) localStorage.setItem(RAIL_HIDDEN_KEY, hidden ? '1' : '');
+  // The thread's clamp measures the rail, so the room that just opened up (or
+  // went away) has to be handed to it — a class change fires no resize.
+  reflowPanes();
+}
+
+function toggleRail() {
+  // A collapse down here would hide the only thing on screen.
+  if (stacks()) return;
+  setRail(!$('#app').classList.contains('rail-hidden'));
+}
+
 function renderRail() {
   const active = state.channels.filter((c) => !c.archived);
   const archived = state.channels.filter((c) => c.archived);
@@ -487,32 +518,73 @@ function channelRow(channel) {
   );
 }
 
+/**
+ * The sessions worth showing a human.
+ *
+ * A session only earns a place here if `slick agent serve` answers for it.
+ * The rest are automations — the cron job that posts the morning digest owns
+ * a history key and a cursor exactly like an agent does, but nothing is
+ * watching it, so every affordance the rail offers (open its channel, pick
+ * its model, @mention it) does nothing. They speak in their channels instead.
+ */
+function callableSessions() {
+  return state.sessions.filter((session) => session.callable);
+}
+
 function renderAgents() {
   const list = clear($('#agent-list'));
-  if (state.sessions.length === 0) {
+  const sessions = callableSessions();
+  if (sessions.length === 0) {
+    const posting = state.sessions.length;
     list.append(
-      el(
-        'li',
-        { class: 'rail__empty' },
-        'No agents yet. Give one a history key:',
-        el('br'),
-        el('code', {}, 'slick agent start --agent claude')
-      )
+      posting > 0
+        ? el(
+            'li',
+            { class: 'rail__empty' },
+            `Nothing is listening. ${posting} session${posting === 1 ? '' : 's'} post here, but no watcher is attached — start one:`,
+            el('br'),
+            el('code', {}, 'slick agent serve --key <history key>')
+          )
+        : el(
+            'li',
+            { class: 'rail__empty' },
+            'No agents yet. Give one a history key:',
+            el('br'),
+            el('code', {}, 'slick agent start --agent claude')
+          )
     );
     return;
   }
-  for (const session of state.sessions) {
-    const live = session.lastSeenAt && Date.now() - session.lastSeenAt < 5 * 60 * 1000;
+  for (const session of sessions) {
+    // Green means a watcher holds this session right now; the timestamp is
+    // only how long ago it last did anything.
+    const live = session.serve?.live ?? false;
+    const model = serveModel(session);
     list.append(
       el(
         'li',
         { class: 'agent' },
-        el('span', { class: `agent__dot${live ? '' : ' is-idle'}`, title: `last seen ${ago(session.lastSeenAt)}` }),
+        el('span', {
+          class: `agent__dot${live ? '' : ' is-idle'}`,
+          title: live ? `watching · last seen ${ago(session.lastSeenAt)}` : `no watcher · last seen ${ago(session.lastSeenAt)}`,
+        }),
         el(
           'div',
           { class: 'agent__body', onclick: () => session.channelSlug && selectChannel(session.channelSlug) },
           el('div', { class: 'agent__name' }, session.name ? `${session.agentId} · ${session.name}` : session.agentId),
-          el('div', { class: 'agent__key', title: session.key }, session.key)
+          el('div', { class: 'agent__key', title: session.key }, session.key),
+          el(
+            'button',
+            {
+              class: `agent__model${model ? ' is-set' : ''}`,
+              title: model ? `Running ${model} — click to change` : 'Choose the model this agent runs',
+              onclick: (event) => {
+                event.stopPropagation(); // the row itself opens the channel
+                editAgentModel(session);
+              },
+            },
+            modelLabel(session, model)
+          )
         ),
         el(
           'button',
@@ -531,10 +603,114 @@ function renderAgents() {
   }
 }
 
-/** Known agents for the `@mention` picker: one entry per agent id, most recently active first. */
+/**
+ * The model this session's `serve` watcher is set to call, or null for
+ * whatever the agent picks by itself. Mirrors `readServeModel` in the core —
+ * underscore-prefixed because it is Slick's bookkeeping, not agent memory.
+ */
+function serveModel(session) {
+  const value = session.state?._serveModel;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * The models this agent told `serve` it can run (`<cmd> --list-models`), in
+ * the shape the picker wants. Empty for an agent that never answered — those
+ * get a text box instead, because a name typed by hand still works.
+ */
+function modelChoices(session) {
+  const stored = session.state?._serveModelChoices;
+  if (!Array.isArray(stored)) return [];
+  return stored
+    .map((entry) => (typeof entry === 'string' ? { id: entry, label: entry, group: null } : entry))
+    .filter((entry) => entry && typeof entry.id === 'string')
+    .map((entry) => ({ id: entry.id, label: entry.label || entry.id, group: entry.group ?? null }));
+}
+
+/** What the rail calls the current model: the agent's own name for it. */
+function modelLabel(session, model) {
+  if (!model) return 'default model';
+  return modelChoices(session).find((choice) => choice.id === model)?.label ?? model;
+}
+
+/** The sentinel option that trades the menu for a text box. */
+const CUSTOM_MODEL = '\u0000custom';
+
+/**
+ * Change the model without touching a terminal. The watcher re-reads this on
+ * its next pass, so there is nothing to restart — and threads keep the
+ * conversations they already have; only the model answering them changes.
+ */
+async function editAgentModel(session) {
+  const current = serveModel(session);
+  const choices = modelChoices(session);
+  const wanted = choices.length > 0 ? await pickModel(session, current, choices) : await typeModel(current);
+  if (wanted === null || wanted === (current ?? '')) return;
+  try {
+    const model = await api.setAgentModel(session.key, wanted || null);
+    await refreshSessions();
+    toast(model ? `${session.agentId} → ${model}` : `${session.agentId} is back on its default model`);
+  } catch (err) {
+    fail(err, 'Could not change that model');
+  }
+}
+
+/** A menu of what the agent says it can run. @returns {Promise<string|null>} */
+async function pickModel(session, current, choices) {
+  // A model set before the list was fetched — or by hand — is still what this
+  // agent is running, so it belongs in the menu rather than silently reset.
+  const known = choices.some((choice) => choice.id === current);
+  const values = await openModal({
+    title: `Model for ${session.agentId}`,
+    okLabel: 'Set model',
+    fields: [
+      {
+        name: 'model',
+        label: 'Model',
+        type: 'select',
+        value: current ?? '',
+        options: [
+          { value: '', label: "Default — whatever the agent runs on its own" },
+          ...(current && !known ? [{ value: current, label: `${current} (set by hand)` }] : []),
+          ...choices.map((choice) => ({ value: choice.id, label: choice.label, group: choice.group })),
+          { value: CUSTOM_MODEL, label: 'Something else…' },
+        ],
+        help: `${choices.length} model(s), as the agent last reported them. Takes effect on the next message it answers.`,
+      },
+    ],
+  });
+  if (!values) return null;
+  return values.model === CUSTOM_MODEL ? typeModel(current) : values.model;
+}
+
+/** The fallback for an agent that never advertised a list. @returns {Promise<string|null>} */
+async function typeModel(current) {
+  const values = await openModal({
+    title: 'Model',
+    okLabel: 'Set model',
+    fields: [
+      {
+        name: 'model',
+        label: 'Model',
+        value: current ?? '',
+        placeholder: 'e.g. anthropic/claude-sonnet-4',
+        help:
+          'Passed to the agent binary as <code>--model</code> on the next message it answers. ' +
+          'Leave it empty for whatever the agent runs by default.',
+      },
+    ],
+  });
+  return values ? (values.model ?? '').trim() : null;
+}
+
+/**
+ * Known agents for the `@mention` picker: one entry per agent id, most
+ * recently active first. Only the ones that answer — offering an automation
+ * here would spell its name correctly and still be ignored.
+ */
 function agentSuggestions() {
   const byId = new Map();
-  for (const session of state.sessions) {
+  for (const session of callableSessions()) {
     const current = byId.get(session.agentId);
     if (!current || (session.lastSeenAt ?? 0) > (current.lastSeenAt ?? 0)) byId.set(session.agentId, session);
   }
@@ -1359,6 +1535,15 @@ function wireComposer(inputId, formId, buttonId, submit, menuId) {
 function wire() {
   initModal();
   initPaneResizer();
+  // The desktop build on macOS floats the traffic lights over the top-left
+  // corner, which the header inherits the moment the rail collapses out from
+  // under them. Nothing in CSS can see that window, so it is flagged here.
+  $('#app').classList.toggle(
+    'is-inset-titlebar',
+    /Electron/.test(navigator.userAgent) && /Mac/i.test(navigator.platform ?? '')
+  );
+  // After the resizer, which owns the clamp `setRail` re-runs.
+  setRail(Boolean(localStorage.getItem(RAIL_HIDDEN_KEY)), { remember: false });
 
   const syncMain = wireComposer('#composer-input', '#composer', '#btn-send', send, '#mention-menu-main');
   wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply, '#mention-menu-thread');
@@ -1374,6 +1559,7 @@ function wire() {
   // Narrow viewports stack the views, so the thread's back arrow drops you to
   // the channel and the channel's drops you to the rail — one step each.
   $('#btn-thread-back').addEventListener('click', () => closeThread());
+  $('#btn-rail').addEventListener('click', toggleRail);
   $('#btn-search').addEventListener('click', openPalette);
   $('#btn-settings').addEventListener('click', openSettings);
   $('#btn-close-settings').addEventListener('click', closeSettings);
@@ -1437,6 +1623,11 @@ function wire() {
     if (meta && event.key.toLowerCase() === 'k') {
       event.preventDefault();
       palette.open ? closePalette() : openPalette();
+    } else if (meta && event.key.toLowerCase() === 'b') {
+      // Bold is the other claim on ⌘B, but the composer is plain text — there
+      // is nothing here for it to mark up.
+      event.preventDefault();
+      toggleRail();
     } else if (event.key === 'Escape') {
       // An open dialog closes itself on Escape; without this the layer behind
       // it would be dismissed by the same keypress.
@@ -1500,7 +1691,9 @@ function renderSettings() {
   body.append(
     ...settingGroup(
       'Workspace',
-      settingRow(workspace?.name ?? 'Slick', workspace ? `Signed in as ${workspace.user.name}` : 'Not connected yet')
+      settingRow(workspace?.name ?? 'Slick', workspace ? `Signed in as ${workspace.user.name}` : 'Not connected yet'),
+      versionRow(),
+      cacheRow()
     ),
     ...settingGroup(
       'Channels',
@@ -1525,6 +1718,69 @@ function renderSettings() {
     ),
     ...settingGroup('Notifications', notificationRow())
   );
+}
+
+/**
+ * Which daemon this window is talking to. Asked for once and remembered — the
+ * answer cannot change without the page reloading behind a restarted server.
+ */
+function versionRow() {
+  const value = el('span', { class: 'setting__value' }, state.version ?? '…');
+  // The build is the half that answers "am I up to date" — the version is
+  // hand-written and the same across every build a phone would need to notice.
+  // Shown side by side because only one of them is ever wrong.
+  const row = settingRow('Version', 'The daemon this window is talking to.', value);
+  if (state.version) return row;
+  api
+    .health()
+    .then((health) => {
+      const version = health?.version ? `v${health.version}` : 'unknown';
+      state.version = health?.build ? `${version} · ${health.build}` : version;
+      value.textContent = state.version;
+    })
+    .catch(() => {
+      value.textContent = 'unknown';
+    });
+  return row;
+}
+
+/**
+ * Throw away the offline copy of the app shell and come back on whatever the
+ * daemon is serving now.
+ *
+ * The worker is already network-first, so this is not how a new build normally
+ * arrives — it is the way out of the case where it did not: a half-written
+ * cache entry, or an installed app that has been sitting on a dead daemon and
+ * kept falling back to the same stale shell.
+ */
+function cacheRow() {
+  if (!('serviceWorker' in navigator) || !('caches' in window)) {
+    return settingRow('Offline copy', 'This browser keeps none, so there is nothing to refresh.');
+  }
+  const button = el('button', { class: 'btn', type: 'button', id: 'btn-refresh-cache' }, 'Refresh');
+  button.addEventListener('click', () => refreshCache(button));
+  return settingRow('Offline copy', 'Drop the cached app files and reload from the daemon.', button);
+}
+
+async function refreshCache(button) {
+  button.disabled = true;
+  button.textContent = 'Refreshing…';
+  try {
+    const registration = await navigator.serviceWorker.getRegistration();
+    // Ask for a newer worker first: if one is waiting, dropping the caches
+    // underneath the old one only to have it rebuild them wastes the trip.
+    await registration?.update();
+    const keys = await caches.keys();
+    await Promise.all(keys.map((key) => caches.delete(key)));
+    toast('Offline copy cleared — reloading');
+    // Long enough for the toast to be read, short enough to still feel like
+    // the button did it.
+    setTimeout(() => location.reload(), 600);
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = 'Refresh';
+    toast(err.message || 'Could not refresh the offline copy', 'error');
+  }
 }
 
 function notificationRow() {
@@ -1636,9 +1892,11 @@ async function boot() {
     onStatus: setConnection,
   });
 
-  // Keep "last seen 3m ago" honest without a re-render storm.
+  // Keep "last seen 3m ago" honest without a re-render storm. This re-fetches
+  // rather than re-rendering because whether a watcher is up is the server's
+  // answer, not ours: a `serve` that started or died leaves no event behind.
   setInterval(() => {
-    if (state.sessions.length) renderAgents();
+    refreshSessions(); // it swallows its own errors — the rail is decoration
   }, 60_000);
 }
 
@@ -1656,10 +1914,37 @@ if ('serviceWorker' in navigator) {
     goTo(channel, thread).catch((err) => console.error('notification navigation failed', err));
   });
 
-  // Whether this page booted under a worker decides what a handover below
-  // means, and claiming one during startup would blur that — so read it now.
-  const wasControlled = Boolean(navigator.serviceWorker.controller);
+  // Whether this page is under a worker decides what a handover below means,
+  // and the first install claims it mid-flight — so this is read now and kept
+  // in step, not re-read from a `controller` that has already moved on by the
+  // time the event lands.
+  let controlled = Boolean(navigator.serviceWorker.controller);
   let reloading = false;
+  let lastUpdateCheck = 0;
+
+  /**
+   * An installed app is resumed far more often than it is launched, and being
+   * resumed re-runs nothing — no navigation, no module fetch, and so no update
+   * check. Network-first does not save it either: nothing asks the network in
+   * the first place. Asking here is what makes a new build land on a phone
+   * that is never actually closed; the worker that comes back claims the page
+   * and the handover below reloads it.
+   */
+  const checkForUpdate = () => {
+    const now = Date.now();
+    if (now - lastUpdateCheck < 60_000) return;
+    lastUpdateCheck = now;
+    navigator.serviceWorker
+      .getRegistration()
+      .then((registration) => registration?.update())
+      .catch(() => {
+        /* offline, or the daemon is down — the worker we have still serves */
+      });
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkForUpdate();
+  });
 
   window.addEventListener('load', async () => {
     const registration = await navigator.serviceWorker.register('./sw.js');
@@ -1674,8 +1959,11 @@ if ('serviceWorker' in navigator) {
     // A worker that skipped waiting now owns a page built against the last one.
     // One reload lines the HTML, CSS, and JS back up. Not on a first install,
     // where the handover is to a page that has been served from the network all
-    // along and is already current.
-    if (!wasControlled || reloading) return;
+    // along and is already current — but every handover after that one counts,
+    // including the ones a long-lived app collects without ever reloading.
+    const first = !controlled;
+    controlled = Boolean(navigator.serviceWorker.controller);
+    if (first || reloading) return;
     reloading = true;
     location.reload();
   });

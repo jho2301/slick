@@ -68,12 +68,18 @@ export class Api {
   get = (path) => this.request('GET', path);
   post = (path, body) => this.request('POST', path, body ?? {});
   patch = (path, body) => this.request('PATCH', path, body ?? {});
+  put = (path, body) => this.request('PUT', path, body ?? {});
   del = (path) => this.request('DELETE', path);
 
   // --------------------------------------------------------------- data ---
 
   workspace() {
     return this.get('/api/workspace');
+  }
+
+  /** Daemon health — the version shown in Settings comes from here. */
+  health() {
+    return this.get('/api/health');
   }
 
   listChannels(includeArchived = true) {
@@ -152,6 +158,16 @@ export class Api {
 
   agentSessions() {
     return this.get('/api/agents/sessions?includeEnded=1').then((r) => r.sessions);
+  }
+
+  /**
+   * The model `slick agent serve` should call for this session. A running
+   * watcher re-reads it every pass, so this lands without restarting it.
+   * @param {string} ref  history key
+   * @param {string|null} model  null (or '') to go back to the default
+   */
+  setAgentModel(ref, model) {
+    return this.put(`/api/agents/sessions/${encodeURIComponent(ref)}/model`, { model }).then((r) => r.model);
   }
 
   pushVapidKey() {

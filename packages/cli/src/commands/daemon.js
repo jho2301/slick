@@ -28,7 +28,7 @@ export const daemon = {
   stop                          stop it
   restart                       stop then start
   log [--lines <n>]             tail the daemon log
-  url                           print the URL with a token, ready to open`,
+  url                           print the URL (with a token, if auth is on)`,
   spec: { strings: ['port', 'host', 'lines'] },
 
   async run(ctx) {
@@ -42,7 +42,7 @@ export const daemon = {
         if (info.running) {
           ok(`Running on ${style.bold(info.url)} ${style.dim(`(pid ${info.pid})`)}`);
           note(`  started ${ago(info.startedAt)} · db ${info.db}`);
-          note(`  open   ${info.url}?token=${info.token}`);
+          note(`  open   ${info.url}${info.token ? `?token=${info.token}` : ''}`);
         } else if (info.stale) {
           line(`${style.yellow('!')} Not running (stale record for pid ${info.pid} — cleaning up on next start)`);
         } else {

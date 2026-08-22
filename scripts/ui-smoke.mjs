@@ -402,6 +402,130 @@ async function main() {
     );
     await shoot('07-new-channel');
 
+    console.log('\nchanging an agent’s model');
+    // The agents live folded under the channels, so open that first — clicking
+    // a hidden button would pass here and be unreachable in the app.
+    await js('document.querySelector("#toggle-agents").click()');
+    await sleep(400);
+    const agentKey = await js('document.querySelector("#agent-list .agent .agent__key").textContent');
+    check('the rail says what each agent is running', await visible('#agent-list .agent__model'));
+    check(
+      'and starts on the agent’s own default',
+      (await js('document.querySelector("#agent-list .agent__model").textContent')) === 'default model'
+    );
+    // An agent that never advertised a list gets a box to type into.
+    await js('document.querySelector("#agent-list .agent__model").click()');
+    await sleep(400);
+    check('the model dialog opened', await js('document.querySelector("#modal").open'));
+    check('with a field to type one into', await js('!!document.querySelector("#field-model")'));
+    await js(`
+      (() => {
+        document.querySelector('#field-model').value = 'anthropic/claude-opus-4';
+        document.querySelector('#modal-form').requestSubmit();
+      })()
+    `);
+    await sleep(900);
+    check(
+      'the rail shows the new model',
+      await js('[...document.querySelectorAll("#agent-list .agent__model")].some(n => n.textContent === "anthropic/claude-opus-4")')
+    );
+    check(
+      'and it is where a running `serve` would read it',
+      server.ws.agents.get(agentKey).state._serveModel === 'anthropic/claude-opus-4'
+    );
+
+    // Once its `serve` has asked the binary what it can run, that same click is
+    // a menu instead — which is the whole point for an agent like Hermes, whose
+    // models are a list nobody remembers.
+    server.ws.agents.setModelChoices(agentKey, [
+      { id: 'north::big', label: 'big', group: 'north' },
+      { id: 'north::small', label: 'small', group: 'north' },
+      { id: 'south::quick', label: 'quick', group: 'south' },
+    ]);
+    await sleep(1200);
+    await js(`
+      [...document.querySelectorAll('#agent-list .agent__model')]
+        .find(n => n.textContent === 'anthropic/claude-opus-4').click()
+    `);
+    await sleep(400);
+    check('the dialog offers a menu now', (await js('document.querySelector("#field-model").tagName')) === 'SELECT');
+    check(
+      'grouped by provider, as the agent grouped them',
+      (await js('[...document.querySelectorAll("#field-model optgroup")].map(g => g.label).join("|")')) ===
+        'north|south'
+    );
+    check(
+      'with the default, the hand-set model and a way out alongside them',
+      await js(`
+        (() => {
+          const values = [...document.querySelectorAll('#field-model option')].map(o => o.value);
+          return values[0] === '' && values.includes('anthropic/claude-opus-4') && values.length === 6;
+        })()
+      `)
+    );
+    check(
+      'and what it is running now is what is selected',
+      (await js('document.querySelector("#field-model").value')) === 'anthropic/claude-opus-4'
+    );
+    await shoot('07b-agent-model');
+    await js(`
+      (() => {
+        document.querySelector('#field-model').value = 'south::quick';
+        document.querySelector('#modal-form').requestSubmit();
+      })()
+    `);
+    await sleep(900);
+    check('picking one sets it', server.ws.agents.get(agentKey).state._serveModel === 'south::quick');
+    check(
+      'and the rail calls it what the agent calls it',
+      await js('[...document.querySelectorAll("#agent-list .agent__model")].some(n => n.textContent === "quick")'),
+      'not the routing id'
+    );
+
+    // The way back out is the half that is easy to ship broken: a setting you
+    // cannot unset.
+    await js(`[...document.querySelectorAll('#agent-list .agent__model')].find(n => n.textContent === 'quick').click()`);
+    await sleep(400);
+    await js(`
+      (() => {
+        document.querySelector('#field-model').value = '';
+        document.querySelector('#modal-form').requestSubmit();
+      })()
+    `);
+    await sleep(900);
+    check('and choosing the default clears it', server.ws.agents.get(agentKey).state._serveModel === null);
+
+    console.log('\nagents that cannot answer stay out of the way');
+    // A cron automation: a real session with a real history key that nothing
+    // watches. Mentioning it would be shouting into a log file.
+    const listed = await js('document.querySelectorAll("#agent-list .agent").length');
+    server.ws.agents.start({ agentId: 'digest-bot', name: 'digest', channel: 'general' });
+    await sleep(1200);
+    check('an automation does not join the rail', (await js('document.querySelectorAll("#agent-list .agent").length')) === listed);
+
+    await js(`
+      (() => {
+        const input = document.querySelector('#composer-input');
+        input.focus();
+        input.value = '@';
+        input.selectionStart = input.selectionEnd = 1;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      })()
+    `);
+    await sleep(300);
+    const offered = await js('[...document.querySelectorAll("#mention-menu-main .what")].map(n => n.textContent).join(" ")');
+    check('the mention picker offers the agents that answer', offered.includes('@claude'), offered);
+    check('and not the ones that only post', !offered.includes('@digest-bot'));
+    await js(`
+      (() => {
+        const input = document.querySelector('#composer-input');
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.blur();
+      })()
+    `);
+    await sleep(200);
+
     console.log('\nediting a message');
     await js('[...document.querySelectorAll(".rail__scroll .chan")].find(b => b.textContent.includes("deploys")).click()');
     await sleep(600);

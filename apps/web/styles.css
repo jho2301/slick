@@ -108,6 +108,36 @@ button { cursor: pointer; }
   grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--thread-w);
 }
 
+/* The rail is a grid column sized by one variable, so collapsing it is that
+   variable going to zero — no second grid-template to keep in step with
+   `.with-thread`, and the narrow override below still wins on its own terms
+   because it replaces the whole template rather than this custom property. */
+.app.rail-hidden { --rail-w: 0px; }
+
+/* Registered so the collapse can be animated: a plain custom property is a
+   string as far as transitions are concerned and would snap. Browsers without
+   @property just skip the animation, which is a fine place to land. */
+@property --rail-w {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 264px;
+}
+
+.app { transition: --rail-w 0.18s ease; }
+/* Restoring a collapsed rail from last time is a starting state, not a move —
+   without this it slides shut in front of you on every load. */
+.app.is-loading { transition: none; }
+
+/* A zero-width column still holds focusable buttons and is still read out, so
+   the rail goes properly hidden — but only once it has finished sliding away,
+   which is what the delayed zero-length step buys. Same trick as the stacked
+   panes further down. */
+.app.rail-hidden .rail {
+  visibility: hidden;
+  transition: visibility 0s linear 0.18s;
+}
+.rail { transition: visibility 0s; }
+
 /* ------------------------------------------------------------ pane split */
 
 /* The grab handle sits on top of the thread's left border and takes up no
@@ -389,6 +419,28 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   color: var(--rail-fg-dim);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* Reads as a label until you go near it, because most of the time it is one:
+   the answer to "what is this agent running?". */
+.agent__model {
+  display: block;
+  max-width: 100%;
+  margin-top: 2px;
+  /* The padding is the hover pill; the negative margin keeps the text itself
+     in the same column as the name and the key above it. */
+  margin-left: -5px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--rail-fg-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.agent__model.is-set { color: var(--rail-fg); }
+.agent__model:hover { background: var(--rail-active); color: #fff; }
+
 .agent__copy {
   border: 0; background: none; color: var(--rail-fg-dim);
   font-size: 11px; padding: 3px 6px; border-radius: 5px; flex: none;
@@ -455,6 +507,13 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
 /* The back arrow is an icon with no text baseline, so it sits out the row's
    baseline alignment rather than hanging below the title. */
 #btn-menu { align-self: center; }
+#btn-rail { align-self: center; }
+/* macOS hides the title bar and floats the traffic lights over the top-left of
+   the window. That corner is the rail until the rail is collapsed — after
+   which it is this header, and the toggle would sit underneath them. Reserve
+   the strip they land on. Set from JS because only the desktop build gets that
+   window, and nothing in CSS can see it. */
+.app.is-inset-titlebar.rail-hidden .chan-head { padding-left: 84px; }
 .chan-head__title { font-size: 17px; font-weight: 800; margin: 0; letter-spacing: -0.01em; }
 .chan-head__topic {
   border: 0; background: none; padding: 2px 4px; border-radius: 5px;
@@ -869,11 +928,12 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
 .send-btn {
   display: grid; place-items: center;
   width: 32px; height: 32px;
-  border: 0; border-radius: 8px;
-  background: var(--accent); color: var(--accent-fg);
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--fg);
   flex: none;
-  transition: opacity 0.12s, transform 0.08s;
+  transition: opacity 0.12s, transform 0.08s, background 0.12s;
 }
+.send-btn:not(:disabled):hover { background: var(--bg-hover); }
 .send-btn svg { width: 17px; height: 17px; fill: currentColor; }
 .send-btn:disabled { opacity: 0.32; cursor: default; }
 .send-btn:not(:disabled):active { transform: scale(0.94); }
@@ -990,9 +1050,11 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   font-weight: 600;
 }
 .btn:hover { background: var(--bg-hover); }
-.btn--primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-.btn--primary:hover { filter: brightness(1.08); }
-.btn--danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+/* No filled variants: every button is the page surface with a border, and the
+   emphasis is carried by the border and the label colour instead. */
+.btn--primary { border-color: var(--fg-faint); color: var(--fg); }
+.btn--danger { border-color: var(--danger); color: var(--danger); }
+.btn--danger:hover { background: var(--danger-soft); }
 .btn--ghost { border-color: transparent; color: var(--fg-dim); }
 
 .warn-note {
@@ -1046,6 +1108,12 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
 .setting__name { font-size: 14px; font-weight: 600; }
 .setting__hint { margin-top: 2px; font-size: 12px; line-height: 1.4; color: var(--fg-dim); }
 .setting .btn { flex: none; }
+.setting__value {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--fg-dim);
+}
 
 /* ------------------------------------------------------------- palette */
 
@@ -1133,6 +1201,7 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
 /* ------------------------------------------------------------ responsive */
 
 .only-narrow { display: none; }
+.only-wide { display: grid; }
 
 @media (max-width: 900px) {
   /* The channel list is home and holds the one column on its own; the channel
@@ -1164,6 +1233,14 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   .thread[hidden] { display: flex; }
 
   .only-narrow { display: grid; }
+  /* The rail is the whole column down here, so there is nothing to collapse it
+     away from — and a stale `rail-hidden` from a wide window must not follow
+     you into a layout where it would hide the only thing on screen. */
+  .only-wide { display: none; }
+  .app.rail-hidden .rail { visibility: visible; }
+  /* The rail is never the collapsed column here, so the header never inherits
+     the traffic lights from it. */
+  .app.is-inset-titlebar.rail-hidden .chan-head { padding-left: 16px; }
   /* The back arrow already closes the thread; a second control for it would
      just crowd the header. */
   #btn-close-thread { display: none; }

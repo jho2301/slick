@@ -11,7 +11,12 @@
  *   slick agent state set $KEY step=verifying                      # remember why
  */
 
-import { ValidationError, looksLikeHistoryKey } from '@slick/core';
+import {
+  ValidationError,
+  looksLikeHistoryKey,
+  readServeModel,
+  readServeModelChoices,
+} from '@slick/core';
 import { parseJsonFlag, resolveText } from '../args.js';
 import {
   ago,
@@ -105,6 +110,8 @@ export const agent = {
   post [key] <text…>            post as the agent
   reply [key] <message-id> <text…>
   state [get|set|clear]         the agent's own JSON memory
+  model [key] [name]            read or change the model a running serve calls
+                                (--list for the ones the agent says it can run)
   ack [key] [seq|latest]        move the read cursor by hand
   watch [key]                   stream new messages as they arrive
   serve [key|name]              call the real agent on new @mentions and post its reply
@@ -134,13 +141,16 @@ Serving
   --interval <ms>                poll interval (default 2000)
   --once                         handle one batch and exit
   --context <n>                  messages of context to give the agent (default 20)
+  --shared-session               one child conversation for every thread at once,
+                                 instead of one per thread
   --system <text>                extra instruction appended to every prompt
   --append-system-prompt <text>  passed through to claude
   --dry-run                      print the prompt instead of calling and posting
   --permission-mode <mode>       passed through to claude
   --allowed-tools <tools>        passed through to claude as --allowedTools
   --dangerously-skip-permissions passed through to claude
-  --model <name>                 passed through to claude
+  --model <name>                 passed through to claude (the launch default;
+                                 slick agent model overrides it, live)
   --timeout <ms>                 kill the child if it runs this long (default 10m)
   --max-attempts <n>             give up on a message after n failures (default 3)
   --no-lock                      allow a second watcher on the same session key`,
@@ -156,6 +166,8 @@ Serving
       'replace',
       'once',
       'follow',
+      'clear',
+      'list',
       ...SERVE_SPEC.booleans,
     ],
     strings: [
@@ -222,6 +234,13 @@ Serving
             channel: s.channelSlug ? `#${s.channelSlug}` : style.dim('—'),
             cursor: String(s.cursorSeq),
             seen: ago(s.lastSeenAt),
+            // The app hides sessions nobody answers for, so this table is
+            // where they stay findable — and where you see why they are gone.
+            serve: s.serve?.live
+              ? style.green('watching')
+              : s.serve?.served
+                ? style.yellow('idle')
+                : style.dim('posts only'),
             status: s.status === 'active' ? style.dim('active') : style.yellow(s.status),
           })),
           [
@@ -231,6 +250,7 @@ Serving
             { key: 'channel', label: 'channel' },
             { key: 'cursor', label: 'cursor', align: 'right' },
             { key: 'seen', label: 'last seen' },
+            { key: 'serve', label: 'serve' },
             { key: 'status', label: 'status' },
           ]
         );
@@ -365,6 +385,57 @@ Serving
         throw new ValidationError(`Unknown state command "${action}".`, { hint: 'Try: get, set, clear' });
       }
 
+      // ----------------------------------------------------------- model ---
+      // A `serve` watcher can be up for days, so the model it calls cannot
+      // live only in its launch flags. It reads this back out of the session
+      // on every pass; changing it here lands on the next message answered,
+      // with no restart and without disturbing any thread's conversation.
+      case 'model': {
+        const first = rest[0];
+        const named = looksLikeHistoryKey(first) || (first !== undefined && first === flags.name);
+        const ref = sessionRef(ctx, named ? first : undefined);
+        const wanted = (named ? rest.slice(1) : rest).join(' ').trim();
+
+        // What can this agent run? `serve` asks the binary itself
+        // (`<cmd> --list-models`) and leaves the answer on the session.
+        if (flags.list) {
+          const session = await ws.agents.get(ref, { agentId: agentId(ctx) });
+          const choices = readServeModelChoices(session.state);
+          const model = readServeModel(session.state);
+          if (ctx.json) return json({ model, choices });
+          if (choices.length === 0) {
+            return note('No list — this agent has not told `serve` what it can run. Any name still works.');
+          }
+          let group = null;
+          for (const choice of choices) {
+            if (choice.group !== group) {
+              group = choice.group;
+              if (group) line(style.dim(group));
+            }
+            line(`  ${choice.id === model ? style.green('●') : ' '} ${choice.label}${style.dim(`  ${choice.id}`)}`);
+          }
+          return;
+        }
+
+        if (!wanted && !flags.clear) {
+          const session = await ws.agents.get(ref, { agentId: agentId(ctx) });
+          const model = readServeModel(session.state);
+          if (ctx.json) return json({ model, choices: readServeModelChoices(session.state), session });
+          if (ctx.quiet) return line(model ?? '');
+          if (!model) return note('No override — `serve` uses its own --model, or whatever the agent defaults to.');
+          return line(model);
+        }
+
+        const session = await ws.agents.setModel(ref, flags.clear ? null : wanted, {
+          agentId: agentId(ctx),
+        });
+        const model = readServeModel(session.state);
+        if (ctx.json) return json({ model, session });
+        if (model) ok(`Model set to ${style.bold(model)} — from the next message answered.`);
+        else ok('Model override cleared.');
+        return;
+      }
+
       // ------------------------------------------------------------- ack ---
       case 'ack': {
         const ref = sessionRef(ctx, rest[0]);
@@ -423,7 +494,7 @@ Serving
 
       default:
         throw new ValidationError(`Unknown agent command "${sub}".`, {
-          hint: 'Try: start, sessions, resume, pull, post, reply, state, ack, watch, serve, end',
+          hint: 'Try: start, sessions, resume, pull, post, reply, state, model, ack, watch, serve, end',
         });
     }
   },

@@ -1,6 +1,6 @@
 import { test, describe, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { Workspace } from '../src/workspace.js';
 import { ConflictError, NotFoundError, ValidationError } from '../src/errors.js';
 import { looksLikeHistoryKey } from '../src/ids.js';
+import { serveLockPath } from '../src/serve.js';
 
 /** @type {string} */
 let home;
@@ -471,6 +472,59 @@ describe('agent sessions', () => {
       resumed.missed.every((e) => e.type !== 'agent.typing'),
       'typing must not show up as something to handle'
     );
+  });
+
+  test('a session nobody serves is not callable', () => {
+    // What a cron automation looks like: it posts, it has a cursor, and no
+    // watcher has ever attached to it.
+    const automation = ws.agents.start({ agentId: 'hn-daily', channel: 'general' });
+    ws.agents.post(automation.key, { text: 'this morning on Hacker News…' });
+
+    const listed = ws.agents.list().find((s) => s.key === automation.key);
+    assert.equal(listed.callable, false);
+    assert.deepEqual(listed.serve, { live: false, pid: null, served: false, callable: false });
+  });
+
+  test('a live serve lock makes a session callable', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    writeFileSync(serveLockPath(session.key, home), String(process.pid));
+    try {
+      const served = ws.agents.get(session.key);
+      assert.equal(served.serve.live, true);
+      assert.equal(served.serve.pid, process.pid);
+      assert.equal(served.callable, true);
+    } finally {
+      rmSync(serveLockPath(session.key, home), { force: true });
+    }
+  });
+
+  test('a lock left by a dead process is not a watcher', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    // A pid that cannot be running: the kernel would have to hand out 2^31.
+    writeFileSync(serveLockPath(session.key, home), '2147483646');
+    try {
+      assert.equal(ws.agents.get(session.key).serve.live, false);
+    } finally {
+      rmSync(serveLockPath(session.key, home), { force: true });
+    }
+  });
+
+  test('an agent stays callable between watcher restarts', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    // The bookkeeping `serve` leaves behind outlives the process that wrote it.
+    ws.agents.setState(session.key, { _serveThreads: { root: { id: 'abc' } } });
+    const between = ws.agents.get(session.key);
+    assert.equal(between.serve.live, false);
+    assert.equal(between.serve.served, true);
+    assert.equal(between.callable, true);
+
+    // Ending a session retires it, whoever used to watch it.
+    assert.equal(ws.agents.end(session.key).callable, false);
+  });
+
+  test('a model chosen by hand does not make an automation callable', () => {
+    const automation = ws.agents.start({ agentId: 'hn-daily', channel: 'general' });
+    assert.equal(ws.agents.setModel(automation.key, 'anthropic/claude-sonnet-4').callable, false);
   });
 });
 

@@ -242,12 +242,15 @@ describe('agent history keys across processes', () => {
 
 describe('agent serve', () => {
   let key;
+  /** Threads reused across tests, to exercise continuity within one thread. */
+  let planThread;
+  let memoryThread;
 
   test('sets up a session and a mention to answer', async () => {
     key = (
       await slick(['agent', 'start', '--agent', 'claude', '--name', 'server', '--channel', 'general', '-q'])
     ).stdout;
-    await slick(['send', 'general', '@claude what is the plan']);
+    planThread = (await slick(['send', 'general', '@claude what is the plan', '--json'])).json.message.id;
     await slick(['send', 'general', 'not addressed to anyone']);
   });
 
@@ -263,11 +266,29 @@ describe('agent serve', () => {
     assert.equal(pulled.events.length, 0, 'both messages were consumed even though only one was answered');
   });
 
-  test('the next run resumes the same fake-agent session', async () => {
-    await slick(['send', 'general', '@claude and now']);
+  test('a reply in the same thread resumes that thread’s conversation', async () => {
+    await slick(['send', 'general', '--thread', planThread, '@claude and now']);
     const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json']);
     const line = JSON.parse(result.stdout.trim());
     assert.equal(line.message.text, 'echo(resumed=true): @claude and now');
+  });
+
+  test('a mention in another thread gets a conversation of its own', async () => {
+    await slick(['send', 'general', '@claude unrelated question']);
+    const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_SESSION_ID: 'fake-session-2' },
+    });
+    const line = JSON.parse(result.stdout.trim());
+    assert.equal(
+      line.message.text,
+      'echo(resumed=false): @claude unrelated question',
+      'a new thread does not inherit another thread’s transcript'
+    );
+
+    const threads = (await slick(['agent', 'state', 'get', key, '--json'])).json.state._serveThreads;
+    assert.equal(Object.keys(threads).length, 2, 'one saved conversation per thread');
+    assert.equal(threads[planThread].sessionId, 'fake-session-1');
+    assert.equal(threads[line.message.threadId].sessionId, 'fake-session-2');
   });
 
   test('a failing call is reported and does not consume the message', async () => {
@@ -293,19 +314,26 @@ describe('agent serve', () => {
     assert.match(line.message.text, /no mention here$/);
   });
 
-  test('a transcript too big to send retires the session instead of retrying into it', async () => {
+  test('a transcript too big to send retires that thread instead of retrying into it', async () => {
     const before = (await slick(['agent', 'state', 'get', key, '--json'])).json;
-    assert.equal(before.state._serveSessionId, 'fake-session-1', 'a session is saved to resume');
+    assert.equal(before.state._serveThreads[planThread].sessionId, 'fake-session-1', 'a session is saved to resume');
 
-    await slick(['send', 'general', '@claude answer despite the oversized history']);
+    await slick(['send', 'general', '--thread', planThread, '@claude answer despite the oversized history']);
     const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json'], {
-      env: { FAKE_AGENT_OVERSIZED_RESUME: '1' },
+      env: { FAKE_AGENT_OVERSIZED_RESUME: '1', FAKE_AGENT_SESSION_ID: 'fake-session-3' },
     });
 
     assert.match(result.stderr, /Retiring the resumed/);
     const line = JSON.parse(result.stdout.trim());
     assert.match(line.message.text, /^echo\(resumed=false\)/, 'answered from a fresh session');
     assert.match(line.message.text, /oversized history$/, 'and it answered the real message');
+
+    const after = (await slick(['agent', 'state', 'get', key, '--json'])).json;
+    assert.equal(
+      after.state._serveThreads[planThread].sessionId,
+      'fake-session-3',
+      'the fresh conversation replaced the dead one for that thread'
+    );
 
     const pulled = (await slick(['agent', 'pull', key, '--json', '--peek'])).json;
     assert.equal(pulled.events.length, 0, 'the message was consumed, not left to retry forever');
@@ -318,7 +346,7 @@ describe('agent serve', () => {
       env: { FAKE_AGENT_FAIL: '1' },
     });
     const state = (await slick(['agent', 'state', 'get', key, '--json'])).json;
-    assert.equal(state.state._serveSessionId, undefined, 'a broken session is not carried into the next run');
+    assert.equal(state.state._serveThreads, undefined, 'a broken session is not carried into the next run');
   });
 
   test('after --max-attempts it says so in the thread and stops blocking the queue', async () => {
@@ -380,27 +408,134 @@ describe('agent serve', () => {
 
   test('saved state is sent when it changes, and not again until it does', async () => {
     await slick(['agent', 'state', 'set', key, 'step=verifying']);
-    await slick(['send', 'general', '@claude first look']);
+    memoryThread = (await slick(['send', 'general', '@claude first look', '--json'])).json.message.id;
     const first = await serveDump();
     assert.match(first.prompt, /Your saved state from earlier runs/);
     assert.match(first.prompt, /"step":"verifying"/);
-    assert.doesNotMatch(first.prompt, /_serveSessionId/, 'our bookkeeping is not the agent’s memory');
+    assert.doesNotMatch(first.prompt, /_serveThreads/, 'our bookkeeping is not the agent’s memory');
 
-    await slick(['send', 'general', '@claude nothing changed']);
+    await slick(['send', 'general', '--thread', memoryThread, '@claude nothing changed']);
     const second = await serveDump();
     assert.doesNotMatch(second.prompt, /Your saved state/, 'the resumed transcript is still holding it');
 
     await slick(['agent', 'state', 'set', key, 'step=done']);
-    await slick(['send', 'general', '@claude changed now']);
+    await slick(['send', 'general', '--thread', memoryThread, '@claude changed now']);
     const third = await serveDump();
     assert.match(third.prompt, /"step":"done"/);
   });
 
+  test('a thread’s prompt carries that thread, not the rest of the channel', async () => {
+    await slick(['send', 'general', 'unrelated chatter nobody asked about']);
+    await slick(['send', 'general', '--thread', memoryThread, '@claude and this thread only']);
+    const call = await serveDump();
+    assert.equal(call.resumed, true, 'the thread’s own conversation answers it');
+    assert.match(call.prompt, /Earlier in this thread:/);
+    assert.match(call.prompt, /first look/, 'the thread’s earlier turns');
+    assert.doesNotMatch(call.prompt, /unrelated chatter/, 'other threads stay out of it');
+  });
+
   test('a retired session is told the state again, having never seen it', async () => {
-    await slick(['send', 'general', '@claude after the retirement']);
+    await slick(['send', 'general', '--thread', memoryThread, '@claude after the retirement']);
     const call = await serveDump([], { FAKE_AGENT_OVERSIZED_RESUME: '1' });
     assert.equal(call.resumed, false, 'the oversized resume was retired for a fresh session');
     assert.match(call.prompt, /"step":"done"/, 'which starts out knowing nothing');
+  });
+
+  test('--shared-session keeps every thread in one conversation, as it used to', async () => {
+    await slick(['send', 'general', '@claude shared one']);
+    const first = await serveDump(['--shared-session']);
+    assert.equal(first.resumed, false, 'nothing shared to resume yet');
+
+    await slick(['send', 'general', '@claude shared two']);
+    const second = await serveDump(['--shared-session']);
+    assert.equal(second.resumed, true, 'a different thread, the same child session');
+    assert.match(second.prompt, /Recent conversation in #general/, 'and the channel, not one thread');
+  });
+
+  test('serve asks the agent what it can run, and remembers the answer', async () => {
+    // Its own session: the shared one was asked by the first serve above, and
+    // the answer is deliberately good for hours after that.
+    const lister = (
+      await slick(['agent', 'start', '--agent', 'claude', '--name', 'lister', '--channel', 'general', '-q'])
+    ).stdout;
+    const log = join(home, 'models-asked.log');
+    await slick(['agent', 'serve', lister, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_MODELS_LOG: log },
+    });
+
+    const listed = (await slick(['agent', 'model', lister, '--list', '--json'])).json;
+    assert.deepEqual(
+      listed.choices.map((c) => c.id),
+      ['north::big', 'north::small', 'south::quick']
+    );
+    assert.equal(listed.choices[0].group, 'north', 'grouped the way the agent grouped them');
+    assert.equal(readFileSync(log, 'utf8').trim().split('\n').length, 1);
+
+    // Asking is a whole process spawn, and the answer is good for hours.
+    await slick(['agent', 'serve', lister, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_MODELS_LOG: log },
+    });
+    assert.equal(readFileSync(log, 'utf8').trim().split('\n').length, 1, 'not asked again within the TTL');
+  });
+
+  test('the list is there from the first pass, without being asked for', async () => {
+    const choices = (await slick(['agent', 'model', key, '--list', '--json'])).json.choices;
+    assert.equal(choices.length, 3, 'the watcher asked on its own, back at the first message');
+  });
+
+  test('an agent that has never heard of --list-models still works', async () => {
+    const other = (
+      await slick(['agent', 'start', '--agent', 'claude', '--name', 'nolist', '--channel', 'general', '-q'])
+    ).stdout;
+    await slick(['send', 'general', '@claude nothing to advertise']);
+    const result = await slick(['agent', 'serve', other, '--once', '--cmd', FAKE_AGENT, '--json'], {
+      env: { FAKE_AGENT_NO_MODELS: '1' },
+    });
+    assert.equal(result.code, 0);
+    assert.match(JSON.parse(result.stdout.trim()).message.text, /nothing to advertise$/);
+
+    const state = (await slick(['agent', 'state', 'get', other, '--json'])).json.state;
+    assert.equal(state._serveModelChoices, undefined, 'no list to offer');
+    assert.ok(state._serveModelsAt > 0, 'but it is not asked again every pass');
+
+    const listed = await slick(['agent', 'model', other, '--list']);
+    assert.match(listed.stdout, /No list/);
+  });
+
+  test('--model is passed through to the child', async () => {
+    await slick(['send', 'general', '@claude which model are you']);
+    const call = await serveDump(['--model', 'anthropic/claude-sonnet-4']);
+    assert.equal(call.model, 'anthropic/claude-sonnet-4');
+  });
+
+  test('`agent model` overrides the launch flag, for a watcher already running', async () => {
+    const set = await slick(['agent', 'model', key, 'anthropic/claude-opus-4', '--json']);
+    assert.equal(set.code, 0);
+    assert.equal(set.json.model, 'anthropic/claude-opus-4');
+    assert.equal(
+      (await slick(['agent', 'model', key, '-q'])).stdout,
+      'anthropic/claude-opus-4',
+      'and reads back'
+    );
+
+    await slick(['send', 'general', '@claude and now']);
+    const call = await serveDump(['--model', 'anthropic/claude-sonnet-4']);
+    assert.equal(call.model, 'anthropic/claude-opus-4', 'the live setting wins over the launch flag');
+
+    const prompt = call.prompt;
+    assert.doesNotMatch(prompt, /_serveModel/, 'which model it is running is not the agent’s memory');
+  });
+
+  test('--clear puts the launch default back', async () => {
+    await slick(['agent', 'model', key, '--clear']);
+    assert.equal((await slick(['agent', 'model', key, '--json'])).json.model, null);
+
+    await slick(['send', 'general', '@claude and after clearing']);
+    const call = await serveDump(['--model', 'anthropic/claude-sonnet-4']);
+    assert.equal(call.model, 'anthropic/claude-sonnet-4');
+
+    await slick(['send', 'general', '@claude with nothing set at all']);
+    assert.equal((await serveDump()).model, null, 'and with no flag either, the agent picks');
   });
 
   test('but a lock left behind by a dead process does not', async () => {

@@ -60,6 +60,13 @@ const claude = ws.agents.find('inbox', { agentId: 'claude' })
 const reviewer = ws.agents.find('review', { agentId: 'reviewer' })
   ?? ws.agents.start({ agentId: 'reviewer', name: 'review', channel: 'design', title: 'Design review bot' });
 
+// Both of these are agents you can talk to, not automations, so they carry the
+// mark a `serve` watcher leaves behind. Without it the app would file them
+// with the cron jobs and keep them out of the rail and the mention picker.
+for (const session of [claude, reviewer]) {
+  ws.agents.setState(session.key, { _serveThreads: {} });
+}
+
 if (ws.messages.list('deploys').messages.length === 0) {
   const incident = ws.messages.post({
     channel: 'deploys',

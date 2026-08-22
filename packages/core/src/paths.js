@@ -24,6 +24,9 @@ export function paths(home) {
     daemonFile: join(root, 'daemon.json'),
     daemonLog: join(root, 'daemon.log'),
     tokenFile: join(root, 'token'),
+    // Presence of this file turns token auth off permanently for this
+    // workspace; see `slickd --no-auth`.
+    noAuthFile: join(root, 'no-auth'),
     uploads: join(root, 'files'),
   };
 }

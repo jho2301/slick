@@ -8,11 +8,18 @@
  * intercepting it would break live updates and serve stale messages.
  */
 
-/* Renaming this is what makes a browser install a new worker, which rebuilds
-   the offline copy below in one pass and drops the old one. Freshness does not
-   depend on remembering to, though — the network is asked first either way, so
-   a shell that ships without a bump here still arrives on the next launch. */
-const CACHE = 'slick-shell-v9';
+/* The daemon rewrites this as it serves the file, to a digest of every asset
+   under the web root — so any change to the UI is a change to this worker, and
+   a browser installing it rebuilds the offline copy below in one pass and
+   drops the old one. That matters most where the network-first fetch handler
+   cannot help: an installed app that is resumed rather than relaunched never
+   re-fetches the shell, and stays on whatever build it last installed until
+   the worker itself is replaced.
+
+   Served without a daemon in front of it, the placeholder stands and the
+   worker still works — it just stops noticing new builds on its own. */
+const BUILD = '__BUILD__';
+const CACHE = `slick-shell-${BUILD}`;
 const SHELL = [
   './',
   './index.html',
@@ -30,8 +37,42 @@ const SHELL = [
   './icons/icon-512.png',
 ];
 
+/**
+ * Worth keeping? Only a plain same-origin answer from the daemon is.
+ *
+ * Behind an authenticating proxy — Cloudflare Access, say — an expired session
+ * answers a request for `app.js` with a redirect to a login page, which then
+ * comes back 200 OK and would otherwise be filed away *as* `app.js`. Once that
+ * is in the cache the app is broken offline for good, and the sign-in it is
+ * offering cannot be completed from inside a fetch handler anyway.
+ */
+function worthCaching(response) {
+  return response.ok && !response.redirected && response.type === 'basic';
+}
+
+/**
+ * Build the offline copy, refusing anything that is not the app.
+ *
+ * `cache.addAll` would take a proxy's sign-in page for a stylesheet — it only
+ * asks whether the response was an error. Throwing instead is what keeps a
+ * half-built shell from being installed: the worker never activates, and the
+ * one already serving carries on.
+ */
+async function precache() {
+  const cache = await caches.open(CACHE);
+  await Promise.all(
+    SHELL.map(async (path) => {
+      // `reload` because this is the moment a new build is meant to arrive;
+      // an HTTP cache hit here would install the previous one under a new name.
+      const response = await fetch(new Request(path, { cache: 'reload' }));
+      if (!worthCaching(response)) throw new Error(`refusing to cache ${path}`);
+      await cache.put(path, response);
+    })
+  );
+}
+
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
+  event.waitUntil(precache());
   self.skipWaiting();
 });
 
@@ -89,7 +130,7 @@ const SHELL_KEY = new URL('./index.html', self.location.href).href;
 /** Fetch, and file a good response under the key it should be found by later. */
 async function refresh(request, key) {
   const response = await fetch(request);
-  if (response.ok) {
+  if (worthCaching(response)) {
     const cache = await caches.open(CACHE);
     await cache.put(key, response.clone());
   }
@@ -123,7 +164,12 @@ self.addEventListener('fetch', (event) => {
       // the two can only stay in step if neither is allowed to lag. The cache
       // is what is left when the daemon is not running, which — being local —
       // is the only real reason to miss.
-      return (await network) ?? (await caches.match(key)) ?? Response.error();
+      const fresh = await network;
+      // A redirect to a proxy's login page is a worse answer than a stale but
+      // working shell — for a navigation, which the browser will follow, it is
+      // the right one, but not for the modules the page is built out of.
+      if (fresh && (navigating || worthCaching(fresh))) return fresh;
+      return (await caches.match(key)) ?? fresh ?? Response.error();
     })()
   );
 });

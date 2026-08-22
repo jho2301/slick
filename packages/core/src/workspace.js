@@ -33,7 +33,9 @@ export class Workspace {
     /** Default author for anything that does not say otherwise. */
     this.actor = { id: user.id, kind: 'human', label: user.name };
 
-    const ctx = { db, actor: this.actor };
+    // `home` travels with the context because services need more than the
+    // database to answer some questions — `serve` locks live on disk.
+    const ctx = { db, actor: this.actor, home: this.home };
     // Categories first: channels resolve `category: 'engineering'` through them.
     this.categories = createCategoryService(ctx);
     ctx.categories = this.categories;

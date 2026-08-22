@@ -1,13 +1,14 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Workspace } from '@slick/core';
+import { Workspace, serveLockPath } from '@slick/core';
 import { createServer } from '../src/index.js';
 import { createPushService } from '../src/push.js';
+import { buildStamp, resolveWebRoot } from '../src/static.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -242,6 +243,71 @@ describe('agent sessions over HTTP', () => {
     assert.equal(ended.body.session.status, 'ended');
   });
 
+  test('the model a served session runs is read and set over HTTP', async () => {
+    const key = (await call('POST', '/api/agents/sessions', { agentId: 'modelbot', channel: 'general' })).body
+      .session.key;
+
+    assert.equal((await call('GET', `/api/agents/sessions/${key}/model`)).body.model, null, 'none to begin with');
+
+    const set = await call('PUT', `/api/agents/sessions/${key}/model`, { model: ' anthropic/claude-opus-4 ' });
+    assert.equal(set.body.model, 'anthropic/claude-opus-4', 'trimmed on the way in');
+    assert.equal((await call('GET', `/api/agents/sessions/${key}/model`)).body.model, 'anthropic/claude-opus-4');
+
+    // It rides in the session list, which is what the app renders the rail from.
+    const listed = (await call('GET', '/api/agents/sessions')).body.sessions.find((s) => s.key === key);
+    assert.equal(listed.state._serveModel, 'anthropic/claude-opus-4');
+
+    const cleared = await call('PUT', `/api/agents/sessions/${key}/model`, { model: null });
+    assert.equal(cleared.body.model, null, 'and back to the default');
+
+    const bad = await call('PUT', `/api/agents/sessions/${key}/model`, { model: 'two\nlines' });
+    assert.equal(bad.status, 422, 'a model name is one line');
+  });
+
+  test('the models an agent advertised are offered back for choosing', async () => {
+    const key = (await call('POST', '/api/agents/sessions', { agentId: 'pickbot', channel: 'general' })).body
+      .session.key;
+    assert.deepEqual((await call('GET', `/api/agents/sessions/${key}/model`)).body.choices, []);
+
+    // What `serve` writes after asking the binary `--list-models`.
+    app.ws.agents.setModelChoices(key, [
+      { id: 'north::big', label: 'big', group: 'north' },
+      'plain-name',
+    ]);
+
+    const offered = (await call('GET', `/api/agents/sessions/${key}/model`)).body;
+    assert.deepEqual(offered.choices, [
+      { id: 'north::big', label: 'big', group: 'north' },
+      { id: 'plain-name', label: 'plain-name', group: null },
+    ]);
+    assert.ok(offered.checkedAt > 0, 'and when that answer was last refreshed');
+
+    // A probe that came back empty-handed keeps the list we already had.
+    app.ws.agents.setModelChoices(key, null);
+    assert.equal((await call('GET', `/api/agents/sessions/${key}/model`)).body.choices.length, 2);
+  });
+
+  test('the session list says which agents can actually be called', async () => {
+    const automation = (await call('POST', '/api/agents/sessions', { agentId: 'digest', channel: 'general' })).body
+      .session.key;
+    const watched = (await call('POST', '/api/agents/sessions', { agentId: 'answers', channel: 'general' })).body
+      .session.key;
+    writeFileSync(serveLockPath(watched, home), String(process.pid));
+
+    const sessions = (await call('GET', '/api/agents/sessions')).body.sessions;
+    const byKey = new Map(sessions.map((s) => [s.key, s]));
+    assert.equal(byKey.get(automation).callable, false, 'nothing is watching it, so a mention would go nowhere');
+    assert.equal(byKey.get(watched).callable, true);
+    assert.equal(byKey.get(watched).serve.live, true);
+
+    // The watcher stops, but the bookkeeping it wrote says it will be back.
+    rmSync(serveLockPath(watched, home), { force: true });
+    await call('PUT', `/api/agents/sessions/${watched}/state`, { state: { _serveThreads: {} } });
+    const after = (await call('GET', '/api/agents/sessions')).body.sessions.find((s) => s.key === watched);
+    assert.equal(after.serve.live, false);
+    assert.equal(after.callable, true, 'an agent between restarts is still an agent');
+  });
+
   test('an unknown history key is a 404 with a usable code', async () => {
     const res = await call('POST', '/api/agents/sessions/slk_h1_00000000000000000000/resume', {});
     assert.equal(res.status, 404);
@@ -469,6 +535,41 @@ describe('web UI hosting', () => {
     assert.ok(manifest.start_url.startsWith('./'));
     assert.equal(manifest.name, 'Slick');
     assert.ok(manifest.icons.length >= 2);
+  });
+
+  // A worker is only replaced when its own bytes change. Without a stamp in
+  // it, a shell that ships new JS behind an unchanged sw.js leaves every
+  // installed app on the worker — and the cache — it already has.
+  test('the service worker carries the build it belongs to', async () => {
+    const res = await fetch(`${base}/sw.js`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/javascript/);
+
+    const source = await res.text();
+    assert.doesNotMatch(source, /__BUILD__/, 'the placeholder should have been replaced');
+    const stamp = source.match(/const BUILD = ["']([0-9a-f]+)["']/)?.[1];
+    assert.ok(stamp, 'the worker should name a build');
+
+    // The same build the daemon reports, or the app cannot tell whether the
+    // worker it is running is the one being served.
+    const health = await fetch(`${base}/api/health`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    }).then((r) => r.json());
+    assert.equal(health.build, stamp);
+  });
+
+  test('and the build changes when the UI does', async () => {
+    const webRoot = resolveWebRoot(null);
+    const file = join(webRoot, 'styles.css');
+    const before = buildStamp(webRoot);
+    const stat = statSync(file);
+    try {
+      utimesSync(file, stat.atime, new Date(stat.mtimeMs + 5000));
+      assert.notEqual(buildStamp(webRoot), before, 'a touched asset should restamp the build');
+    } finally {
+      utimesSync(file, stat.atime, stat.mtime);
+    }
+    assert.equal(buildStamp(webRoot), before, 'and putting it back should restore it');
   });
 
   test('and the manifest is no more readable than anything else', async () => {

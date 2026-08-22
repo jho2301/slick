@@ -81,7 +81,9 @@ if (values.help) {
                       is trusted automatically unless --no-tailscale
   --no-tailscale     skip Tailscale MagicDNS auto-detection
   --web-root <dir>   directory containing the web UI
-  --no-auth          disable token auth (loopback only; for tests)
+  --no-auth          disable token auth for this run (loopback only). To
+                      turn it off permanently, set SLICK_NO_AUTH=1 or
+                      create an empty <home>/no-auth file
   -f, --foreground   log to stdout instead of running quietly
 `);
   process.exit(0);
@@ -94,9 +96,15 @@ if (existing.running) {
   process.exit(existing.pid === process.pid ? 0 : 3);
 }
 
-const token = values['no-auth']
-  ? null
-  : (values.token ?? process.env.SLICK_TOKEN ?? persistedToken(home));
+// Auth can be switched off for good, not just for one run: an explicit
+// flag, `SLICK_NO_AUTH=1`, or a `no-auth` marker file in the workspace all
+// mean the same thing. The Host-header pin and the loopback bind still stand.
+const authOff =
+  values['no-auth'] ||
+  /^(1|true|yes|on)$/i.test(process.env.SLICK_NO_AUTH ?? '') ||
+  existsSync(paths(home).noAuthFile);
+
+const token = authOff ? null : (values.token ?? process.env.SLICK_TOKEN ?? persistedToken(home));
 const host = values.host ?? process.env.SLICK_HOST;
 const trustedHosts = [
   ...(values['trust-host'] ?? []),
