@@ -27,12 +27,27 @@ export const EVENT_TYPES = Object.freeze({
   sessionResumed: 'agent.session.resumed',
   sessionEnded: 'agent.session.ended',
   agentTyping: 'agent.typing',
+  agentThinking: 'agent.thinking',
 });
 
 /**
  * Events an agent cares about when catching up on a conversation. `category.*`
  * is deliberately absent: rearranging the sidebar is not something an agent
  * should wake up to handle.
+ *
+ * `agent.thinking` is absent for a sharper reason, and the omission *is* the
+ * mechanism rather than a tidiness call. A thinking blob is one agent's
+ * scratchpad, mid-answer, and what this list buys is that the *live* signal
+ * stays out of the log an agent wakes for: add it here and every watcher in
+ * the workspace starts waking up, mid-thought, for someone else's half-formed
+ * step list.
+ *
+ * It is not what keeps the reasoning itself private, and it was never going to
+ * be. The finished trace is written down on the message at `metadata._think`,
+ * and a message travels wherever `message.created` travels — which is here.
+ * `agents.pull` and `agents.resume` strip that one key on their way out, for
+ * the same reason this list leaves the event off; the browser, which is who
+ * the trace was written for, gets it whole.
  */
 export const CONVERSATION_EVENTS = Object.freeze([
   EVENT_TYPES.messageCreated,

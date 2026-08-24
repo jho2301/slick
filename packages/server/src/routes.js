@@ -7,14 +7,41 @@
  * apart.
  */
 
-import { SERVE_MODELS_AT_KEY, readServeModel, readServeModelChoices } from '@slick/core';
+import {
+  SERVE_MODELS_AT_KEY,
+  ValidationError,
+  normalizeThinking,
+  readServeEffort,
+  readServeModel,
+  readServeModelChoices,
+} from '@slick/core';
 
+import { listCommands, runCommand } from './commands.js';
 import { createRouter, query } from './http.js';
 
 /** Returned by handlers that wrote the response themselves. */
 export const RAW = Symbol('raw');
 
 const CREATED = (body) => ({ status: 201, body });
+
+/**
+ * The shape @slick/core accepts for an agent id. It is not exported from
+ * there, and the delta route needs it: that route never reaches the core, so
+ * this is the only place the name is ever checked.
+ */
+const AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+/**
+ * How much answer-so-far one delta may carry.
+ *
+ * Every other blob in the app is normalized on the way in and has a cap behind
+ * it; a delta had neither, and it is the only body that is copied straight onto
+ * every open socket at once, so it is the one that could least afford to go
+ * without. A fragment is a fragment — the watcher coalesces at 400 characters
+ * — so this is roomy by an order of magnitude and still nowhere near the 4MB a
+ * request body is otherwise allowed.
+ */
+const MAX_DELTA_TEXT = 4096;
 
 export function createRoutes({ ws, hub, push, version, build }) {
   const router = createRouter();
@@ -207,11 +234,114 @@ export function createRoutes({ ws, hub, push, version, build }) {
     return { model: readServeModel(session.state), session };
   });
 
+  // How hard it thinks. No choices list beside it: the levels belong to the
+  // agent's own vocabulary, so Slick stores a word rather than a menu.
+  r('GET /api/agents/sessions/:ref/effort', ({ params, q }) => {
+    const { state } = ws.agents.get(params.ref, { agentId: q.get('agent') });
+    return { effort: readServeEffort(state) };
+  });
+
+  r('PUT /api/agents/sessions/:ref/effort', ({ params, body }) => {
+    const session = ws.agents.setEffort(params.ref, body.effort ?? null, { agentId: body.agent });
+    return { effort: readServeEffort(session.state), session };
+  });
+
   r('POST /api/agents/sessions/:ref/messages', ({ params, body }) =>
     CREATED(ws.agents.post(params.ref, body))
   );
 
   r('POST /api/agents/sessions/:ref/typing', ({ params, body }) => ws.agents.typing(params.ref, body));
+
+  // Who is typing *now*. The stream carries changes, and a tab that opened
+  // mid-reply missed the one that mattered, so it asks.
+  r('GET /api/typing', () => ({ typing: ws.agents.typingNow() }));
+
+  // The same signal from something that is not a session here — a gateway
+  // answering over this API rather than through `slick agent serve`. It has
+  // no history key to name and no lock to hold, so the snapshot believes it
+  // only for as long as its window.
+  r('POST /api/typing', ({ body }) => ws.agents.externalTyping(body ?? {}));
+
+  // Thinking is typing with a shape to it: the same live signal, carrying the
+  // steps the agent is working through rather than a bare on/off. It is a
+  // durable event like typing, and like typing it is missing from
+  // `CONVERSATION_EVENTS`, so one agent's scratchpad never turns up in
+  // another agent's `pull`.
+  r('POST /api/agents/sessions/:ref/thinking', ({ params, body }) => ws.agents.thinking(params.ref, body));
+
+  // And the same reason for a snapshot: a tab that opened halfway through a
+  // long answer saw none of the steps go by.
+  r('GET /api/thinking', () => ({ thinking: ws.agents.thinkingNow() }));
+
+  r('POST /api/thinking', ({ body }) => ws.agents.externalThinking(body ?? {}));
+
+  // The one route in the app that writes nothing down.
+  //
+  // A delta is a fragment of an answer that does not exist yet. The next one
+  // replaces it a hundred milliseconds later, and the finished message
+  // replaces them all a few seconds after that — so a row per fragment would
+  // be a permanent record of text that was already stale when it was written.
+  // It goes straight to whoever has a stream open and nowhere else. A tab that
+  // was not open for it has missed nothing: the message it was a preview of
+  // arrives through the log like every other message.
+  r('POST /api/stream/delta', ({ body }) => {
+    const agentId = String(body?.agentId ?? '').trim().toLowerCase();
+    if (!AGENT_ID_RE.test(agentId)) {
+      throw new ValidationError(`"${body?.agentId ?? ''}" is not a valid agent id.`, {
+        hint: 'Use letters, digits, "-", "_" or "." — the name the agent posts under.',
+      });
+    }
+    // Resolved rather than believed, exactly as `externalTyping` does it: an
+    // id that names nothing is a 404 the caller can act on, and the channel
+    // comes from the message instead of from whoever asked, so nobody can
+    // aim a preview at a channel they were never in.
+    const { threadId, text, think, done } = body ?? {};
+    const target = ws.messages.get(String(threadId ?? '').trim());
+    if (text != null && typeof text !== 'string') {
+      throw new ValidationError('A delta\u2019s "text" is a piece of the answer, so it has to be a string.');
+    }
+    if (typeof text === 'string' && text.length > MAX_DELTA_TEXT) {
+      // Refused rather than trimmed. Truncating would put a fragment on screen
+      // that the producer believes it sent whole, and the producer is the only
+      // party that can fix its own chunking — so it is the one that gets told.
+      throw new ValidationError(`A delta is a fragment: "text" is capped at ${MAX_DELTA_TEXT} characters.`, {
+        hint: 'Flush more often, or post the finished answer as a message.',
+        details: { length: text.length, max: MAX_DELTA_TEXT },
+      });
+    }
+    const frame = {
+      type: 'agent.delta',
+      // The root the message belongs to, not the id the caller happened to
+      // name, because `externalThinking` resolves the same way — a producer
+      // answering a reply would otherwise leave a draft under the reply id and
+      // a thinking blob under the root, and the browser would clear one of
+      // them and hold the other open forever.
+      threadId: target.threadId ?? target.id,
+      channelId: target.channelId,
+      actor: { id: agentId, kind: 'agent' },
+      text,
+      // The same normalizer `POST /api/thinking` runs, for the same reason:
+      // this blob is about to be copied onto every open socket, and the caps
+      // in `normalizeThinking` are the only thing that bounds it.
+      think: normalizeThinking(think),
+      done: Boolean(done),
+      at: Date.now(),
+    };
+    hub.broadcast(frame, { channelId: target.channelId });
+    return { ok: true };
+  });
+
+  // The agent's own slash commands. Slick keeps no vocabulary of its own: it
+  // asks the adapter what there is, and runs one when a human picks it. The
+  // output goes back in this response and nowhere else — no message, no event,
+  // nothing in the log, because it is one person's answer to one question.
+  r('GET /api/agents/sessions/:ref/commands', ({ params, q }) =>
+    listCommands(ws, params.ref, { force: q.bool('refresh') })
+  );
+
+  r('POST /api/agents/sessions/:ref/command', ({ params, body }) =>
+    runCommand(ws, params.ref, { command: body.command, args: body.args })
+  );
 
   r('POST /api/agents/sessions/:ref/end', ({ params }) => ({ session: ws.agents.end(params.ref) }));
 

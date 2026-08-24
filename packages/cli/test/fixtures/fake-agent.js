@@ -47,6 +47,21 @@ if (process.env.FAKE_AGENT_FAIL) {
   process.exit(0);
 }
 
+// An answer too long for one message. Posting it whole is refused for length,
+// which `serve` used to read as a failed call — so the answer cost three runs
+// of the model and was then dropped. It must arrive as several messages.
+if (process.env.FAKE_AGENT_LONG) {
+  const wanted = Number(process.env.FAKE_AGENT_LONG);
+  const lines = [];
+  let size = 0;
+  for (let i = 0; size < wanted; i++) {
+    lines.push(`line ${i}: ${'.'.repeat(40)}`);
+    size += lines.at(-1).length + 1;
+  }
+  process.stdout.write(JSON.stringify({ is_error: false, result: lines.join('\n'), session_id: sessionId }));
+  process.exit(0);
+}
+
 // The real failure that prompted the retry rework: a resumed transcript that
 // has outgrown the request limit fails every time, while a fresh one is fine.
 if (process.env.FAKE_AGENT_OVERSIZED_RESUME && resumed) {
@@ -69,12 +84,14 @@ if (process.env.FAKE_AGENT_OVERSIZED_RESUME && resumed) {
 if (process.env.FAKE_AGENT_DUMP) {
   const systemIndex = args.indexOf('--append-system-prompt');
   const modelIndex = args.indexOf('--model');
+  const effortIndex = args.indexOf('--effort');
   writeFileSync(
     process.env.FAKE_AGENT_DUMP,
     JSON.stringify({
       prompt,
       system: systemIndex === -1 ? null : args[systemIndex + 1],
       model: modelIndex === -1 ? null : args[modelIndex + 1],
+      effort: effortIndex === -1 ? null : args[effortIndex + 1],
       resumed,
       resumeId,
     })
@@ -85,10 +102,14 @@ if (process.env.FAKE_AGENT_DUMP) {
   process.exit(0);
 }
 
-process.stdout.write(
-  JSON.stringify({
-    is_error: false,
-    result: `echo(resumed=${resumed}): ${lastLine}`,
-    session_id: sessionId,
-  })
-);
+// The model the binary says it actually answered with. Real agents resolve
+// aliases, fall back, or ignore `--model` outright, so what they report is not
+// always what they were asked for — `FAKE_AGENT_REPORTS_MODEL` plays that.
+const reply = {
+  is_error: false,
+  result: `echo(resumed=${resumed}): ${lastLine}`,
+  session_id: sessionId,
+};
+if (process.env.FAKE_AGENT_REPORTS_MODEL) reply.model = process.env.FAKE_AGENT_REPORTS_MODEL;
+
+process.stdout.write(JSON.stringify(reply));

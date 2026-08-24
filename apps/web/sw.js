@@ -20,6 +20,13 @@
    worker still works — it just stops noticing new builds on its own. */
 const BUILD = '__BUILD__';
 const CACHE = `slick-shell-${BUILD}`;
+
+/* Every module the page imports has to be named here, and the cost of
+   forgetting one falls on exactly the people who cannot see it: the shell is
+   network-first, so a browser tab fetches the missing file and never notices,
+   while an installed app offline gets a 404 for one import and comes up as a
+   blank page with no clue why. `grouping.js` and `commands.js` had both been
+   missing since they were split out. */
 const SHELL = [
   './',
   './index.html',
@@ -31,6 +38,9 @@ const SHELL = [
   './js/mentions.js',
   './js/panes.js',
   './js/push.js',
+  './js/commands.js',
+  './js/grouping.js',
+  './js/thinking.js',
   './js/vendor/markdown-it.esm.min.mjs',
   './manifest.webmanifest',
   './icons/icon-192.png',

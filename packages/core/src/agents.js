@@ -16,7 +16,8 @@
 import { ConflictError, NotFoundError, ValidationError } from './errors.js';
 import { newHistoryKey, looksLikeHistoryKey } from './ids.js';
 import { row, rows, transact } from './db.js';
-import { serveStatus } from './serve.js';
+import { readServeLock, serveStatus } from './serve.js';
+import { THINK_KEY, normalizeThinking } from './thinking.js';
 import {
   CONVERSATION_EVENTS,
   EVENT_TYPES,
@@ -40,6 +41,41 @@ export const SERVE_MODEL_KEY = '_serveModel';
 /** The model set on a session, or null for "whatever the agent defaults to". */
 export function readServeModel(state) {
   const value = state?.[SERVE_MODEL_KEY];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * How hard the agent should think, when it is the kind of agent that can be
+ * told. The levels are the agent's own vocabulary — `claude` takes five of
+ * them, Hermes eight — so Slick stores whatever was set and lets the binary
+ * be the authority, exactly as it does for the model name.
+ */
+export const SERVE_EFFORT_KEY = '_serveEffort';
+
+/**
+ * Which calling convention the watcher on this session uses. It is a launch
+ * flag (`serve --adapter`), which the daemon has no way to see — so the
+ * watcher writes it down, and everything else can ask the session instead of
+ * asking the process.
+ */
+export const SERVE_ADAPTER_KEY = '_serveAdapter';
+
+/** The adapter a watcher last served this session with, if one has. */
+export function readServeAdapter(state) {
+  const value = state?.[SERVE_ADAPTER_KEY];
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * How long a "typing on" with no "off" behind it is still believed. A backstop
+ * for a watcher that died between the two, not a cadence: the live signal is
+ * the event, and this only bounds the snapshot below.
+ */
+const TYPING_WINDOW_MS = 5 * 60 * 1000;
+
+/** The reasoning effort set on a session, or null for the agent's own default. */
+export function readServeEffort(state) {
+  const value = state?.[SERVE_EFFORT_KEY];
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
@@ -102,6 +138,13 @@ function stableJson(value) {
     .map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`)
     .join(',')}}`;
 }
+
+/**
+ * How stale a session's `last_seen_at` may get before an otherwise silent poll
+ * refreshes it. Long enough that a 2-second watcher writes 1/15th as often,
+ * short enough that "seen 12s ago" is still true when a human reads it.
+ */
+const SEEN_HEARTBEAT_MS = 30_000;
 
 export function createAgentService(ctx) {
   const { db, channels, messages, home } = ctx;
@@ -281,6 +324,30 @@ export function createAgentService(ctx) {
     return enriched;
   }
 
+  /**
+   * A message on its way to another agent, minus the reasoning trace.
+   *
+   * `hydrateEvent` hands back metadata verbatim, which is right for the
+   * browser — `_think` is exactly what the thinking box on a finished message
+   * renders from. It is not right for `pull`/`resume`: an agent catching up on
+   * a channel would be reading up to 16KB of a neighbour's step-by-step
+   * reasoning per reply, in its own context window, for a question it was not
+   * asked and cannot act on. `_model` and `_effort` stay — they are a few
+   * words each and they say who answered, which is context an agent can use.
+   */
+  function withoutThink(message) {
+    const metadata = message?.metadata;
+    if (!metadata || !Object.prototype.hasOwnProperty.call(metadata, THINK_KEY)) return message;
+    const { [THINK_KEY]: _trace, ...rest } = metadata;
+    return { ...message, metadata: rest };
+  }
+
+  /** `hydrateEvent` for the agent-facing reads, which is the same thing less that key. */
+  function hydrateForAgent(event) {
+    const enriched = hydrateEvent(event);
+    return enriched.message ? { ...enriched, message: withoutThink(enriched.message) } : enriched;
+  }
+
   function readOpts(session, opts = {}) {
     const includeOwn = opts.includeOwn ?? false;
     let channelId = null;
@@ -327,7 +394,7 @@ export function createAgentService(ctx) {
       const after = opts.peek ? session.cursorSeq : nextCursor;
       return {
         session: { ...get(session.key), cursorSeq: opts.peek ? session.cursorSeq : nextCursor },
-        events: page.map(hydrateEvent),
+        events: page.map(hydrateForAgent),
         previousCursor: session.cursorSeq,
         cursor: after,
         hasMore,
@@ -372,17 +439,28 @@ export function createAgentService(ctx) {
       let context = [];
       const channel = channelRef ? channels.find(channelRef) : null;
       if (channel && contextLimit > 0) {
-        context = messages.list(channel.id, { limit: contextLimit, includeReplies: true }).messages;
+        context = messages.list(channel.id, { limit: contextLimit, includeReplies: true }).messages.map(withoutThink);
       }
-
-      db.prepare(
-        'UPDATE agent_sessions SET resume_count = resume_count + 1, updated_at = ?, last_seen_at = ? WHERE key = ?'
-      ).run(Date.now(), Date.now(), session.key);
 
       // `serve` resumes every couple of seconds, and the docs promise resuming
       // is free. Writing a row for a poll that found nothing made an idle
       // watcher the busiest writer in the workspace — 200k rows of "nothing
       // happened". Nothing reads these, so only record an actual catch-up.
+      const now = Date.now();
+      if (missed.length > 0) {
+        db.prepare(
+          'UPDATE agent_sessions SET resume_count = resume_count + 1, updated_at = ?, last_seen_at = ? WHERE key = ?'
+        ).run(now, now, session.key);
+      } else if (now - Number(session.lastSeenAt ?? 0) >= SEEN_HEARTBEAT_MS) {
+        // The same promise, for the row itself. A poll that found nothing is
+        // not news either, and counting it made `resumed 41000×` mean "up for
+        // a day" rather than "caught up forty-one thousand times". What an
+        // idle watcher still owes the workspace is a sign of life — and that
+        // is a heartbeat, not a write per pass. (Whether it is *watching* is
+        // its lock file's answer; this only backs the "last seen" beside it.)
+        db.prepare('UPDATE agent_sessions SET last_seen_at = ? WHERE key = ?').run(now, session.key);
+      }
+
       if (missed.length > 0) {
         recordEvent(db, {
           type: EVENT_TYPES.sessionResumed,
@@ -399,7 +477,7 @@ export function createAgentService(ctx) {
         cursor: session.cursorSeq,
         channel,
         context,
-        missed: missed.slice(0, limit).map(hydrateEvent),
+        missed: missed.slice(0, limit).map(hydrateForAgent),
         hasMore,
         pending: countEvents(db, { since: session.cursorSeq, ...filters }),
       };
@@ -476,6 +554,35 @@ export function createAgentService(ctx) {
       });
     }
     return setState(ref, { [SERVE_MODEL_KEY]: wanted || null }, { ...opts, merge: true });
+  }
+
+  /**
+   * Choose how hard the agent thinks — the same deal as `setModel`, re-read by
+   * a running watcher on every pass.
+   *
+   * The level is not checked against a list on purpose: `claude` accepts five
+   * names and Hermes eight, and a workspace can point an adapter at something
+   * with a vocabulary of its own. A level the binary does not know is the
+   * binary's complaint to make, in words that fit the binary.
+   *
+   * @param {string} ref
+   * @param {string|null} effort  a level, or null/'' to go back to the default
+   * @param {{agentId?: string}} [opts]
+   */
+  function setEffort(ref, effort, opts = {}) {
+    if (effort !== null && effort !== undefined && typeof effort !== 'string') {
+      throw new ValidationError('An effort level is a string, or null for the default.', {
+        details: { received: typeof effort },
+      });
+    }
+    const wanted = (effort ?? '').trim();
+    // One argv entry and one badge on a message: a level is a short word.
+    if (!(wanted === '' || /^[a-z0-9][a-z0-9._-]{0,31}$/i.test(wanted))) {
+      throw new ValidationError(`"${wanted.slice(0, 40)}…" is not an effort level.`, {
+        hint: 'Use the level the agent expects, e.g. low, medium, high, xhigh, max.',
+      });
+    }
+    return setState(ref, { [SERVE_EFFORT_KEY]: wanted || null }, { ...opts, merge: true });
   }
 
   /**
@@ -567,6 +674,72 @@ export function createAgentService(ctx) {
   }
 
   /**
+   * Who is typing, right now.
+   *
+   * `agent.typing` is a *change*, and a tab that opens in the middle of a
+   * reply never saw the change — so it shows nothing while an agent works,
+   * which looks exactly like an agent that is not working. This is the
+   * snapshot a fresh tab, or one coming back from a dropped stream, starts
+   * from; the events carry it from there.
+   *
+   * Two things keep a stale row out of it. The window covers an "on" so old
+   * that no reply could still be running, and the lock covers the rest: a
+   * watcher killed outright never wrote its "off", but it does not hold its
+   * lock any more either, and that is already how the whole workspace decides
+   * whether an agent is home.
+   *
+   * A row with no session key came from outside the workspace — see
+   * `externalTyping` — and there is no lock to ask about, so for those the
+   * window is the whole answer.
+   *
+   * @param {{withinMs?: number}} [opts]
+   * @returns {Array<{threadId: string, channelId: string|null, agentId: string, sessionKey: string|null, at: number}>}
+   */
+  function typingNow(opts = {}) {
+    const withinMs = Math.max(Number(opts.withinMs) || TYPING_WINDOW_MS, 1000);
+    // SQLite hands back the row MAX(seq) came from, so each group is the last
+    // thing one agent said about one thread. Grouping by the actor as well as
+    // the session matters for external rows: their session key is NULL, which
+    // SQLite would otherwise collapse into one group per thread — two
+    // gateways answering in the same thread would hide each other.
+    const latest = rows(
+      db
+        .prepare(
+          `SELECT MAX(seq) AS seq, session_key, thread_id, channel_id, actor_id, payload, created_at
+             FROM events
+            WHERE type = ? AND created_at >= ? AND thread_id IS NOT NULL
+            GROUP BY session_key, actor_id, thread_id`
+        )
+        .all(EVENT_TYPES.agentTyping, Date.now() - withinMs)
+    );
+
+    const watching = new Map();
+    const out = [];
+    for (const record of latest) {
+      let on = false;
+      try {
+        on = Boolean(JSON.parse(record.payload ?? '{}').on);
+      } catch {
+        on = false; // an unreadable payload is not a reason to claim someone is typing
+      }
+      if (!on) continue;
+      const key = record.session_key;
+      if (key) {
+        if (!watching.has(key)) watching.set(key, Boolean(readServeLock(key, home)));
+        if (!watching.get(key)) continue;
+      }
+      out.push({
+        threadId: record.thread_id,
+        channelId: record.channel_id,
+        agentId: record.actor_id,
+        sessionKey: key ?? null,
+        at: Number(record.created_at),
+      });
+    }
+    return out;
+  }
+
+  /**
    * An ephemeral "working on it" signal for the UI — not part of the durable
    * conversation, so it never shows up in `pull`/`resume`. The daemon's live
    * stream carries it straight through like any other event.
@@ -582,6 +755,229 @@ export function createAgentService(ctx) {
       threadId: input.threadId ?? null,
       sessionKey: session.key,
       payload: { on: Boolean(input.on) },
+    });
+    return { ok: true };
+  }
+
+  /**
+   * The same signal, from something that is not a session here.
+   *
+   * A gateway answering in Slick over this API has no history key and holds
+   * no `serve` lock — it is another program's process, and Slick has no way
+   * to ask whether it is still alive. So its rows carry no session key, and
+   * the snapshot trusts them for the length of the window and no longer.
+   * That is the honest trade for not being able to check.
+   *
+   * The thread is resolved rather than believed: the caller hands over a
+   * message id and gets its thread, so pointing at a reply lights up the
+   * root it belongs to, and the channel comes from the message instead of
+   * from whoever asked.
+   *
+   * @param {{agentId: string, threadId: string, on?: boolean}} input
+   */
+  function externalTyping(input = {}) {
+    const agentId = String(input.agentId ?? '').trim().toLowerCase();
+    if (!NAME_RE.test(agentId)) {
+      throw new ValidationError(`"${input.agentId ?? ''}" is not a valid agent id.`, {
+        hint: 'Use letters, digits, "-", "_" or "." — the name the agent posts under.',
+      });
+    }
+    const threadId = String(input.threadId ?? '').trim();
+    const target = threadId ? messages.find(threadId) : null;
+    if (!target) {
+      throw new NotFoundError(`No message with id "${threadId}".`, {
+        hint: 'Typing hangs on a thread, so it needs the id of a message in one.',
+        details: { threadId },
+      });
+    }
+    recordEvent(db, {
+      type: EVENT_TYPES.agentTyping,
+      actor: { id: agentId, kind: 'agent' },
+      channelId: target.channelId,
+      threadId: target.threadId ?? target.id,
+      // No session, so no lock to expire it: see `typingNow`.
+      sessionKey: null,
+      payload: { on: Boolean(input.on) },
+    });
+    return { ok: true };
+  }
+
+  /**
+   * What an agent is thinking about, right now.
+   *
+   * The same snapshot problem `typingNow` solves, for a richer payload: the
+   * blob is a *change* too, and a tab that opens mid-answer never saw it. So
+   * this is the same query, the same window and the same lock check — a
+   * session-backed row is only believed while its watcher still holds its
+   * `serve` lock, and a session-less gateway row is believed for the length
+   * of the window and no longer, because there is nothing to ask.
+   *
+   * One rule is new. A row whose blob has already reached `done` or `error`
+   * is left out: that trace belongs to the finished message, where it was
+   * written down, and repeating it here would put a second copy of the same
+   * reasoning under a reply that is already on screen.
+   *
+   * @param {{withinMs?: number}} [opts]
+   * @returns {Array<{threadId: string, channelId: string|null, agentId: string, sessionKey: string|null, at: number, think: object}>}
+   */
+  function thinkingNow(opts = {}) {
+    const withinMs = Math.max(Number(opts.withinMs) || TYPING_WINDOW_MS, 1000);
+    const latest = rows(
+      db
+        .prepare(
+          `SELECT MAX(seq) AS seq, session_key, thread_id, channel_id, actor_id, payload, created_at
+             FROM events
+            WHERE type = ? AND created_at >= ? AND thread_id IS NOT NULL
+            GROUP BY session_key, actor_id, thread_id`
+        )
+        .all(EVENT_TYPES.agentThinking, Date.now() - withinMs)
+    );
+
+    const watching = new Map();
+    const out = [];
+    for (const record of latest) {
+      let think = null;
+      try {
+        think = normalizeThinking(JSON.parse(record.payload ?? '{}').think);
+      } catch {
+        think = null; // an unreadable payload is nothing to show, not an error
+      }
+      if (!think) continue;
+      if (think.p === 'done' || think.p === 'error') continue;
+      const key = record.session_key;
+      if (key) {
+        if (!watching.has(key)) watching.set(key, Boolean(readServeLock(key, home)));
+        if (!watching.get(key)) continue;
+      }
+      out.push({
+        threadId: record.thread_id,
+        channelId: record.channel_id,
+        agentId: record.actor_id,
+        sessionKey: key ?? null,
+        at: Number(record.created_at),
+        think,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Has this agent already said exactly this about this thread?
+   *
+   * The durable tier of the thinking signal exists for one job: `thinkingNow`,
+   * the catch-up snapshot a tab takes when it opens mid-answer. What that job
+   * needs is the *latest* state per thread, never the history of how it got
+   * there — and the producers coalesce on a 120ms timer while a step changes
+   * every few seconds, so most flushes repeat the previous one word for word.
+   * Each of those repeats carries the whole accumulated blob, into a log that
+   * is append-only by design and never pruned, so writing them is a megabyte
+   * of permanent record per answered message. Recording only what actually
+   * changed brings the row count back to the order of `agent.typing`, which is
+   * what this tier was sized for.
+   *
+   * The comparison is on the serialized payload because that is the byte
+   * string the previous row already holds, and both sides are built the same
+   * way by `recordEvent`. `ix_events_type` walks seq backwards within
+   * `agent.thinking`, and the row being looked for is nearly always the most
+   * recent one there, so this stops on its first or second step.
+   *
+   * @param {{actorId: string, sessionKey: string|null, threadId: string|null, payload: string}} what
+   */
+  function thinkingRepeats({ actorId, sessionKey, threadId, payload }) {
+    const last = row(
+      db
+        .prepare(
+          `SELECT payload FROM events
+            WHERE type = ? AND actor_id = ? AND session_key IS ? AND thread_id IS ?
+            ORDER BY seq DESC LIMIT 1`
+        )
+        .get(EVENT_TYPES.agentThinking, actorId, sessionKey, threadId)
+    );
+    return last?.payload === payload;
+  }
+
+  /**
+   * The reasoning trace behind the "working on it", while it is still being
+   * worked on. Ephemeral in exactly the way `typing` is — it never joins
+   * `CONVERSATION_EVENTS`, so no other agent ever pulls it — and the daemon's
+   * live stream carries it straight through.
+   *
+   * The blob is normalized here rather than trusted, because this is the one
+   * place a scratchpad becomes a row in the event log.
+   *
+   * @param {string} ref
+   * @param {{think?: unknown, threadId?: string|null, channelId?: string|null}} [input]
+   */
+  function thinking(ref, input = {}) {
+    const session = get(ref, input);
+    const threadId = input.threadId ?? null;
+    const payload = { think: normalizeThinking(input.think) };
+    // See `thinkingRepeats`: a flush that says what the last one said is not
+    // news, and this tier only ever answers "what is it doing *now*".
+    const repeat = thinkingRepeats({
+      actorId: session.agentId,
+      sessionKey: session.key,
+      threadId,
+      payload: JSON.stringify(payload),
+    });
+    if (repeat) return { ok: true };
+    recordEvent(db, {
+      type: EVENT_TYPES.agentThinking,
+      actor: { id: session.agentId, kind: 'agent' },
+      channelId: input.channelId ?? session.channelId,
+      threadId,
+      sessionKey: session.key,
+      payload,
+    });
+    return { ok: true };
+  }
+
+  /**
+   * The same signal from a gateway, which has no session here.
+   *
+   * Everything `externalTyping` says applies unchanged: no history key, no
+   * `serve` lock, nothing Slick can ask about liveness — so the row carries no
+   * session key and the snapshot trusts it for the window only. The thread is
+   * resolved through the message rather than believed, so a reply id lights up
+   * the root it belongs to and the channel comes from the message.
+   *
+   * @param {{agentId: string, threadId: string, think?: unknown}} input
+   */
+  function externalThinking(input = {}) {
+    const agentId = String(input.agentId ?? '').trim().toLowerCase();
+    if (!NAME_RE.test(agentId)) {
+      throw new ValidationError(`"${input.agentId ?? ''}" is not a valid agent id.`, {
+        hint: 'Use letters, digits, "-", "_" or "." — the name the agent posts under.',
+      });
+    }
+    const threadId = String(input.threadId ?? '').trim();
+    const target = threadId ? messages.find(threadId) : null;
+    if (!target) {
+      throw new NotFoundError(`No message with id "${threadId}".`, {
+        hint: 'Thinking hangs on a thread, so it needs the id of a message in one.',
+        details: { threadId },
+      });
+    }
+    const rootId = target.threadId ?? target.id;
+    const payload = { think: normalizeThinking(input.think) };
+    // The same dedupe as `thinking`, and a gateway needs it more: it has no
+    // session, so its rows are keyed on the agent name alone and a chatty
+    // producer is otherwise the busiest writer in the workspace.
+    const repeat = thinkingRepeats({
+      actorId: agentId,
+      sessionKey: null,
+      threadId: rootId,
+      payload: JSON.stringify(payload),
+    });
+    if (repeat) return { ok: true };
+    recordEvent(db, {
+      type: EVENT_TYPES.agentThinking,
+      actor: { id: agentId, kind: 'agent' },
+      channelId: target.channelId,
+      threadId: rootId,
+      // No session, so no lock to expire it: see `thinkingNow`.
+      sessionKey: null,
+      payload,
     });
     return { ok: true };
   }
@@ -616,11 +1012,17 @@ export function createAgentService(ctx) {
     ack,
     setState,
     setModel,
+    setEffort,
     setModelChoices,
     update,
     post,
     reply,
     typing,
+    externalTyping,
+    typingNow,
+    thinking,
+    externalThinking,
+    thinkingNow,
     end,
     remove,
     pendingCount,

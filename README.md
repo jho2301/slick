@@ -132,7 +132,64 @@ text box, and is not asked again for six hours.
 Threads keep their conversations across the switch, and the setting is our
 bookkeeping, not the agent's memory — it never shows up in a prompt.
 
-**Only agents that answer are offered.** A session that nothing watches — the
+**How hard it thinks** works the same way, and lands in the same place:
+
+```bash
+slick agent effort $KEY high      # from the next message answered
+slick agent effort $KEY           # what is it set to?
+slick agent effort $KEY --clear   # back to the agent's own default
+```
+
+There is no `--list` beside it, because the levels are the agent's own
+vocabulary — `claude` takes five of them, Hermes eight — and a menu built here
+would be a guess that goes stale. The level reaches the binary through the
+adapter's `effort` argument group, so an agent that has no such flag simply
+never gets asked. A reply then wears two badges side by side, the model and
+the level it was thought at: `claude-opus-4` `xhigh`. Two rather than one
+string, because they change independently and a thread is easier to scan for
+the answers that were thought hard about when the level is its own column.
+Grouping counts both: two consecutive replies that differ in either one keep
+their own headers, since a grouped row shows no badge at all.
+
+Which level a message says it was answered at follows the same rule as the
+model, in reverse. `--effort` is a per-run override the agent applies to *that*
+call, while a level recorded in the agent's own store can predate it — Hermes
+writes a session's config once, when the session is created, and resuming
+leaves it alone. So where Slick asked at all, what it asked for is what the
+badge says; where it did not, the agent's own record fills in.
+
+**You can see it thinking.** While a watcher has an agent working on a message,
+the thread shows a typing indicator, and it disappears when the reply lands.
+That signal is a *change* on the event stream, so a tab opened in the middle of
+a long reply would have missed it — the app asks `GET /api/typing` on the way
+up, and again whenever a dropped stream comes back, for who is working right
+now. Two things keep a dead watcher from spinning forever: the answer only
+counts as current for five minutes, and it only counts at all while that
+session's `serve` lock is held by a live process. A watcher stopped with ctrl-c
+writes its own "off" on the way out.
+
+**And you can see what it is thinking about.** An agent that narrates — an
+adapter with a `stream` block below, or the Hermes plugin further down — gets
+a box above its answer while the answer is being written: one line saying what
+it is working on right now, and under it the steps it has taken, each with a
+mark saying whether it is running, finished or failed. The box stays on the
+reply afterwards, so a thread read next week still shows the work rather than
+only the conclusion.
+
+It opens and closes on five rules, in that order, and they exist because the
+box is a *detail* on somebody else's answer and the answer is the thing you
+came for. It is **born collapsed** — a summary line and a chevron, nothing
+else. **Your choice sticks while it streams**: open it and it stays open for
+the whole run, however many steps arrive, because a box that reshuffled itself
+under a reader mid-sentence would be unreadable. **Finishing collapses it**,
+handing the space back to the answer that has just landed. **An error opens
+it**, whatever you last chose, since the step that broke is the one thing in
+there worth showing unasked — and that holds on a reload or a switch away and
+back, not only at the moment it fails. **After that your choice is permanent**:
+once the run is over, nothing moves the box again but you.
+
+**Only agents that answer are offered.**
+ A session that nothing watches — the
 cron job that posts a morning digest owns a history key and a cursor exactly
 like an agent does — is not something you can talk to, so the app keeps it out
 of the sidebar and out of the `@mention` picker. What counts is the lock a
@@ -141,11 +198,238 @@ listed while its watcher restarts. `slick agent sessions` still shows every
 session and a `serve` column saying which is which: `watching`, `idle` (served
 before, nothing up right now), or `posts only`.
 
-`--dry-run` shows you the prompt without calling or posting anything; `--cmd`
-points it at a different binary for other agents. It does not hand the child
-process the ability to touch Slick itself — that stays between you and whatever
-tool permissions you give it with `--permission-mode` / `--allowed-tools` /
-`--dangerously-skip-permissions`.
+`--dry-run` shows you the prompt without calling or posting anything. Serving
+does not hand the child process the ability to touch Slick itself — that stays
+between you and whatever tool permissions you give it with `--permission-mode`
+/ `--allowed-tools` / `--dangerously-skip-permissions`.
+
+**Something other than `claude`.** `--cmd` names the binary; an **adapter**
+says how to call it. The built-in default is the `claude` CLI's convention —
+prompt in `-p`, conversation in `--resume`, answer in `{"result": …}` — and
+anything that did not speak it needed a shim pretending to be `claude`. Write
+the convention down instead, as `~/.slick/adapters/<name>.json`:
+
+```json
+{
+  "label": "My runner",
+  "cmd": "my-agent",
+  "args": {
+    "prompt": ["--ask", "{prompt}"],
+    "resume": ["--thread", "{session}"],
+    "model": ["--model", "{model}"]
+  },
+  "reply": { "format": "json", "text": "answer", "sessionId": "thread_id" },
+  "maxMessageLength": 4000,
+  "installHint": "brew install my-agent"
+}
+```
+
+```bash
+slick agent adapters                        # what this workspace can call
+slick agent serve $KEY --adapter my-runner  # and how to call it
+```
+
+Every group is optional, and leaving one out is how you say the agent has no
+such thing: no `model` group and Slick stops asking for a model, no `resume`
+group and every message starts a fresh conversation with the thread as its
+context. `"promptVia": "stdin"` hands the prompt over on stdin rather than in
+an argument — which is what the other built-in, `plain`, does: prompt in, text
+out, no JSON, so a shell script is a legitimate agent. A file named after a
+built-in replaces it, so retuning `claude` for this workspace means writing
+`claude.json` and nothing else.
+
+**When one flag is not one value.** Two escapes, both optional, both a regex.
+An argument group can `match` its value and spread the captures across several
+flags; a reply field can be found by `pattern` in output that is not JSON.
+Together that is enough for an agent whose answer is plain text on stdout and
+whose session id arrives on stderr — which is `hermes chat -q`, and the whole
+of `~/.slick/adapters/hermes.json`:
+
+```json
+{
+  "label": "Hermes",
+  "cmd": "/Users/you/.local/bin/hermes",
+  "args": {
+    "prompt": ["chat", "-q", "{prompt}"],
+    "base": ["-Q", "--in", "/Users/you/code/slick", "--source", "slick", "--accept-hooks"],
+    "resume": ["--resume", "{session}"],
+    "model": {
+      "match": "^(.+?)::(.+)$",
+      "args": ["-m", "{2}", "--provider", "{1}"],
+      "else": ["-m", "{value}"]
+    }
+  },
+  "reply": {
+    "format": "text",
+    "sessionId": { "pattern": "session_id:\\s*(\\S+)", "from": "stderr" },
+    "model": {
+      "sqlite": "~/.hermes/state.db",
+      "query": "SELECT model FROM sessions WHERE id = ?",
+      "bind": "sessionId"
+    }
+  }
+}
+```
+
+`{1}`, `{2}` are the captures, and a value that matches nothing leaves the
+group out unless there is an `else`. A pattern field says which stream to read
+(`from`: `stdout`, `stderr`, or both) and which capture it wants; give one to
+`text` as well when the answer needs trimming before it is posted.
+
+**What actually ran, and what it actually said.** `--model` and `--effort` are
+requests: the agent resolves an alias, falls back to another provider, or was
+switched by hand since. And a console is a display — an agent whose model
+streams its reasoning prints that reasoning next to the answer, having already
+written the clean final response to its own store. An agent that writes things
+down can be asked: one read-only `SELECT`, bound to the session id just read
+out of its output.
+
+```json
+"model": {
+  "sqlite": "~/.hermes/state.db",
+  "query": "SELECT model FROM sessions WHERE id = ?",
+  "bind": "sessionId",
+  "pattern": "([^/\\\\]+?)(?:\\.(?:gguf|safetensors))?$"
+}
+```
+
+`text`, `model` and `effort` can be sourced this way; `sessionId` cannot, being
+the key the others bind to. A `pattern` alongside trims what comes back, which
+is how a local model stored as `C:\weights\Qwen3.8-27B.gguf` gets a badge that
+says `Qwen3.8-27B`. A missing store, a missing row or a renamed table costs you
+the badge and nothing else.
+
+An answer read this way is the answer: the printed output is not used as a
+fallback, because for the agents that need this at all it is precisely the
+thing that cannot be trusted. A run that finishes without recording anything
+is reported as a failed call rather than posted, and a resumed conversation is
+checked against what the store said *before* the call — otherwise a run that
+wrote nothing would answer the new message with the old reply.
+
+What none of this will ever be is a program: one match, one row, no branching.
+An agent that needs more than that needs a wrapper, and should have one.
+
+**Watching it work, not just waiting for it.** An agent that prints as it goes
+can have that printing shown, live, in the thread it is answering — the answer
+filling in a word at a time, and above it a box saying which step the agent is
+on. Slick reads none of that by guessing: a `stream` block says which fields of
+the agent's own output carry it, in the same plucked-path style the `reply`
+block uses.
+
+```json
+"stream": {
+  "format": "jsonl",
+  "args": ["--stream-json"],
+  "text": "delta.text",
+  "reasoning": "delta.thinking",
+  "step": "tool.name",
+  "stepStatus": "tool.status"
+}
+```
+
+`format` is `jsonl` and nothing else so far — one JSON object per line on
+stdout, which is what every streaming CLI already prints. `args` are the flags
+that ask for the streaming in the first place, and they ride along whenever
+there is a `stream` block to read the answer back with, rather than being a
+second thing to remember to turn on. `text` is a piece of the answer,
+`reasoning` is a piece of the model's own thinking, and `step` names a thing
+the agent is doing — a tool, a search, a file — with `stepStatus` saying how
+it went: `pending`, `in_progress`, `complete` or `error`. A step named twice is
+that one step reporting back rather than a second row, so a word Slick does not
+know reads as *started* the first time the step is seen and as *finished* the
+time it comes back. Every path is optional, but a `stream` block that names no
+`text`, no `reasoning` and no `step` is refused, because there would be nothing
+to send on. So is an `args.stream` group with no `stream` block above it: the
+flags would go out and nothing would read what came back.
+
+A line that is not JSON is display noise — a banner, a progress bar, a
+deprecation warning — and is skipped without comment; so is a frame whose
+shape does not match the paths, which is how a heartbeat or a usage summary
+gets ignored rather than flickering on screen as an empty delta. The answer
+that is finally posted is still read out of the `reply` block, off the whole
+of stdout, exactly as it is for an adapter that streams nothing: the streamed
+text is a *preview* and never the message. What does outlive the call is the
+step list, which is written down on the reply it belonged to, so a thread read
+next week still says what the agent did to get there. An adapter with no
+`stream` block is called, read and posted precisely as it was before there was
+one.
+
+**The agent's own slash commands.** Type `/` in the composer and you get the
+*agent's* vocabulary, not Slick's — `/compress`, `/status`, `/reasoning`,
+whatever that agent has. Slick keeps no list and invents no commands; it asks
+the adapter:
+
+```json
+"commands": {
+  "list": { "cmd": "…/python", "args": ["…/hermes-commands.py", "--list"] },
+  "run":  { "cmd": "…/python", "args": ["…/hermes-commands.py", "{command}", "{args}"] }
+}
+```
+
+`list` prints a JSON array of `{name, summary, args, aliases, where}` and fills
+the menu; `run` is handed the name and the rest of the line and prints what the
+command has to say. `where` is the agent's own verdict on each one — anything
+other than `"run"` is still listed, greyed, with the reason, because a command
+you cannot use here is a thing worth knowing about rather than a thing to hide.
+
+**The answer is yours alone.** It comes back in the response to that one
+request and is drawn above your composer until you dismiss it or type the next
+thing. It is not a message, not an event, not a row in the log — nobody else
+sees it and nothing keeps it, because a command's output is an answer to one
+person's question. That is also why this runs in the daemon rather than the
+watcher: none of it belongs in the conversation.
+
+**A long answer arrives whole.** A message holds 40,000 characters, and an
+answer past that used to be refused on the way in — which `serve` read as a
+failed call, retried three times, and then dropped without a word. Now it is
+posted as several messages, split between lines, and a code fence the split
+lands inside is closed before the break and reopened after it so that neither
+half renders as half a fence. An adapter can set `maxMessageLength` lower when
+whatever is on the other end takes less than Slick does.
+
+---
+
+## Hermes, instead of a CLI per thread
+
+`agent serve` spawns a process per thread. If you already run
+[Hermes](https://github.com/NousResearch/hermes-agent) — one long-lived gateway that
+sits in Slack, Telegram and the rest — `plugins/hermes/slick` is a platform
+plugin that puts it in a Slick channel the same way. It tails `/api/stream` and
+answers over the REST API, so there is no SDK and nothing to install beyond the
+directory itself.
+
+```bash
+cp -R plugins/hermes/slick ~/.hermes/plugins/slick
+hermes plugins enable slick-platform     # the name in plugin.yaml, not the directory
+slick daemon start                       # the plugin needs something to talk to
+```
+
+Then give it a token and a channel. Either the environment:
+
+```bash
+export SLICK_TOKEN=...                   # the "token" field of ~/.slick/daemon.json
+export SLICK_CHANNEL=general             # "*" for every channel, or a comma-separated list
+hermes gateway restart
+```
+
+or `~/.hermes/config.yaml`, if you would rather not export anything:
+
+```yaml
+gateway:
+  platforms:
+    slick:
+      enabled: true
+      extra:
+        url: http://127.0.0.1:4477
+        channel: general
+        token: <the token from ~/.slick/daemon.json>
+```
+
+Environment wins over `extra` when both are set, and `SLICK_HOME_CHANNEL` picks
+where cron jobs (`deliver=slick`) land — it defaults to `SLICK_CHANNEL`.
+Restart the gateway after either one; `hermes gateway status` should then list
+Slick as connected. Hermes posts as an agent-kind author, so it never reads its
+own replies back off the stream.
 
 ---
 
@@ -260,7 +544,7 @@ it over HTTP; the app calls the server. There is exactly one implementation of
 ## Tests
 
 ```bash
-npm test              # 116 tests: core, HTTP API, and the CLI end to end
+npm test              # 201 tests: core, HTTP API, and the CLI end to end
 npm run smoke:ui      # loads the real UI in Electron and drives it
 npm run shots         # screenshots of the UI into $SLICK_HOME/shots
 ```

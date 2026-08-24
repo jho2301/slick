@@ -13,9 +13,14 @@
 
 import {
   ValidationError,
+  adapterDir,
+  listAdapters,
   looksLikeHistoryKey,
+  readServeEffort,
   readServeModel,
   readServeModelChoices,
+  supportsModelList,
+  supportsResume,
 } from '@slick/core';
 import { parseJsonFlag, resolveText } from '../args.js';
 import {
@@ -29,6 +34,7 @@ import {
   renderTranscript,
   style,
   table,
+  warn,
 } from '../output.js';
 import { requireRef } from './channel.js';
 import { serve, SERVE_SPEC } from './agent-serve.js';
@@ -112,9 +118,11 @@ export const agent = {
   state [get|set|clear]         the agent's own JSON memory
   model [key] [name]            read or change the model a running serve calls
                                 (--list for the ones the agent says it can run)
+  effort [key] [level]          read or change how hard it thinks (low…max)
   ack [key] [seq|latest]        move the read cursor by hand
   watch [key]                   stream new messages as they arrive
   serve [key|name]              call the real agent on new @mentions and post its reply
+  adapters                      the calling conventions serve knows
   end [key]                     close a session
   forget [key]                  delete a session record
 
@@ -137,20 +145,24 @@ Writing
 
 Serving
   --all                         respond to every message, not just @mentions
-  --cmd <bin>                   the agent binary to call (default: claude)
+  --adapter <name>              how to call the binary (default: claude;
+                                slick agent adapters lists them)
+  --cmd <bin>                   the agent binary to call (default: the adapter's)
   --interval <ms>                poll interval (default 2000)
   --once                         handle one batch and exit
   --context <n>                  messages of context to give the agent (default 20)
   --shared-session               one child conversation for every thread at once,
                                  instead of one per thread
   --system <text>                extra instruction appended to every prompt
-  --append-system-prompt <text>  passed through to claude
+  --append-system-prompt <text>  passed through, if the adapter takes one
   --dry-run                      print the prompt instead of calling and posting
-  --permission-mode <mode>       passed through to claude
-  --allowed-tools <tools>        passed through to claude as --allowedTools
-  --dangerously-skip-permissions passed through to claude
-  --model <name>                 passed through to claude (the launch default;
+  --permission-mode <mode>       passed through, if the adapter takes one
+  --allowed-tools <tools>        passed through, if the adapter takes one
+  --dangerously-skip-permissions passed through, if the adapter takes one
+  --model <name>                 the model to ask for (the launch default;
                                  slick agent model overrides it, live)
+  --effort <level>               how hard to think, if the adapter can ask
+                                 (slick agent effort overrides it, live)
   --timeout <ms>                 kill the child if it runs this long (default 10m)
   --max-attempts <n>             give up on a message after n failures (default 3)
   --no-lock                      allow a second watcher on the same session key`,
@@ -476,6 +488,81 @@ Serving
         return;
       }
 
+      // --------------------------------------------------------- effort ---
+      // How hard the agent thinks, when it is the kind that can be told. No
+      // `--list`: the levels are the agent's own vocabulary, documented in its
+      // own --help, and Slick would only be guessing at them.
+      case 'effort':
+      case 'reasoning': {
+        const first = rest[0];
+        const named = looksLikeHistoryKey(first) || (first !== undefined && first === flags.name);
+        const ref = sessionRef(ctx, named ? first : undefined);
+        const wanted = (named ? rest.slice(1) : rest).join(' ').trim();
+
+        if (!wanted && !flags.clear) {
+          const session = await ws.agents.get(ref, { agentId: agentId(ctx) });
+          const effort = readServeEffort(session.state);
+          if (ctx.json) return json({ effort, session });
+          if (ctx.quiet) return line(effort ?? '');
+          if (!effort) return note('No override — the agent thinks as hard as its own configuration says.');
+          return line(effort);
+        }
+
+        const session = await ws.agents.setEffort(ref, flags.clear ? null : wanted, {
+          agentId: agentId(ctx),
+        });
+        const effort = readServeEffort(session.state);
+        if (ctx.json) return json({ effort, session });
+        if (effort) ok(`Effort set to ${style.bold(effort)} — from the next message answered.`);
+        else ok('Effort override cleared.');
+        return;
+      }
+
+      // --------------------------------------------------------- adapters ---
+      // What `serve --adapter` can be pointed at. A broken manifest is listed
+      // with its complaint rather than thrown: one bad file should cost you
+      // that adapter, not the ability to see the others.
+      case 'adapters':
+      case 'adapter': {
+        const described = listAdapters(ws.home).map((entry) => ({
+          name: entry.name,
+          label: entry.label,
+          source: entry.source,
+          error: entry.error,
+          cmd: entry.adapter?.cmd ?? null,
+          promptVia: entry.adapter?.promptVia ?? null,
+          resume: Boolean(entry.adapter && supportsResume(entry.adapter)),
+          listsModels: Boolean(entry.adapter && supportsModelList(entry.adapter)),
+          maxMessageLength: entry.adapter?.maxMessageLength ?? null,
+        }));
+        if (ctx.json) return json({ adapters: described, dir: adapterDir(ws.home) });
+        table(
+          described.map((a) => ({
+            name: a.error ? style.yellow(a.name) : style.green(a.name),
+            label: a.label,
+            cmd: a.cmd ?? style.dim('--cmd'),
+            prompt: a.promptVia ?? style.dim('—'),
+            resume: a.resume ? 'yes' : style.dim('no'),
+            models: a.listsModels ? 'asks' : style.dim('—'),
+            limit: a.maxMessageLength ? String(a.maxMessageLength) : style.dim('—'),
+            // The directory is on the footer line; the file name is the news.
+            source: a.source === 'built-in' ? style.dim('built-in') : a.source.split('/').at(-1),
+          })),
+          [
+            { key: 'name', label: 'adapter' },
+            { key: 'label', label: 'label' },
+            { key: 'cmd', label: 'command' },
+            { key: 'prompt', label: 'prompt' },
+            { key: 'resume', label: 'resume' },
+            { key: 'models', label: 'models' },
+            { key: 'limit', label: 'msg limit', align: 'right' },
+            { key: 'source', label: 'from' },
+          ]
+        );
+        for (const broken of described.filter((a) => a.error)) warn(`${broken.name}: ${broken.error}`);
+        return note(`Add one by writing a JSON file in ${adapterDir(ws.home)}.`);
+      }
+
       // ------------------------------------------------------- end/forget ---
       case 'end':
       case 'close': {
@@ -494,7 +581,7 @@ Serving
 
       default:
         throw new ValidationError(`Unknown agent command "${sub}".`, {
-          hint: 'Try: start, sessions, resume, pull, post, reply, state, model, ack, watch, serve, end',
+          hint: 'Try: start, sessions, resume, pull, post, reply, state, model, effort, ack, watch, serve, adapters, end',
         });
     }
   },

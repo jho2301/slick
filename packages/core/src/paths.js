@@ -28,5 +28,7 @@ export function paths(home) {
     // workspace; see `slickd --no-auth`.
     noAuthFile: join(root, 'no-auth'),
     uploads: join(root, 'files'),
+    // One JSON file per agent adapter; see `adapters.js`.
+    adapters: join(root, 'adapters'),
   };
 }

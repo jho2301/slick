@@ -1,12 +1,15 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { EventEmitter } from 'node:events';
+
 import { Workspace, serveLockPath } from '@slick/core';
 import { createServer } from '../src/index.js';
+import { createHub } from '../src/hub.js';
 import { createPushService } from '../src/push.js';
 import { buildStamp, resolveWebRoot } from '../src/static.js';
 
@@ -337,6 +340,214 @@ describe('agent sessions over HTTP', () => {
     const resumed = await call('POST', `/api/agents/sessions/${key}/resume`, {});
     assert.ok(resumed.body.missed.every((e) => e.type !== 'agent.typing'));
   });
+
+  test('and the app can ask who is typing right now, rather than wait for a change it missed', async () => {
+    const key = (await call('POST', '/api/agents/sessions', { agentId: 'snap', channel: 'general' })).body.session.key;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: '@snap are you working?' })).body
+      .message.id;
+
+    await call('POST', `/api/agents/sessions/${key}/typing`, { on: true, threadId: rootId });
+    const quiet = await call('GET', '/api/typing');
+    assert.equal(quiet.status, 200);
+    assert.deepEqual(quiet.body.typing, [], 'nobody is watching that session, so nobody is typing in it');
+
+    const lock = join(home, `serve-${key}.lock`);
+    writeFileSync(lock, String(process.pid));
+    try {
+      const live = (await call('GET', '/api/typing')).body.typing;
+      assert.equal(live.length, 1);
+      assert.equal(live[0].threadId, rootId);
+      assert.equal(live[0].agentId, 'snap');
+
+      await call('POST', `/api/agents/sessions/${key}/typing`, { on: false, threadId: rootId });
+      assert.deepEqual((await call('GET', '/api/typing')).body.typing, []);
+    } finally {
+      rmSync(lock, { force: true });
+    }
+  });
+
+  test('a gateway with no session here can still say it is typing', async () => {
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'hermes, a question' }))
+      .body.message.id;
+
+    const on = await call('POST', '/api/typing', { agentId: 'hermes', threadId: rootId, on: true });
+    assert.equal(on.status, 200);
+    assert.deepEqual(on.body, { ok: true });
+
+    // No history key was minted and no lock exists anywhere, yet it shows.
+    const live = (await call('GET', '/api/typing')).body.typing;
+    assert.equal(live.length, 1);
+    assert.equal(live[0].threadId, rootId);
+    assert.equal(live[0].agentId, 'hermes');
+    assert.equal(live[0].sessionKey, null);
+    assert.ok(
+      (await call('GET', '/api/agents/sessions')).body.sessions.every((s) => s.agentId !== 'hermes'),
+      'and nothing invented a session to hang it on'
+    );
+
+    await call('POST', '/api/typing', { agentId: 'hermes', threadId: rootId, on: false });
+    assert.deepEqual((await call('GET', '/api/typing')).body.typing, []);
+  });
+
+  test('and a reply id means the thread it is in', async () => {
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'the root' })).body.message.id;
+    const replyId = (await call('POST', `/api/messages/${rootId}/replies`, { text: 'a reply' })).body.message.id;
+
+    await call('POST', '/api/typing', { agentId: 'hermes', threadId: replyId, on: true });
+    const live = (await call('GET', '/api/typing')).body.typing;
+    assert.equal(live.length, 1);
+    assert.equal(live[0].threadId, rootId);
+
+    await call('POST', '/api/typing', { agentId: 'hermes', threadId: rootId, on: false });
+  });
+
+  test('typing it cannot place is refused where the caller can see it', async () => {
+    const missing = await call('POST', '/api/typing', { agentId: 'hermes', threadId: 'msg_nope', on: true });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.error.code, 'not_found');
+
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'anything' })).body.message.id;
+    const named = await call('POST', '/api/typing', { agentId: 'not a name', threadId: rootId, on: true });
+    assert.equal(named.status, 422);
+    assert.equal(named.body.error.code, 'invalid_request');
+    assert.deepEqual((await call('GET', '/api/typing')).body.typing, []);
+  });
+
+  test('thinking is the same signal with a shape to it, and just as un-resumable', async () => {
+    const key = (await call('POST', '/api/agents/sessions', { agentId: 'thinker', channel: 'general' })).body.session
+      .key;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: '@thinker take your time' })).body
+      .message.id;
+
+    const posted = await call('POST', `/api/agents/sessions/${key}/thinking`, {
+      threadId: rootId,
+      think: { t: 'Working…', p: 'streaming', s: [{ id: 't1', t: 'Reading the thread…', st: 'in_progress' }] },
+    });
+    assert.equal(posted.status, 200);
+
+    const events = await call('GET', '/api/events?since=0');
+    const thinking = events.body.events.filter((e) => e.type === 'agent.thinking');
+    assert.equal(thinking.length, 1);
+    assert.equal(thinking[0].threadId, rootId);
+    assert.equal(thinking[0].payload.think.s[0].id, 't1');
+
+    // The scratchpad is one agent's working-out, and it stays out of the
+    // conversation every other agent replays.
+    const resumed = await call('POST', `/api/agents/sessions/${key}/resume`, {});
+    assert.ok(resumed.body.missed.every((e) => e.type !== 'agent.thinking'));
+
+    // Nobody is watching that session, so nothing of it is live.
+    assert.deepEqual((await call('GET', '/api/thinking')).body.thinking, []);
+  });
+
+  test('and a gateway with no session here gets a snapshot until it says it is done', async () => {
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'hermes, think out loud' })).body
+      .message.id;
+
+    const on = await call('POST', '/api/thinking', {
+      agentId: 'hermes',
+      threadId: rootId,
+      think: { t: 'Searching…', p: 'streaming', s: [{ id: 't1', t: 'Searching the web…', st: 'in_progress' }] },
+    });
+    assert.equal(on.status, 200);
+
+    const live = (await call('GET', '/api/thinking')).body.thinking;
+    assert.equal(live.length, 1);
+    assert.equal(live[0].threadId, rootId);
+    assert.equal(live[0].agentId, 'hermes');
+    assert.equal(live[0].sessionKey, null);
+    assert.equal(live[0].think.t, 'Searching…');
+    assert.equal(live[0].think.s[0].st, 'in_progress');
+
+    // A finished blob belongs on the message it explains, not in the snapshot
+    // of what is happening right now.
+    await call('POST', '/api/thinking', {
+      agentId: 'hermes',
+      threadId: rootId,
+      think: { t: 'Searched the web', p: 'done', s: [{ id: 't1', t: 'Searched the web', st: 'complete' }] },
+    });
+    assert.deepEqual((await call('GET', '/api/thinking')).body.thinking, []);
+  });
+});
+
+describe('the agent’s own slash commands', () => {
+  let key;
+
+  // An adapter whose "agent" is a two-line node script: it lists two commands
+  // and answers one of them, which is all the daemon side needs to be real.
+  const HELPER = `
+    // With -e, argv[1] is already the first real argument.
+    const [, first, ...rest] = process.argv;
+    if (first === 'list') {
+      process.stdout.write(JSON.stringify([
+        { name: 'ping', description: 'say hello', args_hint: '[times]', aliases: ['p'] },
+        { name: 'nope', description: 'cannot run here', where: 'session' },
+      ]));
+    } else if (first === 'ping' || first === 'p') {
+      process.stdout.write('pong ' + rest.join(' ').trim());
+    } else {
+      process.stderr.write('/' + first + ' needs a live session');
+      process.exit(3);
+    }`;
+
+  test('a session records which adapter serves it, and the adapter is asked', async () => {
+    mkdirSync(join(home, 'adapters'), { recursive: true });
+    writeFileSync(
+      join(home, 'adapters', 'talky.json'),
+      JSON.stringify({
+        cmd: process.execPath,
+        args: { prompt: ['-e', '{prompt}'] },
+        commands: {
+          list: { args: ['-e', HELPER, 'list'] },
+          run: { args: ['-e', HELPER, '{command}', '{args}'] },
+        },
+      })
+    );
+    key = (await call('POST', '/api/agents/sessions', { agentId: 'talky', channel: 'general' })).body.session.key;
+    await call('PUT', `/api/agents/sessions/${key}/state`, { state: { _serveAdapter: 'talky' } });
+
+    const listed = await call('GET', `/api/agents/sessions/${key}/commands`);
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.error, null);
+    assert.deepEqual(
+      listed.body.commands.map((c) => c.name),
+      ['ping', 'nope']
+    );
+    assert.equal(listed.body.commands[0].summary, 'say hello');
+    assert.equal(listed.body.commands[0].args, '[times]');
+    assert.deepEqual(listed.body.commands[0].aliases, ['p']);
+    assert.equal(listed.body.commands[1].where, 'session', 'listed, but the agent says not from here');
+  });
+
+  test('running one answers the caller and leaves nothing behind', async () => {
+    const before = (await call('GET', '/api/channels/general/messages')).body.messages.length;
+
+    const ran = await call('POST', `/api/agents/sessions/${key}/command`, { command: 'ping', args: 'twice' });
+    assert.equal(ran.status, 200);
+    assert.equal(ran.body.output, 'pong twice');
+    assert.equal(ran.body.error, null);
+
+    const failed = await call('POST', `/api/agents/sessions/${key}/command`, { command: 'nope' });
+    assert.match(failed.body.error, /needs a live session/);
+    assert.equal(failed.body.output, '');
+
+    const after = (await call('GET', '/api/channels/general/messages')).body.messages.length;
+    assert.equal(after, before, 'a command is not a message');
+    const events = await call('GET', '/api/events?since=0');
+    assert.ok(
+      events.body.events.every((e) => !String(e.type).includes('command')),
+      'and it is not in the log either'
+    );
+  });
+
+  test('an agent with no commands of its own simply has none', async () => {
+    const plain = (await call('POST', '/api/agents/sessions', { agentId: 'quiet', channel: 'general' })).body.session
+      .key;
+    const listed = await call('GET', `/api/agents/sessions/${plain}/commands`);
+    assert.deepEqual(listed.body.commands, []);
+    const ran = await call('POST', `/api/agents/sessions/${plain}/command`, { command: 'help' });
+    assert.match(ran.body.error, /cannot run commands/);
+  });
 });
 
 describe('push notifications', () => {
@@ -497,6 +708,302 @@ describe('live stream', () => {
 
     controller.abort();
     await reader.cancel().catch(() => {});
+  });
+
+  test('carries a streamed delta to an open reader without writing anything down', async () => {
+    const root = await call('POST', '/api/channels/general/messages', { text: '@hermes, a long question' });
+    const rootId = root.body.message.id;
+
+    const controller = new AbortController();
+    const res = await fetch(`${base}/api/stream`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      signal: controller.signal,
+    });
+    assert.equal(res.status, 200);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    // Unlike the parser above this one hands back the *raw* frame, because
+    // what is being asserted about a delta is as much the lines it does not
+    // have as the payload it does.
+    async function readRawUntil(predicate, timeoutMs = 6000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
+        if (hit) return hit;
+        if (Date.now() >= deadline) return null;
+        const { value, done } = await Promise.race([
+          reader.read(),
+          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
+        ]);
+        if (done) return null;
+        if (value) buffer += decoder.decode(value, { stream: true });
+      }
+    }
+
+    const parse = (chunk) => JSON.parse(chunk.split('\n').find((l) => l.startsWith('data:')).slice(5).trim());
+
+    assert.ok(await readRawUntil((c) => c.includes('"stream.ready"')), 'stream announces itself');
+
+    const before = (await call('GET', '/api/health')).body.seq;
+    const posted = await call('POST', '/api/stream/delta', {
+      agentId: 'hermes',
+      threadId: rootId,
+      text: 'the beginning of an ans',
+      think: { t: 'Drafting…', p: 'streaming', s: [{ id: 't1', t: 'Reading the thread…', st: 'complete' }] },
+    });
+    assert.equal(posted.status, 200);
+    assert.deepEqual(posted.body, { ok: true });
+
+    const raw = await readRawUntil((c) => c.includes('"agent.delta"'));
+    assert.ok(raw, 'the delta reached the open reader');
+
+    const frame = parse(raw);
+    assert.equal(frame.threadId, rootId);
+    assert.equal(frame.channelId, root.body.message.channelId, 'the channel came from the message, not the caller');
+    assert.deepEqual(frame.actor, { id: 'hermes', kind: 'agent' });
+    assert.equal(frame.text, 'the beginning of an ans');
+    assert.equal(frame.think.s[0].id, 't1');
+    assert.equal(typeof frame.at, 'number');
+
+    // Matched against the raw frame on purpose: an `id:` line would set the
+    // reader's Last-Event-ID to a seq it has never actually been sent.
+    assert.ok(!/(^|\n)id:/.test(raw), 'an ephemeral frame carries no id line');
+
+    // And nothing about it survived the request.
+    assert.equal((await call('GET', '/api/health')).body.seq, before, 'the log did not move');
+    const events = await call('GET', '/api/events?since=0');
+    assert.ok(
+      events.body.events.every((e) => e.type !== 'agent.delta'),
+      'no row was written for a fragment of an answer that does not exist yet'
+    );
+
+    controller.abort();
+    await reader.cancel().catch(() => {});
+  });
+
+  test('a reader too far behind is hung up on, never quietly skipped past', async () => {
+    // A real stalled socket is not something a test can arrange, so this
+    // drives the hub directly: what matters is which of the two paths gives
+    // up on a client, and how.
+    const hub = createHub(app.ws, { activePollMs: 30 });
+    /** A response that claims to be a megabyte behind on demand. */
+    const fakeClient = () => {
+      const req = new EventEmitter();
+      req.headers = {};
+      const res = new EventEmitter();
+      res.writableLength = 0;
+      res.wrote = [];
+      res.ended = false;
+      res.writeHead = () => {};
+      res.flushHeaders = () => {};
+      res.write = (chunk) => res.wrote.push(chunk);
+      res.end = () => {
+        res.ended = true;
+      };
+      return { req, res };
+    };
+
+    try {
+      const stalled = fakeClient();
+      const client = hub.subscribe(stalled.req, stalled.res, {});
+      const cursor = client.cursor;
+      stalled.res.writableLength = 2_000_000;
+
+      // An ephemeral frame is skipped and the client keeps its place: there is
+      // no seq on a delta, so there is nothing for it to have missed.
+      const rootId = (await call('POST', '/api/channels/general/messages', { text: 'something to point at' })).body
+        .message.id;
+      hub.broadcast({ type: 'agent.delta', threadId: rootId, text: 'a fragment' });
+      assert.equal(stalled.res.ended, false, 'a dropped delta is not worth a disconnect');
+      assert.equal(hub.size, 1);
+
+      // A log row is not. Skipping it would advance the cursor past a hole no
+      // reconnect could ever fill, so the connection ends instead and the
+      // browser comes back quoting the last id it really received.
+      hub.wake();
+      assert.equal(stalled.res.ended, true, 'the connection was ended, not the row dropped');
+      assert.equal(hub.size, 0, 'and the client is out of the set');
+      assert.equal(client.cursor, cursor, 'its cursor never moved over what it did not get');
+
+      // A reader that is keeping up is untouched by any of it.
+      const fine = fakeClient();
+      hub.subscribe(fine.req, fine.res, {});
+      await call('POST', '/api/channels/general/messages', { text: 'and one for the healthy reader' });
+      hub.wake();
+      assert.equal(fine.res.ended, false);
+      assert.ok(
+        fine.res.wrote.some((chunk) => chunk.includes('and one for the healthy reader')),
+        'the row reached it'
+      );
+    } finally {
+      hub.close();
+    }
+  });
+
+  test('a delta is normalized and capped on the way in, like every other blob', async () => {
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'a question with a reply' })).body
+      .message.id;
+
+    // The one body in the app that is copied onto every open socket at once
+    // was also the only one arriving unchecked. A fragment has a size.
+    const huge = await call('POST', '/api/stream/delta', {
+      agentId: 'hermes',
+      threadId: rootId,
+      text: 'x'.repeat(4097),
+    });
+    assert.equal(huge.status, 422);
+    assert.equal(huge.body.error.code, 'invalid_request');
+    assert.match(huge.body.error.message, /fragment/);
+
+    const wrong = await call('POST', '/api/stream/delta', { agentId: 'hermes', threadId: rootId, text: { no: 1 } });
+    assert.equal(wrong.status, 422);
+
+    const controller = new AbortController();
+    const res = await fetch(`${base}/api/stream`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      signal: controller.signal,
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    async function readUntilRaw(predicate, timeoutMs = 6000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
+        if (hit) return hit;
+        if (Date.now() >= deadline) return null;
+        const { value, done } = await Promise.race([
+          reader.read(),
+          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
+        ]);
+        if (done) return null;
+        if (value) buffer += decoder.decode(value, { stream: true });
+      }
+    }
+    const parse = (chunk) => JSON.parse(chunk.split('\n').find((l) => l.startsWith('data:')).slice(5).trim());
+    assert.ok(await readUntilRaw((c) => c.includes('"stream.ready"')));
+
+    // A reply id, because a producer answering in a thread has the reply in
+    // hand and not the root — and the draft has to land under the same key
+    // `POST /api/thinking` resolves to, or the browser holds two of them.
+    const reply = await call('POST', `/api/messages/${rootId}/replies`, { text: 'a reply in that thread' });
+    assert.equal(reply.status, 201);
+
+    await call('POST', '/api/stream/delta', {
+      agentId: 'hermes',
+      threadId: reply.body.message.id,
+      text: 'half an answ',
+      think: { t: 'T'.repeat(400), p: 'whatever', s: [{ t: 'Reading…', st: 'nonsense' }] },
+    });
+
+    const frame = parse(await readUntilRaw((c) => c.includes('"agent.delta"')));
+    assert.equal(frame.threadId, rootId, 'the reply lit up the root it belongs to');
+    assert.equal(frame.think.t.length, 200, 'the title was clamped, not taken as given');
+    assert.equal(frame.think.p, 'streaming', 'and a phase nobody defined is a live one');
+    assert.equal(frame.think.s[0].st, 'pending');
+    assert.equal(frame.think.s[0].id, 's0', 'a step with no id got one from its place');
+
+    controller.abort();
+    await reader.cancel().catch(() => {});
+  });
+
+  test('a delta it cannot place is refused, ephemeral or not', async () => {
+    const missing = await call('POST', '/api/stream/delta', { agentId: 'hermes', threadId: 'msg_nope', text: 'hi' });
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.error.code, 'not_found');
+
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'anything at all' })).body.message.id;
+    const named = await call('POST', '/api/stream/delta', { agentId: 'not a name', threadId: rootId, text: 'hi' });
+    assert.equal(named.status, 422);
+    assert.equal(named.body.error.code, 'invalid_request');
+  });
+
+  test('so a reader that drops mid-answer resumes at the seq the delta never moved', async () => {
+    const root = await call('POST', '/api/channels/general/messages', { text: 'the question before the drop' });
+    const rootId = root.body.message.id;
+
+    const controller = new AbortController();
+    const res = await fetch(`${base}/api/stream`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      signal: controller.signal,
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    async function readRawUntil(predicate, timeoutMs = 6000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
+        if (hit) return hit;
+        if (Date.now() >= deadline) return null;
+        const { value, done } = await Promise.race([
+          reader.read(),
+          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
+        ]);
+        if (done) return null;
+        if (value) buffer += decoder.decode(value, { stream: true });
+      }
+    }
+
+    assert.ok(await readRawUntil((c) => c.includes('"stream.ready"')));
+
+    // One real event, whose id is what an EventSource would remember.
+    await call('POST', '/api/channels/general/messages', { text: 'a real message before the stream' });
+    const durable = await readRawUntil((c) => c.includes('a real message before the stream'));
+    assert.ok(durable, 'the real message arrived');
+    const lastEventId = Number(durable.split('\n').find((l) => l.startsWith('id:')).slice(3).trim());
+    assert.ok(Number.isFinite(lastEventId));
+
+    await call('POST', '/api/stream/delta', { agentId: 'hermes', threadId: rootId, text: 'partial…' });
+    assert.ok(await readRawUntil((c) => c.includes('"agent.delta"')), 'the delta arrived after it');
+
+    controller.abort();
+    await reader.cancel().catch(() => {});
+
+    // The delta left no id behind to remember, so the reconnect quotes the
+    // last durable one — the same place it would have resumed from if nothing
+    // had streamed at all.
+    const resumed = new AbortController();
+    const again = await fetch(`${base}/api/stream`, {
+      headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': String(lastEventId) },
+      signal: resumed.signal,
+    });
+    const reader2 = again.body.getReader();
+    const decoder2 = new TextDecoder();
+    let buffer2 = '';
+
+    async function readAgain(predicate, timeoutMs = 6000) {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const hit = buffer2.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
+        if (hit) return hit;
+        if (Date.now() >= deadline) return null;
+        const { value, done } = await Promise.race([
+          reader2.read(),
+          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
+        ]);
+        if (done) return null;
+        if (value) buffer2 += decoder2.decode(value, { stream: true });
+      }
+    }
+
+    const ready = await readAgain((c) => c.includes('"stream.ready"'));
+    assert.ok(ready);
+    const parsed = JSON.parse(ready.split('\n').find((l) => l.startsWith('data:')).slice(5).trim());
+    assert.equal(parsed.since, lastEventId, 'resumed exactly where the last real event left it');
+
+    await call('POST', '/api/channels/general/messages', { text: 'a real message after the reconnect' });
+    assert.ok(
+      await readAgain((c) => c.includes('a real message after the reconnect')),
+      'and the resumed stream is a working stream'
+    );
+
+    resumed.abort();
+    await reader2.cancel().catch(() => {});
   });
 });
 

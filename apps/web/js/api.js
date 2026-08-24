@@ -156,8 +156,39 @@ export class Api {
     return this.get(`/api/search?${params}`);
   }
 
+  agentCommands(ref) {
+    return this.get(`/api/agents/sessions/${encodeURIComponent(ref)}/commands`);
+  }
+
+  runAgentCommand(ref, command, args) {
+    return this.post(`/api/agents/sessions/${encodeURIComponent(ref)}/command`, { command, args });
+  }
+
+  typing() {
+    return this.get('/api/typing').then((r) => r.typing ?? []);
+  }
+
+  /**
+   * The working an agent has shown so far, for every answer in flight. Same
+   * hole as `typing()` covers: a tab that opens in the middle of a reply never
+   * saw the steps go up, and the stream only ever carries the change.
+   */
+  thinkingSnapshot() {
+    return this.get('/api/thinking').then((r) => r.thinking ?? []);
+  }
+
   agentSessions() {
     return this.get('/api/agents/sessions?includeEnded=1').then((r) => r.sessions);
+  }
+
+  /**
+   * How hard `slick agent serve` should think on this session. Free text: the
+   * levels are the adapter's, not ours, and the same watcher re-read applies.
+   * @param {string} ref  history key
+   * @param {string|null} effort  null (or '') to go back to the default
+   */
+  setAgentEffort(ref, effort) {
+    return this.put(`/api/agents/sessions/${encodeURIComponent(ref)}/effort`, { effort }).then((r) => r.effort);
   }
 
   /**
@@ -187,6 +218,9 @@ export class Api {
    * connection resumes exactly where it stopped, so nothing is missed. Pass
    * `since` as a function to have manual reconnects resume from wherever the
    * caller has actually got to.
+   * Nothing here knows about ephemeral frames, and nothing needs to: the hub
+   * never sets an SSE `event:` field, so a delta arrives on `onmessage` with
+   * everything else and is routed by its own `type` like every other frame.
    * @param {{since?: number|(() => number), onEvent: (e: any) => void, onStatus?: (s: string) => void}} opts
    */
   stream({ since, onEvent, onStatus }) {

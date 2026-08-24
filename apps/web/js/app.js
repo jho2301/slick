@@ -30,13 +30,15 @@ import {
   openModal,
   toast,
 } from './ui.js';
+import { isGrouped } from './grouping.js';
+import { applyChunk, emptyThink, readThinking, settle, stepStatusLabel } from './thinking.js';
+import { createCommandMenu } from './commands.js';
 import { createMentionMenu } from './mentions.js';
 import { initPaneResizer, reflowPanes } from './panes.js';
 import { currentSubscription, disablePush, enablePush, pushSupported } from './push.js';
 
 const api = new Api();
 const LAST_CHANNEL_KEY = 'slick.channel';
-const GROUP_WINDOW_MS = 5 * 60 * 1000;
 // A stuck "on" with no matching "off" (the agent process died mid-call)
 // should not leave the indicator spinning forever.
 const TYPING_TIMEOUT_MS = 5 * 60 * 1000;
@@ -58,13 +60,44 @@ const state = {
   unread: new Map(),
   editing: null,
   atBottom: true,
+  /** The agent's own slash commands, fetched the first time one is typed. */
+  commands: { key: null, list: [], loading: false },
   /** threadId -> Map<agentId, timeout handle> */
   typing: new Map(),
+  /**
+   * An answer being streamed at us, per thread, before it is a message.
+   * Modelled on `typing` above and torn down the same three ways: the
+   * producer says it is done, the message it was building lands, or the same
+   * backstop timer gives up on a process that died mid-sentence.
+   * @type {Map<string, {text: string, think: object, agentId: string, at: number, timer: any}>}
+   */
+  drafts: new Map(),
   seq: 0,
 };
 
 /** message id -> rendered row, so live updates can patch in place. */
 const nodes = new Map();
+
+/**
+ * Whether each thinking box is open, and which phase it was in when we last
+ * decided that. Keyed by message id, or by `draft-<threadId>` for the box on
+ * an answer that is still arriving.
+ *
+ * It sits out here beside `nodes` rather than on the row because
+ * `patchMessage` rebuilds a row wholesale — on every `message.updated`, every
+ * reply-count bump, every typing flip three rows down — so a box that kept its
+ * own state in the node would slam shut every time an agent so much as
+ * started typing. Out here, a rebuild reconstructs the right state for free
+ * and `patchMessage` goes on knowing nothing about any of this.
+ * @type {Map<string, {open: boolean, sawPhase: string}>}
+ */
+const thinkUi = new Map();
+
+/** Steps past this many are folded away behind one "Show all" row. */
+const STEP_SOFT_CAP = 12;
+
+/** How close to the bottom still counts as reading live, in both panes. */
+const NEAR_BOTTOM_PX = 60;
 
 // ============================================================== rendering ===
 
@@ -78,17 +111,6 @@ function avatar(author, extraClass = '') {
       title: label,
     },
     initials(label)
-  );
-}
-
-function isGrouped(message, previous) {
-  return Boolean(
-    previous &&
-      !previous.deleted &&
-      previous.author.id === message.author.id &&
-      previous.author.kind === message.author.kind &&
-      message.createdAt - previous.createdAt < GROUP_WINDOW_MS &&
-      dayKey(previous.createdAt) === dayKey(message.createdAt)
   );
 }
 
@@ -157,11 +179,448 @@ function typingBubble(agentIds) {
 }
 
 /**
+ * The disclosure box above an agent's answer — or nothing at all, which is by
+ * far the common case.
+ *
+ * The `null` is the whole graceful-degradation story, and it is structural
+ * rather than a rule a caller has to remember: a message with no `_think` in
+ * its metadata produces no box, no wrapper and no class, and `el` drops null
+ * children, so the row around it is byte-for-byte the row this app has always
+ * drawn.
+ */
+function thinkingBox(message, surface) {
+  const think = readThinking(message);
+  return think ? thinkingView(think, message.id, surface) : null;
+}
+
+/** Nothing to show is not the same as a box with nothing in it. */
+const hasThinking = (think) => Boolean(think && (think.title || think.steps?.length));
+
+/** What the mark beside the summary line is doing, in step vocabulary. */
+const phaseStatus = (phase) => (phase === 'done' ? 'complete' : phase === 'error' ? 'error' : 'in_progress');
+
+/**
+ * The summary line when the agent authored none. Present progressive while it
+ * runs, past tense once it has stopped — and never a duration, which would
+ * quietly turn "here is my working" into "here is how long I took".
+ */
+const phaseTitle = (phase) =>
+  phase === 'done' ? 'Finished thinking' : phase === 'error' ? 'Thinking stopped' : 'Thinking…';
+
+/**
+ * Open or shut, decided here rather than in the click handler.
+ *
+ * The handler only ever sees the presses; the interesting transitions arrive
+ * as rebuilds, so this is the one place that can see both. `sawPhase` is what
+ * makes a rebuild different from a phase change: the row is reconstructed
+ * dozens of times per answer and only the handful of those that actually move
+ * the phase are allowed to overrule the reader.
+ */
+function thinkOpenState(key, phase) {
+  const seen = thinkUi.get(key);
+  // Born collapsed — unless it is already broken. "Born collapsed" is the
+  // default, and the error rule overrules it here for exactly the reason it
+  // overrules a manual collapse below: the step that failed is the one thing
+  // in the box worth showing unasked, and a reload or a switch away and back
+  // arrives here rather than at the transition underneath.
+  if (!seen) {
+    const born = phase === 'error';
+    thinkUi.set(key, { open: born, sawPhase: phase });
+    return born;
+  }
+  // Nothing moved, so whatever the reader last chose stands. That one line is
+  // both the latch during the stream and the permanence after it.
+  if (seen.sawPhase === phase) return seen.open;
+  // The phase turned over. Finishing hands the space back to the answer that
+  // is arriving; failing does the exact opposite, because a failure is
+  // precisely when someone needs to see which step broke.
+  const open = phase === 'error';
+  thinkUi.set(key, { open, sawPhase: phase });
+  return open;
+}
+
+/**
+ * In place, and deliberately not a re-render. The row has not changed — a
+ * disclosure was pressed — and rebuilding it would throw away the transition
+ * the stylesheet runs on `.think__body` and hand the reader a repaint for a
+ * chevron.
+ */
+function toggleThink(key) {
+  const seen = thinkUi.get(key);
+  const open = !seen?.open;
+  thinkUi.set(key, { open, sawPhase: seen?.sawPhase ?? 'streaming' });
+  // Every copy of this box, not just the one that was pressed. A thread root
+  // is on screen twice while the pane is open — once in the channel, once at
+  // the top of the pane — and both read their state from this one key, so a
+  // toggle wired to a single node leaves the other copy saying the opposite of
+  // what it is doing.
+  for (const box of document.querySelectorAll(`.think[data-think-key="${CSS.escape(key)}"]`)) {
+    // `aria-expanded` and nothing else: the stylesheet collapses the body off
+    // the head's own attribute, so this is the state and the animation at
+    // once. Setting `hidden` here as well would take the steps out of the
+    // accessibility tree and out of the transition with them.
+    box.querySelector('.think__head')?.setAttribute('aria-expanded', String(open));
+    const chev = box.querySelector('.think__chev');
+    if (chev) chev.textContent = open ? '▾' : '▸';
+  }
+}
+
+/** key -> what this box's live region last said, and when. */
+const thinkSaid = new Map();
+
+/** At most one spoken update per box per this long. */
+const ANNOUNCE_EVERY_MS = 1500;
+
+/** What a screen reader should be told is happening, in one short line. */
+function announcement(think) {
+  if (think.phase === 'done') return 'Finished thinking';
+  if (think.phase === 'error') return 'Thinking stopped on an error';
+  const running = [...(think.steps ?? [])].reverse().find((step) => step.status !== 'complete');
+  return running?.title || think.title || 'Thinking…';
+}
+
+/**
+ * Say the step, not the characters.
+ *
+ * Two rules are doing the work here. Assistive tech watches a live region for
+ * *changes*, and the first content of a brand-new node is not a change — so
+ * text that is worth announcing goes in one turn after the box is built, once
+ * the region is really in the document, and text that has already been said
+ * goes in synchronously, before insertion, where it stays silent. And a box
+ * with a dozen quick steps would otherwise talk over itself, so nothing is
+ * announced twice within `ANNOUNCE_EVERY_MS` — except a phase change, which is
+ * the one update nobody should miss.
+ */
+function announce(region, key, think) {
+  const text = announcement(think);
+  const said = thinkSaid.get(key);
+  // Scrolling back through a channel is not a channel full of things
+  // finishing. A box whose very first sight is already done or failed has no
+  // transition to report, so it is recorded as said without ever being said —
+  // otherwise opening a channel with a dozen old answers queues a dozen
+  // "Finished thinking"s at a reader who asked for none of them.
+  if (!said && think.phase !== 'streaming') {
+    thinkSaid.set(key, { text, phase: think.phase, at: Date.now() });
+    region.textContent = text;
+    return;
+  }
+  if (said?.text === text) {
+    region.textContent = text;
+    return;
+  }
+  if (said && said.phase === think.phase && Date.now() - said.at < ANNOUNCE_EVERY_MS) return;
+  thinkSaid.set(key, { text, phase: think.phase, at: Date.now() });
+  setTimeout(() => {
+    region.textContent = text;
+  }, 0);
+}
+
+function thinkStep(step) {
+  const details = step.details ?? [];
+  const sources = step.sources ?? [];
+  return el(
+    'li',
+    { class: 'think__step', dataset: { status: step.status, id: step.id } },
+    el('span', { class: 'think__mark', dataset: { status: step.status }, 'aria-hidden': 'true' }),
+    el('span', { class: 'think__step-title' }, step.title),
+    // The mark is decoration and says so; this is the same information as
+    // plain text, sitting inside the step it belongs to.
+    el('span', { class: 'think__sr' }, stepStatusLabel(step)),
+    details.length > 0 ? el('ul', { class: 'think__details' }, details.map((line) => el('li', {}, line))) : null,
+    step.output ? el('p', { class: 'think__output' }, step.output) : null,
+    sources.length > 0
+      ? el(
+          'ul',
+          { class: 'think__sources' },
+          // `_blank` and a stripped referrer, the same terms every link the
+          // markdown renderer emits goes out on.
+          sources.map((source) =>
+            el(
+              'li',
+              {},
+              el(
+                'a',
+                { class: 'think__source', href: source.url, target: '_blank', rel: 'noreferrer noopener' },
+                source.title
+              )
+            )
+          )
+        )
+      : null
+  );
+}
+
+/**
+ * The steps, with the oldest ones folded away past the soft cap.
+ *
+ * The tail is what stays visible rather than the head: a running box appends
+ * its newest step at the bottom, and a cap that kept the first twelve would
+ * leave a live box frozen on twelve finished rows while the interesting one
+ * happens off-list. The way back to the rest sits where they were cut.
+ */
+function thinkSteps(steps) {
+  const list = el('ol', { class: 'think__steps' });
+  const folded = [];
+  steps.forEach((step, index) => {
+    const row = thinkStep(step);
+    if (index < steps.length - STEP_SOFT_CAP) {
+      row.hidden = true;
+      folded.push(row);
+    }
+    list.append(row);
+  });
+  if (folded.length > 0) {
+    const more = el(
+      'li',
+      { class: 'think__more' },
+      el(
+        'button',
+        {
+          type: 'button',
+          onclick: () => {
+            for (const row of folded) row.hidden = false;
+            more.remove();
+          },
+        },
+        `Show all ${steps.length} steps`
+      )
+    );
+    list.prepend(more);
+  }
+  return list;
+}
+
+/**
+ * The box itself, shared by a finished message and a draft still arriving —
+ * they are the same thing at different phases, and `key` is only how the
+ * disclosure state finds its way back to the right one.
+ */
+function thinkingView(think, key, surface = 'timeline') {
+  // A stream ends by stopping, so a finished blob can still be carrying a step
+  // that claims to be running. A transcript must never hold a live spinner.
+  const shown = think.phase === 'streaming' ? think : settle(think, think.phase);
+  const open = thinkOpenState(key, shown.phase);
+  // The surface is in the id and not in the key, and the split is the point: a
+  // thread root is drawn in the channel and again at the top of the pane, so
+  // the two copies must not both claim the id their heads point `aria-controls`
+  // at — while the open state stays keyed on the message alone, because they
+  // are the same box and opening one opens the other.
+  const bodyId = `think-${surface}-${key}-body`;
+
+  const chev = el('span', { class: 'think__chev', 'aria-hidden': 'true' }, open ? '▾' : '▸');
+  // No `hidden`: collapse is the stylesheet's `0fr` row, which keeps the steps
+  // in the accessibility tree and gives the disclosure something to animate.
+  // `[hidden]` is `display: none !important` in this app and would quietly
+  // take both away.
+  const body = el(
+    'div',
+    { class: 'think__body', id: bodyId, role: 'group', 'aria-label': 'Thinking steps' },
+    thinkSteps(shown.steps ?? [])
+  );
+  const head = el(
+    'button',
+    {
+      class: 'think__head',
+      type: 'button',
+      'aria-expanded': String(open),
+      'aria-controls': bodyId,
+      onclick: () => toggleThink(key),
+    },
+    el('span', { class: 'think__mark', dataset: { status: phaseStatus(shown.phase) }, 'aria-hidden': 'true' }),
+    el('span', { class: 'think__title' }, shown.title || phaseTitle(shown.phase)),
+    chev
+  );
+  // A sibling of the body, never inside it: a region that is collapsed away
+  // with the thing it describes announces nothing at the moment it matters.
+  const region = el('p', { class: 'think__live', 'aria-live': 'polite', 'aria-atomic': 'true' });
+  announce(region, key, shown);
+
+  return el('div', { class: 'think', dataset: { phase: shown.phase, thinkKey: key } }, head, body, region);
+}
+
+/**
+ * A live answer, in the shape of the message it is about to become.
+ *
+ * It replaces the typing chip or bubble rather than sitting beside it: they
+ * say the same thing, and "claude is typing" under two paragraphs of claude's
+ * answer reads like a second agent. The body keeps the typing dots only while
+ * there is no text yet, so a draft that is all thinking still looks alive.
+ */
+function draftBubble(threadId, surface) {
+  const draft = state.drafts.get(threadId);
+  if (!draft) return null;
+  const author = { id: draft.agentId, label: draft.agentId, kind: 'agent' };
+  return el(
+    'div',
+    { class: 'msg is-typing msg--draft', dataset: { thread: threadId } },
+    el('div', { class: 'msg__gutter' }, avatar(author)),
+    el(
+      'div',
+      {},
+      hasThinking(draft.think) ? thinkingView(draft.think, `draft-${threadId}`, surface) : null,
+      draft.text
+        ? el('div', { class: 'msg__body msg__body--draft', html: renderText(draft.text) })
+        : el(
+            'div',
+            { class: 'msg__body msg__body--typing msg__body--draft' },
+            typingLabel([draft.agentId]),
+            typingDots()
+          )
+    )
+  );
+}
+
+/**
+ * The session a message was posted through. Agents stamp their history key on
+ * every message, so that is the exact answer; an agent that posted some other
+ * way falls back to its session only when it has exactly one, because guessing
+ * between several would put the wrong model next to someone's words.
+ */
+function sessionForMessage(message) {
+  if (message.sessionKey) {
+    const exact = state.sessions.find((session) => session.key === message.sessionKey);
+    if (exact) return exact;
+  }
+  const mine = state.sessions.filter((session) => session.agentId === message.author?.id);
+  return mine.length === 1 ? mine[0] : null;
+}
+
+/**
+ * What an agent message says it was answered by — this stands in for the old
+ * `agent` badge, so every agent message gets one. Nothing records which model
+ * wrote a given message, so it is the session's current setting under the
+ * agent's own name for it, same as the rail. A session we cannot pin down, or
+ * one on its default, still says something rather than reading like a human.
+ */
+function messageModel(message) {
+  if (message.author?.kind !== 'agent') return null;
+  // What actually answered, as `serve` recorded it when the reply was posted.
+  // That is history and stays true; everything below is only today's setting.
+  const answered = message.metadata?._model;
+  if (typeof answered === 'string' && answered.trim()) return answered.trim();
+  const session = sessionForMessage(message);
+  if (!session) return 'agent';
+  return modelLabel(session, serveModel(session));
+}
+
+/**
+ * Metadata worth dumping under a message. Slick's own bookkeeping is
+ * underscore-prefixed (`_model`, as on `_serveModel`) and gets rendered
+ * properly elsewhere — the raw line is for what the agent chose to attach.
+ */
+function visibleMetadata(metadata) {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const entries = Object.entries(metadata).filter(([key]) => !key.startsWith('_'));
+  return entries.length > 0 ? Object.fromEntries(entries) : null;
+}
+
+/**
+ * How hard the agent was thinking, if anything says. Recorded on the message
+ * by `serve` when the reply was posted — that is history and stays true —
+ * and otherwise the session's setting today, same fallback as the model.
+ */
+function messageEffort(message) {
+  if (message.author?.kind !== 'agent') return null;
+  const level = message.metadata?._effort;
+  if (typeof level === 'string' && level.trim()) return level.trim();
+  // A reply `serve` stamped says what it says. It writes `_model` and `_effort`
+  // together, so `_model` alone means "answered at no particular level" — not
+  // "we do not know" — and today's setting must not be painted over yesterday.
+  if (message.metadata && '_model' in message.metadata) return null;
+  const session = sessionForMessage(message);
+  return session ? serveEffort(session) : null;
+}
+
+/**
+ * What the badges say, and what hovering them explains.
+ *
+ * Two chips rather than one string: the model is a name and the level is a
+ * setting, they change independently, and a reader scanning a thread for
+ * which answers were thought hard about should find a column rather than read
+ * to the end of every id. They sit in one wrapper so the pair travels, and
+ * wraps, together.
+ *
+ * @returns {{model: string|null, effort: string|null, title: string}|null}
+ */
+function messageBadge(message) {
+  const model = messageModel(message);
+  const effort = messageEffort(message);
+  if (!model && !effort) return null;
+  const answered = model ? `Answered by ${model}` : 'Answered';
+  return { model, effort, title: effort ? `${answered}, thinking ${effort}` : answered };
+}
+
+/**
+ * One string standing for both chips, for the grouping rule. A grouped row has
+ * no header and so no chips at all, so two replies differing in either half
+ * must not be tucked under one heading: the level counts as much as the name.
+ */
+const badgeLabel = (message) => {
+  const badge = messageBadge(message);
+  return badge ? `${badge.model ?? ''} ${badge.effort ?? ''}` : null;
+};
+
+/** The pair, as they sit beside the author. */
+function modelChip(badge) {
+  if (!badge) return null;
+  return el(
+    'span',
+    { class: 'msg__badges', title: badge.title },
+    badge.model ? el('span', { class: 'msg__badge msg__model' }, badge.model) : null,
+    badge.effort ? el('span', { class: 'msg__badge msg__effort' }, badge.effort) : null
+  );
+}
+
+/**
+ * Put the chip on a row that is already on screen. Sessions load — and change —
+ * after messages render, and re-rendering the timeline for that would throw the
+ * reader's scroll position away.
+ */
+function syncModelChip(row, message) {
+  const head = row?.querySelector('.msg__head');
+  if (!head) return; // a grouped row has no header to hang it off
+  const badge = messageBadge(message);
+  const existing = head.querySelector('.msg__badges');
+  if (!badge) {
+    existing?.remove();
+    return;
+  }
+  // The pair is replaced rather than patched: there are four ways two optional
+  // chips can change, and rebuilding one small wrapper is both shorter and
+  // harder to get wrong than four transitions that must also keep them in order.
+  const fresh = modelChip(badge);
+  if (existing) {
+    existing.replaceWith(fresh);
+    return;
+  }
+  const author = head.querySelector('.msg__author');
+  if (author) author.after(fresh);
+  else head.append(fresh);
+}
+
+/** Every chip in the timeline, after the sessions behind them moved. */
+function syncModelChips() {
+  for (const message of state.messages) {
+    const row = nodes.get(message.id);
+    if (row) syncModelChip(row, message);
+  }
+}
+
+/** A fingerprint of "which model is each session on", to spot real changes. */
+function modelFingerprint() {
+  // The effort belongs in here too: it is half of what the badge says, and
+  // the chips only get repaired when this string changes.
+  return state.sessions
+    .map((session) => `${session.key}:${serveModel(session) ?? ''}:${serveEffort(session) ?? ''}`)
+    .join('|');
+}
+
+/**
  * One message row. `previous` decides whether it is visually grouped under
  * the message above it.
  */
 function messageRow(message, previous, opts = {}) {
-  const grouped = !opts.standalone && isGrouped(message, previous);
+  const grouped = !opts.standalone && isGrouped(message, previous, badgeLabel);
   const row = el('div', {
     class: `msg${grouped ? ' is-grouped' : ''}`,
     dataset: { id: message.id },
@@ -180,7 +639,7 @@ function messageRow(message, previous, opts = {}) {
         'div',
         { class: 'msg__head' },
         el('span', { class: 'msg__author' }, message.author.label || message.author.id),
-        message.author.kind === 'agent' ? el('span', { class: 'msg__badge' }, 'agent') : null,
+        modelChip(messageBadge(message)),
         message.author.kind === 'system' ? el('span', { class: 'msg__badge msg__badge--system' }, 'system') : null,
         el('span', { class: 'msg__time', title: fullStamp(message.createdAt) }, clock(message.createdAt))
       )
@@ -190,16 +649,27 @@ function messageRow(message, previous, opts = {}) {
   if (message.deleted) {
     main.append(el('div', { class: 'msg__body msg__deleted' }, 'This message was deleted'));
   } else {
+    // Two constraints hold this line where it is. It goes in `main` and not in
+    // `row` because `.msg` is a two-column grid — avatar, then body — and a
+    // third in-flow child would wrap under the avatar gutter instead of
+    // sitting above the answer it explains. And nothing inside the box may
+    // carry `.msg__body`: `startEdit` finds the editable node with
+    // `row.querySelector('.msg__body')`, first match wins, and a box drawn
+    // above the real body would hand the editor the wrong node.
+    const think = thinkingBox(message, opts.inThread ? 'thread' : 'timeline');
+    if (think) main.append(think);
     main.append(el('div', { class: 'msg__body', html: renderText(message.text) }));
     if (message.editedAt) main.append(el('span', { class: 'msg__edited' }, '(edited)'));
-    if (message.metadata) {
-      main.append(el('div', { class: 'msg__meta' }, JSON.stringify(message.metadata)));
-    }
+    const meta = visibleMetadata(message.metadata);
+    if (meta) main.append(el('div', { class: 'msg__meta' }, JSON.stringify(meta)));
   }
 
   if (!opts.inThread) {
     const typers = typingAgents(message.threadId);
-    if (typers.length > 0) main.append(typingChip(typers, message.threadId));
+    // An answer already arriving says everything the typing pill would, so it
+    // takes the pill's place rather than stacking on top of it.
+    if (state.drafts.has(message.threadId)) main.append(draftBubble(message.threadId, 'timeline'));
+    else if (typers.length > 0) main.append(typingChip(typers, message.threadId));
     else if (message.replyCount > 0) main.append(threadSummary(message));
   }
 
@@ -212,9 +682,18 @@ function emptyState(title, ...lines) {
   return el('div', { class: 'empty' }, el('h2', {}, title), lines.map((text) => el('p', { html: text })));
 }
 
-function renderTimeline() {
+function renderTimeline({ sameChannel = false } = {}) {
   const host = clear($('#messages'));
   nodes.clear();
+  // Every row is about to be rebuilt either way, but "load earlier" is the
+  // same channel and the same conversation: a box the reader opened should
+  // still be open once sixty older messages arrive above it. Switching
+  // channels is the opposite — those ids have left the screen for good, and
+  // keeping their state would only leak.
+  if (!sameChannel) {
+    thinkUi.clear();
+    thinkSaid.clear();
+  }
 
   if (!state.current) {
     host.append(emptyState('No channel selected', 'Pick one on the left, or create your first channel.'));
@@ -289,6 +768,8 @@ function dropMessage(id) {
   if (index !== -1) state.messages.splice(index, 1);
   nodes.get(id)?.remove();
   nodes.delete(id);
+  thinkUi.delete(id);
+  thinkSaid.delete(id);
 }
 
 // ---------------------------------------------------------------- layers ---
@@ -560,6 +1041,7 @@ function renderAgents() {
     // only how long ago it last did anything.
     const live = session.serve?.live ?? false;
     const model = serveModel(session);
+    const effort = serveEffort(session);
     list.append(
       el(
         'li',
@@ -584,6 +1066,21 @@ function renderAgents() {
               },
             },
             modelLabel(session, model)
+          ),
+          // How hard it thinks, beside what it runs. Only an agent that has
+          // been told sits on a level, so the button stays blank until then
+          // rather than claiming a default it cannot know.
+          el(
+            'button',
+            {
+              class: `agent__effort${effort ? ' is-set' : ''}`,
+              title: effort ? `Thinking ${effort} — click to change` : 'Set how hard this agent thinks',
+              onclick: (event) => {
+                event.stopPropagation();
+                editAgentEffort(session);
+              },
+            },
+            effort ?? 'effort'
           )
         ),
         el(
@@ -610,6 +1107,15 @@ function renderAgents() {
  */
 function serveModel(session) {
   const value = session.state?._serveModel;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * How hard this session's watcher is set to think, or null for whatever the
+ * agent's own configuration says. Mirrors `readServeEffort` in the core.
+ */
+function serveEffort(session) {
+  const value = session.state?._serveEffort;
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
@@ -652,6 +1158,41 @@ async function editAgentModel(session) {
     toast(model ? `${session.agentId} → ${model}` : `${session.agentId} is back on its default model`);
   } catch (err) {
     fail(err, 'Could not change that model');
+  }
+}
+
+/**
+ * Change how hard the agent thinks. Free text on purpose: the levels are the
+ * agent's own vocabulary — `claude` takes five, Hermes eight — and a menu
+ * built here would be a guess that goes stale.
+ */
+async function editAgentEffort(session) {
+  const current = serveEffort(session);
+  const values = await openModal({
+    title: 'Reasoning effort',
+    okLabel: 'Set effort',
+    fields: [
+      {
+        name: 'effort',
+        label: 'Effort',
+        value: current ?? '',
+        placeholder: 'e.g. high',
+        help:
+          'Passed to the agent on the next message it answers, and shown on the reply beside the model. ' +
+          'The levels are the agent&rsquo;s own &mdash; claude takes low, medium, high, xhigh, max. ' +
+          'Leave it empty for whatever the agent is configured to do.',
+      },
+    ],
+  });
+  if (!values) return;
+  const wanted = (values.effort ?? '').trim();
+  if (wanted === (current ?? '')) return;
+  try {
+    const level = await api.setAgentEffort(session.key, wanted || null);
+    await refreshSessions();
+    toast(level ? `${session.agentId} → thinking ${level}` : `${session.agentId} is back on its default effort`);
+  } catch (err) {
+    fail(err, 'Could not change that effort level');
   }
 }
 
@@ -783,7 +1324,7 @@ async function loadOlder() {
   state.messages = [...result.messages, ...state.messages];
   state.hasMore = result.hasMore;
   state.oldestSeq = result.oldestSeq ?? state.oldestSeq;
-  renderTimeline();
+  renderTimeline({ sameChannel: true });
   // Keep the reading position steady while content grows above it.
   timeline.scrollTop = timeline.scrollHeight - previousHeight;
 }
@@ -960,14 +1501,31 @@ async function openThread(rootId) {
   $('#thread').hidden = false;
   // Jumping straight from one thread to another stays on the same layer.
   if (!wasOpen && stacks()) pushLayer('thread');
-  renderThread();
+  // Opening one has no reading position to preserve, so this is the one call
+  // that still jumps to the bottom unconditionally.
+  renderThread({ stick: true });
 }
 
-function renderThread() {
+/** Close enough to the bottom of a scroller to count as following it. */
+const nearBottom = (host) => host.scrollHeight - host.scrollTop - host.clientHeight < NEAR_BOTTOM_PX;
+
+function renderThread({ stick } = {}) {
   if (!state.thread) return;
   const { root, replies } = state.thread;
+  const pane = $('#thread-body');
+  // Measured before the rebuild throws the pane away. This used to jump to the
+  // bottom every time, which was harmless when a redraw meant a reply had
+  // landed — but a draft redraws the pane as it grows, and yanking a reader
+  // who has scrolled back down again on every frame is not a redraw, it is a
+  // fight.
+  const follow = stick ?? nearBottom(pane);
+  // And where they were, for when they are not following. `clear()` empties
+  // the pane, which clamps its scrollTop to 0, so leaving the restore to the
+  // `follow` branch alone would send a reader who had scrolled up back to the
+  // top of the thread every time anything at all redrew it.
+  const prevTop = pane.scrollTop;
   $('#thread-sub').textContent = `#${state.thread.channel.slug}`;
-  const host = clear($('#thread-body'));
+  const host = clear(pane);
   host.append(messageRow(root, null, { inThread: true, standalone: true }));
   host.append(
     el(
@@ -982,8 +1540,9 @@ function renderThread() {
     previous = reply;
   }
   const typers = typingAgents(root.id);
-  if (typers.length > 0) host.append(typingBubble(typers));
-  host.scrollTop = host.scrollHeight;
+  if (state.drafts.has(root.id)) host.append(draftBubble(root.id, 'thread'));
+  else if (typers.length > 0) host.append(typingBubble(typers));
+  host.scrollTop = follow ? host.scrollHeight : prevTop;
 }
 
 function closeThread({ viaPopstate = false } = {}) {
@@ -1236,8 +1795,16 @@ async function refreshCategories() {
 
 async function refreshSessions() {
   try {
+    const before = modelFingerprint();
     state.sessions = await api.agentSessions();
     renderAgents();
+    // Messages usually render before the sessions behind them are known, and a
+    // human can switch a model mid-conversation — either way the chips already
+    // on screen are stale until we say otherwise.
+    if (modelFingerprint() !== before) {
+      syncModelChips();
+      if (state.thread) renderThread();
+    }
   } catch {
     /* the agent list is decoration; never block the app on it */
   }
@@ -1249,6 +1816,45 @@ function bumpUnread(channelId) {
   if (!channelId || channelId === state.current?.id) return;
   state.unread.set(channelId, (state.unread.get(channelId) ?? 0) + 1);
   renderRail();
+}
+
+/**
+ * Who is working right now, asked rather than waited for.
+ *
+ * The stream carries typing as a change; a tab that opens in the middle of a
+ * reply never saw it, and shows nothing for the rest of the call. So the app
+ * asks once on boot and again whenever a dropped stream comes back, and
+ * reconciles rather than merges: an agent that stopped while we were away has
+ * to stop here too.
+ */
+async function refreshTyping() {
+  let current;
+  try {
+    current = await api.typing();
+  } catch {
+    return; // an older daemon, or one that is down: keep what we have
+  }
+  // Only ever adds. Switching an indicator *off* is the event stream's job —
+  // a reconnect replays the "off" it missed — and the snapshot cannot see a
+  // watcher whose lock lives on another machine, so a gap in it is not proof
+  // that nobody is working. What it cannot correct, the timer will.
+  for (const entry of current) setTyping(entry.threadId, entry.agentId, true);
+
+  // The scratchpad has exactly the same hole in it, and the same fix. It is
+  // asked for separately rather than in parallel because a daemon old enough
+  // not to have this route still has the typing one, and losing typing to a
+  // 404 on thinking would be a poor trade.
+  let scratch;
+  try {
+    scratch = await api.thinkingSnapshot();
+  } catch {
+    return;
+  }
+  for (const entry of scratch) {
+    if (!entry?.threadId || !entry.think) continue;
+    setDraft(entry.threadId, { agentId: entry.agentId, think: entry.think });
+    redrawThread(entry.threadId);
+  }
 }
 
 function typingAgents(threadId) {
@@ -1273,14 +1879,127 @@ function setTyping(threadId, agentId, on) {
     entry.delete(agentId);
     if (entry.size === 0) state.typing.delete(threadId);
   }
+  redrawThread(threadId);
+}
+
+/**
+ * Redraw the two places a thread's live indicator can show: the root's row in
+ * the channel, and the thread pane when it happens to be that thread. Pulled
+ * out of `setTyping` so a draft lands in exactly the same places by exactly
+ * the same rules — including the one that matters, which is that a row being
+ * edited is left alone rather than rebuilt out from under the editor.
+ */
+function redrawThread(threadId) {
   const message = state.editing === threadId ? null : state.messages.find((m) => m.id === threadId);
   if (message) patchMessage(message);
   if (state.thread?.root.id === threadId) renderThread();
 }
 
+/**
+ * Start or extend the draft for a thread. Nothing here draws: `setDraft` is
+ * called from the per-token path as well as the per-step one, and a render
+ * per token is the thing this whole design exists to avoid.
+ */
+function setDraft(threadId, { agentId, think } = {}) {
+  let draft = state.drafts.get(threadId);
+  if (!draft) {
+    draft = { text: '', think: emptyThink(), agentId: agentId ?? 'agent', at: Date.now(), timer: null };
+    state.drafts.set(threadId, draft);
+  }
+  if (agentId) draft.agentId = agentId;
+  if (think) draft.think = applyChunk(draft.think, think);
+  draft.at = Date.now();
+  // Same backstop as typing, for the same reason: the "done" frame is
+  // ephemeral, so a producer that dies mid-answer sends nothing at all.
+  clearTimeout(draft.timer);
+  draft.timer = setTimeout(() => clearDraft(threadId), TYPING_TIMEOUT_MS);
+  return draft;
+}
+
+/** The answer landed, or gave up. Either way the placeholder goes. */
+function clearDraft(threadId) {
+  const draft = state.drafts.get(threadId);
+  if (!draft) return;
+  clearTimeout(draft.timer);
+  state.drafts.delete(threadId);
+  thinkUi.delete(`draft-${threadId}`);
+  thinkSaid.delete(`draft-${threadId}`);
+  redrawThread(threadId);
+}
+
+/** Every draft bubble on screen for a thread — at most the channel row and the pane. */
+const draftNodes = (threadId) => [...document.querySelectorAll(`.msg--draft[data-thread="${CSS.escape(threadId)}"]`)];
+
+/**
+ * A token, or a handful of them, written straight into the node.
+ *
+ * This is the whole point of a draft having its own state. `renderThread`
+ * clears the pane and rebuilds the root and every reply; `patchMessage`
+ * rebuilds a whole row. Either one per delta would mean a full rebuild and a
+ * scroll jump several times a second, on a pane the reader is trying to read.
+ * So the first frame pays for one render to put a bubble on screen, and every
+ * frame after it mutates that bubble in place and returns.
+ */
+function applyDelta(event) {
+  const threadId = event.threadId;
+  if (!threadId) return;
+  if (event.done) {
+    clearDraft(threadId);
+    return;
+  }
+  const fresh = !state.drafts.has(threadId);
+  const draft = setDraft(threadId, { agentId: event.actor?.id, think: event.think });
+  if (typeof event.text === 'string') draft.text += event.text;
+
+  // Nothing in this app has ever re-scrolled for a row that was already on
+  // screen and simply got taller, because until now nothing grew. A draft does,
+  // a few characters at a time, and a reader parked at the bottom would
+  // otherwise watch the answer walk up and off the screen. Both measurements
+  // are taken before the node changes, or "was I at the bottom" answers itself.
+  const pane = state.thread?.root.id === threadId ? $('#thread-body') : null;
+  const followPane = pane ? nearBottom(pane) : false;
+  const followTimeline = state.atBottom;
+
+  if (fresh) {
+    redrawThread(threadId);
+  } else {
+    for (const node of draftNodes(threadId)) {
+      const body = node.querySelector('.msg__body--draft');
+      if (body && draft.text) {
+        // The dots were standing in for text that had not arrived; it has.
+        body.classList.remove('msg__body--typing');
+        body.innerHTML = renderText(draft.text);
+      }
+      // Steps move far more slowly than characters, so the box is only rebuilt
+      // on a frame that actually carried one — and never while the reader has
+      // its disclosure focused, since replacing the node would drop the focus.
+      const box = node.querySelector('.think');
+      if (event.think && box && !box.contains(document.activeElement)) {
+        const surface = node.closest('#thread-body') ? 'thread' : 'timeline';
+        box.replaceWith(thinkingView(draft.think, `draft-${threadId}`, surface));
+      } else if (event.think && !box) {
+        redrawThread(threadId);
+        break;
+      }
+    }
+  }
+
+  if (followTimeline) scrollToBottom();
+  if (followPane && pane) pane.scrollTop = pane.scrollHeight;
+}
+
 async function handleEvent(event) {
   if (event.type === 'stream.ready') {
     state.seq = event.seq;
+    return;
+  }
+  if (event.type === 'agent.delta') {
+    // Broadcast with no `id:` line and so no seq of its own: a delta is the one
+    // frame in the app that was never written down, and there is nothing to
+    // resume it from. It returns above the bookkeeping below rather than
+    // through it, so a stray seq on an ephemeral frame can never move the
+    // position we would reconnect at.
+    applyDelta(event);
     return;
   }
   state.seq = Math.max(state.seq, event.seq ?? 0);
@@ -1289,6 +2008,13 @@ async function handleEvent(event) {
     case 'message.created': {
       const message = event.message;
       if (!message) return;
+      // Whatever was streaming into a bubble is now a real message carrying
+      // the whole text, so the stand-in goes before the row that replaces it
+      // is drawn — but only for the agent that was writing it. A human
+      // replying into the thread mid-answer must not wipe the answer. A
+      // thread with no draft costs one map lookup.
+      const drafting = state.drafts.get(message.threadId);
+      if (drafting && drafting.agentId === message.author?.id) clearDraft(message.threadId);
       if (message.parentId) {
         if (state.thread?.root.id === message.parentId) {
           state.thread.replies.push(message);
@@ -1353,7 +2079,26 @@ async function handleEvent(event) {
 
     case 'agent.typing': {
       if (!event.threadId) return;
-      setTyping(event.threadId, event.actor?.id ?? 'agent', Boolean(event.payload?.on));
+      // Typing is a change, not a state, and it lives in the same durable log
+      // as everything else, so a reconnect replays old ones. An "on" from long
+      // enough ago describes a reply that has been finished for hours.
+      const on = Boolean(event.payload?.on);
+      if (on && Date.now() - (event.createdAt ?? 0) > TYPING_TIMEOUT_MS) return;
+      setTyping(event.threadId, event.actor?.id ?? 'agent', on);
+      return;
+    }
+
+    case 'agent.thinking': {
+      if (!event.threadId) return;
+      // Thinking rows are durable, exactly like typing, so a reconnect replays
+      // the ones from an answer that finished hours ago. Same guard, same
+      // reason: an old scratchpad describes a message that is already sitting
+      // in the transcript with its working attached.
+      if (Date.now() - (event.createdAt ?? 0) > TYPING_TIMEOUT_MS) return;
+      const think = event.payload?.think;
+      if (!think) return;
+      setDraft(event.threadId, { agentId: event.actor?.id ?? 'agent', think });
+      redrawThread(event.threadId);
       return;
     }
 
@@ -1503,17 +2248,100 @@ function fail(err, fallback) {
   if (!(err instanceof ApiError)) console.error(err);
 }
 
-function wireComposer(inputId, formId, buttonId, submit, menuId) {
+// ------------------------------------------------------------- commands ---
+
+/**
+ * The session a slash command is aimed at: an agent that is home in this
+ * channel, or failing that any agent that is home at all. A command is asked
+ * of an agent, so there has to be one.
+ */
+function commandSession() {
+  const callable = state.sessions.filter((session) => session.serve?.callable);
+  return callable.find((session) => session.channelSlug === state.current?.slug) ?? callable[0] ?? null;
+}
+
+/**
+ * Fetch the agent's command vocabulary, once, the first time a `/` is typed.
+ * Slick has no list of its own to fall back on — an agent that offers nothing
+ * simply has no menu.
+ */
+async function loadCommands() {
+  const session = commandSession();
+  if (!session || state.commands.loading || state.commands.key === session.key) return;
+  state.commands.loading = true;
+  try {
+    const answer = await api.agentCommands(session.key);
+    state.commands = { key: session.key, list: answer.commands ?? [], loading: false };
+  } catch {
+    state.commands.loading = false; // no vocabulary, no menu; nothing to say about it
+  }
+}
+
+/** Show a line only this person sees, above the composer. Not a message. */
+function showEphemeral(title, body, kind = '') {
+  const host = $('#composer-out');
+  clear(host);
+  host.hidden = false;
+  host.className = `composer__out${kind ? ` is-${kind}` : ''}`;
+  host.append(
+    el(
+      'div',
+      { class: 'composer__out-head' },
+      el('span', { class: 'composer__out-title' }, title),
+      el('button', {
+        class: 'composer__out-close',
+        type: 'button',
+        'aria-label': 'Dismiss',
+        onclick: () => {
+          host.hidden = true;
+        },
+      }, '×')
+    ),
+    body ? el('div', { class: 'composer__out-body', html: renderText(body) }) : null
+  );
+}
+
+/**
+ * Run one of the agent's own commands and show what it said.
+ *
+ * The output goes nowhere near the channel: it comes back in the response to
+ * this one request and is drawn above the composer for the person who asked.
+ */
+async function runSlashCommand(line) {
+  const [word, ...rest] = line.slice(1).split(/\s+/);
+  const args = line.slice(1 + word.length).trim();
+  const session = commandSession();
+  if (!session) {
+    showEphemeral(`/${word}`, 'No agent is listening in this workspace, so there is nobody to ask.', 'warn');
+    return;
+  }
+  showEphemeral(`/${word}`, '…', '');
+  try {
+    const answer = await api.runAgentCommand(session.key, word, args);
+    if (answer.error) showEphemeral(`/${answer.command || word}`, answer.error, 'warn');
+    else showEphemeral(`/${answer.command || word}`, answer.output || '(nothing to show)');
+  } catch (err) {
+    showEphemeral(`/${word}`, err.message ?? String(err), 'warn');
+  }
+}
+
+function wireComposer(inputId, formId, buttonId, submit, menuId, commandMenuId) {
   const input = $(inputId);
   const button = $(buttonId);
   const resize = autosize(input);
   const mentions = menuId ? createMentionMenu(input, $(menuId), agentSuggestions) : null;
+  const commands = commandMenuId
+    ? createCommandMenu(input, $(commandMenuId), () => state.commands.list, loadCommands)
+    : null;
   const sync = () => {
     button.disabled = input.value.trim().length === 0 || input.disabled;
   };
   input.addEventListener('input', sync);
   input.addEventListener('keydown', (event) => {
+    // Whichever menu is open gets the key first; only one ever is, since one
+    // wants a `/` at the start of the box and the other an `@` after a space.
     if (mentions?.handleKeydown(event)) return;
+    if (commands?.handleKeydown(event)) return;
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       $(formId).requestSubmit();
@@ -1524,9 +2352,16 @@ function wireComposer(inputId, formId, buttonId, submit, menuId) {
     const text = input.value;
     if (!text.trim()) return;
     mentions?.close();
+    commands?.close();
     input.value = '';
     resize();
     sync();
+    // A line that is only a slash command is a question for the agent's
+    // console, not a message for the channel. It leaves nothing behind.
+    if (commands && /^\/[a-z0-9._:-]+/i.test(text.trim())) {
+      await runSlashCommand(text.trim());
+      return;
+    }
     await submit(text);
   });
   return sync;
@@ -1545,7 +2380,14 @@ function wire() {
   // After the resizer, which owns the clamp `setRail` re-runs.
   setRail(Boolean(localStorage.getItem(RAIL_HIDDEN_KEY)), { remember: false });
 
-  const syncMain = wireComposer('#composer-input', '#composer', '#btn-send', send, '#mention-menu-main');
+  const syncMain = wireComposer(
+    '#composer-input',
+    '#composer',
+    '#btn-send',
+    send,
+    '#mention-menu-main',
+    '#command-menu-main'
+  );
   wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply, '#mention-menu-thread');
 
   // The uncategorised bucket outlives every re-render, so it is wired once.
@@ -1589,7 +2431,7 @@ function wire() {
   const timeline = $('#timeline');
   timeline.addEventListener('scroll', () => {
     const distance = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight;
-    state.atBottom = distance < 60;
+    state.atBottom = distance < NEAR_BOTTOM_PX;
     if (state.atBottom) $('#btn-jump').hidden = true;
     if (timeline.scrollTop < 80 && state.hasMore) loadOlder();
   });
@@ -1889,7 +2731,11 @@ async function boot() {
     onEvent: (event) => {
       handleEvent(event).catch((err) => console.error('event failed', err));
     },
-    onStatus: setConnection,
+    onStatus: (status) => {
+    setConnection(status);
+    // A stream that just came back may have been away across a whole reply.
+    if (status === 'live') refreshTyping();
+  },
   });
 
   // Keep "last seen 3m ago" honest without a re-render storm. This re-fetches

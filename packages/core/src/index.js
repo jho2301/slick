@@ -18,13 +18,37 @@ export {
   recordEvent,
 } from './events.js';
 export {
+  SERVE_ADAPTER_KEY,
+  SERVE_EFFORT_KEY,
   SERVE_MODEL_KEY,
   SERVE_MODELS_KEY,
   SERVE_MODELS_AT_KEY,
+  readServeAdapter,
+  readServeEffort,
   readServeModel,
   readServeModelChoices,
   normalizeModelChoices,
 } from './agents.js';
 export { serveLockPath, readServeLock, wasEverServed, serveStatus } from './serve.js';
+export {
+  BUILT_IN_ADAPTERS,
+  DEFAULT_ADAPTER,
+  adapterDir,
+  adapterFile,
+  buildAgentArgs,
+  buildCommandListCall,
+  buildCommandRunCall,
+  buildModelListArgs,
+  listAdapters,
+  loadAdapter,
+  lookupReported,
+  normalizeAdapter,
+  parseAgentReply,
+  slotFires,
+  supportsCommands,
+  supportsModelList,
+  supportsResume,
+} from './adapters.js';
+export { THINK_KEY, normalizeThinking, mergeThinking } from './thinking.js';
 export { slugify, assertSlug } from './channels.js';
-export { extractMentions, serializeMessage } from './messages.js';
+export { extractMentions, serializeMessage, splitMessageText, MAX_TEXT_LENGTH } from './messages.js';

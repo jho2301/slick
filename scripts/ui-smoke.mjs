@@ -110,8 +110,8 @@ async function main() {
     const deployRows = await js('document.querySelectorAll("#messages .msg").length');
     check('deploys has messages', deployRows > 0, `${deployRows} rows`);
     check(
-      'agent messages are badged',
-      await js('!!document.querySelector("#messages .msg__badge")')
+      'agent messages name the model that answered',
+      await js('!!document.querySelector("#messages .msg__model")')
     );
     check('code block rendered', await js('!!document.querySelector("#messages pre, #thread-body pre") || true'));
     await shoot('01-channel');
@@ -195,6 +195,106 @@ async function main() {
         Math.abs((await js('document.querySelector("#thread").getBoundingClientRect().width')) - 400) < 1
       );
     }
+
+    console.log('\nthinking steps');
+    // Posted the way an agent posts one: the working hangs off the message's
+    // own metadata, so the box has to survive every round trip a message does.
+    const worked = server.ws.messages.post({
+      channel: 'deploys',
+      text: 'Rolled the canary back and pinned the previous image.',
+      author: { id: 'claude', kind: 'agent', label: 'claude' },
+      metadata: {
+        _think: {
+          t: 'Worked out what took the canary down',
+          p: 'done',
+          s: [
+            {
+              id: 't1',
+              t: 'Read the deploy log',
+              st: 'complete',
+              d: ['tail -n 200 deploy.log', '2 restarts'],
+              o: 'The image digest changed at 14:02',
+            },
+            {
+              id: 't2',
+              t: 'Compared the two images',
+              st: 'complete',
+              src: [{ u: 'https://example.test/builds/91', t: 'build 91' }],
+            },
+          ],
+        },
+      },
+    });
+    await sleep(1000);
+    check('a thinking box is drawn above the answer', await js('!!document.querySelector("#messages .think")'));
+    check('it is born collapsed', !(await visible('#messages .think__body')));
+    // Collapsed here means a zero-height grid row, not `display: none`. The
+    // difference is invisible in a screenshot and is the whole accessibility
+    // story: content that is display:none is out of the tree, so a reader
+    // would be told the box exists and never told what is in it.
+    check(
+      'and collapsed still leaves the steps in the accessibility tree',
+      await js(`
+        (() => {
+          const body = document.querySelector('#messages .think__body');
+          return getComputedStyle(body).display !== 'none' && body.getBoundingClientRect().height < 1;
+        })()
+      `)
+    );
+    check(
+      'and the head is a button that says so',
+      (await js('document.querySelector("#messages .think__head").getAttribute("aria-expanded")')) === 'false'
+    );
+    // A thread root is drawn twice while its pane is open, so the id the head
+    // points at has to name the surface it was drawn on or the two copies both
+    // claim it and `aria-controls` resolves to whichever came first.
+    check(
+      'and points at a body id scoped to the pane it was drawn in',
+      await js(`
+        (() => {
+          const head = document.querySelector('#messages .think__head');
+          const body = document.querySelector('#messages .think__body');
+          return head.getAttribute('aria-controls') === body.id && body.id.startsWith('think-timeline-');
+        })()
+      `)
+    );
+    await js('document.querySelector("#messages .think__head").click()');
+    await sleep(500);
+    check('clicking the head opens the steps', await visible('#messages .think__body'));
+    check(
+      'and says so',
+      (await js('document.querySelector("#messages .think__head").getAttribute("aria-expanded")')) === 'true'
+    );
+    const stepRows = await js('document.querySelectorAll("#messages .think__step").length');
+    check('every step rendered', stepRows === 2, `${stepRows} steps`);
+    check('the answer itself is still the editable body', await js(`
+      (() => {
+        const row = document.querySelector('#messages .msg .think').closest('.msg');
+        return row.querySelector('.msg__body').textContent.includes('Rolled the canary back');
+      })()
+    `));
+    await shoot('02c-thinking');
+
+    // The regression that matters. A reply bumps the root's reply count, which
+    // rebuilds the entire row through patchMessage — and a box whose open flag
+    // lived in the node would shut itself here, under a reader mid-sentence.
+    server.ws.messages.post({ parentId: worked.id, text: 'Thanks — leaving it pinned.' });
+    await sleep(1200);
+    check(
+      'a write to the same thread rebuilds that row',
+      await js(`
+        (() => {
+          const row = document.querySelector('#messages .msg .think').closest('.msg');
+          const chip = row.querySelector('.msg__thread');
+          return !!chip && chip.textContent.includes('1 reply');
+        })()
+      `)
+    );
+    check('and leaves the box open', await visible('#messages .think__body'));
+    check(
+      'with its button still saying so',
+      (await js('document.querySelector("#messages .think__head").getAttribute("aria-expanded")')) === 'true'
+    );
 
     console.log('\nsending');
     await js(`

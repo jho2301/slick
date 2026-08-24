@@ -18,7 +18,7 @@ import { createPushService } from './push.js';
 import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot, serviceWorkerWithBuild } from './static.js';
 import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.3.0';
 const COOKIE = 'slick_token';
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -123,7 +123,12 @@ export function createServer(opts = {}) {
           hub,
         });
         if (result === RAW) return;
-        if (req.method !== 'GET') hub.wake();
+        // `/api/stream/delta` is the exception, and the only one: `broadcast`
+        // already put its frame on every open socket before the handler
+        // returned, and it wrote no row for a wake to go looking for. Waking
+        // anyway would buy nothing but a `ws.seq()` query against SQLite for
+        // every fragment of every streamed answer.
+        if (req.method !== 'GET' && url.pathname !== '/api/stream/delta') hub.wake();
         if (result && typeof result === 'object' && 'status' in result && 'body' in result) {
           return sendJson(res, result.status, result.body);
         }

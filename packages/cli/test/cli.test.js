@@ -1,7 +1,8 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +11,9 @@ import { parse, withGlobals } from '../src/args.js';
 
 const BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../bin/slick.js');
 const FAKE_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/fake-agent.js');
+const PLAIN_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/plain-agent.js');
+const STDERR_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/stderr-agent.js');
+const STREAM_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/stream-agent.js');
 let home;
 
 before(() => {
@@ -429,9 +433,18 @@ describe('agent serve', () => {
     await slick(['send', 'general', '--thread', memoryThread, '@claude and this thread only']);
     const call = await serveDump();
     assert.equal(call.resumed, true, 'the thread’s own conversation answers it');
-    assert.match(call.prompt, /Earlier in this thread:/);
-    assert.match(call.prompt, /first look/, 'the thread’s earlier turns');
     assert.doesNotMatch(call.prompt, /unrelated chatter/, 'other threads stay out of it');
+    assert.doesNotMatch(call.prompt, /first look/, 'nor the turns the transcript is already holding');
+  });
+
+  test('a resumed thread is told what it missed, not what it already has', async () => {
+    await slick(['send', 'general', '--thread', memoryThread, 'a quiet aside nobody mentioned it in']);
+    await slick(['send', 'general', '--thread', memoryThread, '@claude what did you miss']);
+    const call = await serveDump();
+    assert.equal(call.resumed, true);
+    assert.match(call.prompt, /Earlier in this thread:/, 'there is news, so there is context');
+    assert.match(call.prompt, /a quiet aside/, 'the message it was never handed');
+    assert.doesNotMatch(call.prompt, /first look/, 'and only that message');
   });
 
   test('a retired session is told the state again, having never seen it', async () => {
@@ -439,6 +452,7 @@ describe('agent serve', () => {
     const call = await serveDump([], { FAKE_AGENT_OVERSIZED_RESUME: '1' });
     assert.equal(call.resumed, false, 'the oversized resume was retired for a fresh session');
     assert.match(call.prompt, /"step":"done"/, 'which starts out knowing nothing');
+    assert.match(call.prompt, /first look/, 'so the thread is handed to it whole again');
   });
 
   test('--shared-session keeps every thread in one conversation, as it used to', async () => {
@@ -446,10 +460,13 @@ describe('agent serve', () => {
     const first = await serveDump(['--shared-session']);
     assert.equal(first.resumed, false, 'nothing shared to resume yet');
 
+    await slick(['send', 'general', 'a channel aside it was never handed']);
     await slick(['send', 'general', '@claude shared two']);
     const second = await serveDump(['--shared-session']);
     assert.equal(second.resumed, true, 'a different thread, the same child session');
     assert.match(second.prompt, /Recent conversation in #general/, 'and the channel, not one thread');
+    assert.match(second.prompt, /a channel aside/, 'caught up on what it missed');
+    assert.doesNotMatch(second.prompt, /shared one/, 'but not on what it answered');
   });
 
   test('serve asks the agent what it can run, and remembers the answer', async () => {
@@ -538,6 +555,75 @@ describe('agent serve', () => {
     assert.equal((await serveDump()).model, null, 'and with no flag either, the agent picks');
   });
 
+  test('the reply records which model answered it, as the binary reports it', async () => {
+    await slick(['send', 'general', '@claude who answered this']);
+    const result = await slick(
+      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', '--model', 'anthropic/claude-sonnet-4'],
+      { env: { FAKE_AGENT_REPORTS_MODEL: 'anthropic/claude-sonnet-4-20250514' } }
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const posted = JSON.parse(result.stdout.trim()).message;
+    assert.equal(
+      posted.metadata._model,
+      'anthropic/claude-sonnet-4-20250514',
+      'what the binary says it ran beats the alias we asked for'
+    );
+  });
+
+  test('and falls back to what we asked for when the binary does not say', async () => {
+    await slick(['send', 'general', '@claude and now a quiet one']);
+    const asked = await slick(
+      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', '--model', 'anthropic/claude-opus-4']
+    );
+    assert.equal(JSON.parse(asked.stdout.trim()).message.metadata._model, 'anthropic/claude-opus-4');
+
+    await slick(['send', 'general', '@claude with nothing set anywhere']);
+    const silent = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json']);
+    assert.equal(
+      JSON.parse(silent.stdout.trim()).message.metadata,
+      null,
+      'a default-model session claims nothing about which model wrote it'
+    );
+  });
+
+  test('--effort is passed through, and the reply says how hard it thought', async () => {
+    await slick(['send', 'general', '@claude think hard about this']);
+    const call = await serveDump(['--effort', 'xhigh']);
+    assert.equal(call.effort, 'xhigh', 'the level reaches the binary');
+
+    await slick(['send', 'general', '@claude and once more']);
+    const result = await slick(
+      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', '--model', 'opus', '--effort', 'high']
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const posted = JSON.parse(result.stdout.trim()).message;
+    assert.equal(posted.metadata._model, 'opus');
+    assert.equal(posted.metadata._effort, 'high', 'the badge can say model(effort)');
+  });
+
+  test('`agent effort` overrides the launch flag, live, and clears back', async () => {
+    const set = await slick(['agent', 'effort', key, 'max', '--json']);
+    assert.equal(set.code, 0, set.stderr);
+    assert.equal(set.json.effort, 'max');
+    assert.equal((await slick(['agent', 'effort', key, '-q'])).stdout, 'max', 'and reads back');
+
+    await slick(['send', 'general', '@claude with the live setting']);
+    const call = await serveDump(['--effort', 'low']);
+    assert.equal(call.effort, 'max', 'the live setting wins over the launch flag');
+    assert.doesNotMatch(call.prompt, /_serveEffort/, 'which level it thinks at is not the agent’s memory');
+
+    await slick(['agent', 'effort', key, '--clear']);
+    assert.equal((await slick(['agent', 'effort', key, '--json'])).json.effort, null);
+    await slick(['send', 'general', '@claude after clearing']);
+    assert.equal((await serveDump()).effort, null, 'and with no flag either, the agent decides');
+  });
+
+  test('an effort level is a short word, not a paragraph', async () => {
+    const bad = await slick(['agent', 'effort', key, 'think as hard as you possibly can']);
+    assert.equal(bad.code, 2);
+    assert.match(bad.stderr, /is not an effort level/);
+  });
+
   test('but a lock left behind by a dead process does not', async () => {
     const lock = join(home, `serve-${key}.lock`);
     writeFileSync(lock, '2147483646'); // a pid that cannot be running
@@ -546,6 +632,323 @@ describe('agent serve', () => {
     assert.equal(result.code, 0);
     assert.match(JSON.parse(result.stdout.trim()).message.text, /after the crash$/);
     assert.equal(existsSync(lock), false, 'and the lock is released on the way out');
+  });
+});
+
+describe('agent adapters', () => {
+  let key;
+
+  test('the built-in calling conventions are listed', async () => {
+    const listed = await slick(['agent', 'adapters', '--json']);
+    assert.equal(listed.code, 0);
+    assert.deepEqual(
+      listed.json.adapters.map((a) => a.name),
+      ['claude', 'plain']
+    );
+    const claude = listed.json.adapters.find((a) => a.name === 'claude');
+    assert.equal(claude.cmd, 'claude');
+    assert.equal(claude.resume, true);
+    assert.equal(claude.source, 'built-in');
+  });
+
+  test('a manifest adds one, and it says which binary to run', async () => {
+    mkdirSync(join(home, 'adapters'), { recursive: true });
+    writeFileSync(
+      join(home, 'adapters', 'tiny.json'),
+      JSON.stringify({
+        label: 'Tiny messages',
+        cmd: FAKE_AGENT,
+        args: {
+          prompt: ['-p', '{prompt}'],
+          base: ['--output-format', 'json'],
+          resume: ['--resume', '{session}'],
+          model: ['--model', '{model}'],
+        },
+        reply: { format: 'json', text: 'result', sessionId: 'session_id', error: 'is_error' },
+        maxMessageLength: 400,
+      })
+    );
+
+    const tiny = (await slick(['agent', 'adapters', '--json'])).json.adapters.find((a) => a.name === 'tiny');
+    assert.equal(tiny.maxMessageLength, 400);
+    assert.equal(tiny.source, join(home, 'adapters', 'tiny.json'));
+
+    key = (
+      await slick(['agent', 'start', '--agent', 'tiny', '--name', 'tiny-serve', '--channel', 'general', '-q'])
+    ).stdout;
+    await slick(['send', 'general', '@tiny say something short']);
+    // No --cmd anywhere: the manifest is the whole configuration.
+    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'tiny', '--json']);
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(JSON.parse(result.stdout.trim()).message.text, /say something short$/);
+  });
+
+  test('an answer too long for one message is posted as several, not lost', async () => {
+    await slick(['send', 'general', '@tiny write me an essay']);
+    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'tiny', '--json', '--model', 'big'], {
+      env: { FAKE_AGENT_LONG: '1500' },
+    });
+    assert.equal(result.code, 0, result.stderr);
+
+    const posted = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l).message);
+    assert.ok(posted.length >= 4, `1500 characters at 400 a message is more than one: got ${posted.length}`);
+    assert.ok(posted.every((m) => m.text.length <= 400), 'every piece is postable');
+    assert.match(posted[0].text, /^line 0: /, 'and they arrive in the order they were written');
+    assert.ok(posted.map((m) => m.text).join('\n').length >= 1500, 'the whole answer is there');
+
+    assert.equal(posted[0].metadata._model, 'big');
+    assert.equal(posted[1].metadata, null, 'one answer says which model wrote it once');
+
+    const pending = (await slick(['agent', 'pull', key, '--json', '--peek'])).json;
+    assert.equal(pending.events.length, 0, 'and the question is answered, not left for the next pass');
+  });
+
+  test('the plain adapter feeds stdin and takes the answer as it stands', async () => {
+    const plainKey = (
+      await slick(['agent', 'start', '--agent', 'plain', '--name', 'plain-serve', '--channel', 'general', '-q'])
+    ).stdout;
+    await slick(['send', 'general', '@plain are you there']);
+    const result = await slick(
+      ['agent', 'serve', plainKey, '--once', '--adapter', 'plain', '--cmd', PLAIN_AGENT, '--json']
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.match(JSON.parse(result.stdout.trim()).message.text, /^plain saw: .*are you there$/);
+
+    const state = (await slick(['agent', 'state', 'get', plainKey, '--json'])).json.state;
+    assert.equal(state._serveThreads, undefined, 'nothing to resume, so nothing is remembered');
+  });
+
+  test('a text agent resumes on a session id read out of its stderr', async () => {
+    writeFileSync(
+      join(home, 'adapters', 'stderr.json'),
+      JSON.stringify({
+        label: 'Stderr agent',
+        cmd: STDERR_AGENT,
+        args: {
+          prompt: ['-q', '{prompt}'],
+          resume: ['--resume', '{session}'],
+          model: { match: '^(.+?)::(.+)$', args: ['-m', '{2}', '--provider', '{1}'], else: ['-m', '{value}'] },
+        },
+        reply: { format: 'text', sessionId: { pattern: 'session_id:\\s*(\\S+)', from: 'stderr' } },
+      })
+    );
+
+    const bot = (
+      await slick(['agent', 'start', '--agent', 'stderrbot', '--name', 'stderr-serve', '--channel', 'general', '-q'])
+    ).stdout;
+    const thread = (await slick(['send', 'general', '@stderrbot first question', '--json'])).json.message.id;
+
+    const first = await slick(['agent', 'serve', bot, '--once', '--adapter', 'stderr', '--json'], {
+      env: { STDERR_AGENT_SESSION: 'sess-77' },
+    });
+    assert.equal(first.code, 0, first.stderr);
+    assert.match(JSON.parse(first.stdout.trim()).message.text, /answered\(resumed=false/);
+
+    const threads = (await slick(['agent', 'state', 'get', bot, '--json'])).json.state._serveThreads;
+    assert.equal(threads[thread].sessionId, 'sess-77', 'the id came out of stderr, not out of JSON');
+
+    // ...and is handed back on the next message in that thread — along with a
+    // provider-qualified model, which arrives as two flags.
+    await slick(['agent', 'model', bot, 'copilot::gpt-5.4']);
+    await slick(['send', 'general', '--thread', thread, '@stderrbot and now']);
+    const second = await slick(['agent', 'serve', bot, '--once', '--adapter', 'stderr', '--json']);
+    assert.equal(second.code, 0, second.stderr);
+    const answer = JSON.parse(second.stdout.trim()).message.text;
+    assert.match(answer, /answered\(resumed=true/);
+    assert.match(answer, /model=gpt-5\.4, provider=copilot/, 'one id, split back into -m and --provider');
+
+    // A run that dies still leaves the message for the next pass to retry.
+    await slick(['send', 'general', '--thread', thread, '@stderrbot this one dies']);
+    const failed = await slick(['agent', 'serve', bot, '--once', '--adapter', 'stderr', '--json'], {
+      env: { STDERR_AGENT_FAIL: '1' },
+    });
+    assert.match(failed.stderr, /provider unreachable/);
+    const pending = (await slick(['agent', 'pull', bot, '--json', '--peek'])).json;
+    assert.ok(pending.events.some((e) => e.message?.text?.includes('this one dies')));
+  });
+
+  test('an adapter with no binary of its own says so before it starts', async () => {
+    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'plain']);
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /does not name a binary/);
+  });
+
+  test('an unknown adapter says where one would go', async () => {
+    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'nope']);
+    assert.equal(result.code, 4);
+    assert.match(result.stderr, /No agent adapter called "nope"/);
+    assert.match(result.stderr, /adapters/);
+  });
+
+  test('a manifest that does not parse costs you that adapter, not the list', async () => {
+    const broken = join(home, 'adapters', 'broken.json');
+    writeFileSync(broken, '{ not json');
+    try {
+      const listed = await slick(['agent', 'adapters', '--json']);
+      assert.equal(listed.code, 0);
+      assert.match(listed.json.adapters.find((a) => a.name === 'broken').error, /not valid JSON/);
+      assert.ok(listed.json.adapters.some((a) => a.name === 'tiny'), 'the working ones still list');
+    } finally {
+      rmSync(broken, { force: true });
+    }
+  });
+});
+
+describe('an agent that narrates while it answers', () => {
+  /** Every POST the watcher made, in the order the daemon received it. */
+  const deltas = [];
+  const thinking = [];
+  let server;
+  let key;
+
+  /**
+   * The same agent, described twice: once by an adapter that knows how to read
+   * what it prints on the way, once by one that does not. The output is
+   * identical either way, which is the whole test — streaming is a second
+   * reading of it, never a different call.
+   */
+  const manifest = (stream) => ({
+    label: stream ? 'Narrating agent' : 'The same agent, unheard',
+    cmd: STREAM_AGENT,
+    args: { prompt: ['-p', '{prompt}'], resume: ['--resume', '{session}'] },
+    ...(stream
+      ? {
+          stream: {
+            format: 'jsonl',
+            text: 'delta.text',
+            reasoning: 'delta.thinking',
+            step: 'tool.name',
+            stepStatus: 'tool.status',
+            args: ['--stream'],
+          },
+        }
+      : {}),
+    reply: {
+      format: 'text',
+      text: { pattern: '"answer":"(.*?)"', from: 'stdout' },
+      sessionId: { pattern: '"session_id":"(.*?)"', from: 'stdout' },
+    },
+  });
+
+  before(async () => {
+    // A delta is the one thing the watcher cannot write down itself, so it
+    // needs something answering where the daemon would be.
+    server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => (body += chunk));
+      req.on('end', () => {
+        const payload = body ? JSON.parse(body) : {};
+        if (req.url === '/api/stream/delta') deltas.push(payload);
+        if (req.url === '/api/thinking') thinking.push(payload);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise((done) => server.listen(0, '127.0.0.1', done));
+    writeFileSync(
+      join(home, 'daemon.json'),
+      JSON.stringify({ url: `http://127.0.0.1:${server.address().port}`, token: 'watching', pid: process.pid })
+    );
+
+    mkdirSync(join(home, 'adapters'), { recursive: true });
+    writeFileSync(join(home, 'adapters', 'narrating.json'), JSON.stringify(manifest(true)));
+    writeFileSync(join(home, 'adapters', 'quiet.json'), JSON.stringify(manifest(false)));
+
+    key = (
+      await slick(['agent', 'start', '--agent', 'narrator', '--name', 'narrator-serve', '--channel', 'general', '-q'])
+    ).stdout;
+  });
+
+  after(() => {
+    server?.close();
+    // Nothing after this describe should think a daemon is running.
+    rmSync(join(home, 'daemon.json'), { force: true });
+  });
+
+  test('the pieces arrive as they are written, and spell the answer', async () => {
+    await slick(['send', 'general', '@narrator say something out loud']);
+    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'narrating', '--json'], {
+      env: { STREAM_AGENT_DUMP: join(home, 'stream-agent-call.json') },
+    });
+    assert.equal(result.code, 0, result.stderr);
+    const posted = JSON.parse(result.stdout.trim()).message;
+    assert.equal(posted.text, 'streamed(resumed=false): @narrator say something out loud');
+
+    const call = JSON.parse(readFileSync(join(home, 'stream-agent-call.json'), 'utf8'));
+    assert.ok(call.args.includes('--stream'), 'the stream block’s own argv reached the binary');
+
+    assert.ok(deltas.length > 0, 'somebody was told while it was still being written');
+    assert.ok(deltas.length <= 5, `coalesced, never a request per token: ${deltas.length}`);
+    assert.equal(
+      deltas.map((d) => d.text ?? '').join(''),
+      posted.text,
+      'every piece, in the order it was written, is the answer'
+    );
+    assert.ok(
+      deltas.every((d) => d.agentId === 'narrator' && d.threadId === posted.threadId),
+      'and every one of them says which agent, in which thread'
+    );
+    assert.equal(deltas.at(-1).done, true, 'the last word is that there are no more');
+  });
+
+  test('what it did on the way is told live, and kept on the message', async () => {
+    assert.ok(thinking.length > 0, 'the steps were sent as they happened');
+    const settled = thinking.at(-1);
+    assert.equal(settled.agentId, 'narrator');
+    assert.equal(settled.think.p, 'done', 'a finished run leaves nothing spinning');
+    assert.deepEqual(
+      settled.think.s.map((step) => [step.t, step.st]),
+      [['Reading the thread', 'complete']],
+      'one tool, reported twice, is one step'
+    );
+    assert.equal(settled.think.t, 'Working out what was asked');
+
+    // The stream is gone the moment it is drawn; the message is what a reader
+    // arriving late has.
+    const thread = (await slick(['read', 'general', '--limit', '10', '--replies', '--json'])).json;
+    const answer = thread.messages.find((m) => m.text.startsWith('streamed(resumed=false): @narrator say something'));
+    assert.deepEqual(
+      answer.metadata._think.s.map((step) => step.t),
+      ['Reading the thread'],
+      'and the steps are on the answer itself, not only on the wire'
+    );
+  });
+
+  test('the same output, with no stream block, is read exactly as it was', async () => {
+    const sent = deltas.length;
+    await slick(['send', 'general', '@narrator say something out loud']);
+    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'quiet', '--json']);
+    assert.equal(result.code, 0, result.stderr);
+    const posted = JSON.parse(result.stdout.trim()).message;
+
+    assert.equal(
+      posted.text,
+      'streamed(resumed=false): @narrator say something out loud',
+      'the close path still reads the same final answer out of the same output'
+    );
+    assert.equal(posted.metadata, null, 'nothing narrated, so nothing is stamped');
+    assert.equal(deltas.length, sent, 'and nothing was sent anywhere');
+  });
+
+  test('a run that never came back is not left saying it finished thinking', async () => {
+    const before = thinking.length;
+    await slick(['send', 'general', '@narrator take your time']);
+    const result = await slick(
+      ['agent', 'serve', key, '--once', '--adapter', 'narrating', '--json', '--timeout', '1500'],
+      { env: { STREAM_AGENT_HANG: '1' } }
+    );
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(thinking.length > before, 'the one step it got to was told at the time');
+
+    // The step it died inside is the whole reason to keep the box: a timeout
+    // that reported "complete" would hide the only thing worth reading.
+    const settled = thinking.at(-1);
+    assert.equal(settled.think.p, 'error', 'the run did not finish, and the box says so');
+    assert.deepEqual(
+      settled.think.s.map((step) => step.st),
+      ['error'],
+      'nothing it was in the middle of is called complete'
+    );
   });
 });
 

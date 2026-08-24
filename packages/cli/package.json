@@ -1,6 +1,6 @@
 {
   "name": "@slick/cli",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "slick — command line access to your workspace, for humans and agents",

@@ -11,8 +11,9 @@ import { ConflictError, NotFoundError, ValidationError } from './errors.js';
 import { newId, ID_PREFIX } from './ids.js';
 import { row, rows, transact } from './db.js';
 import { EVENT_TYPES, recordEvent } from './events.js';
+import { THINK_KEY, normalizeThinking } from './thinking.js';
 
-const MAX_TEXT_LENGTH = 40_000;
+export const MAX_TEXT_LENGTH = 40_000;
 const MENTION_RE = /(?:^|[\s(<[])@([a-z0-9][a-z0-9._-]{0,63})/gi;
 
 /** `@claude fix this` -> ['claude'] */
@@ -22,6 +23,114 @@ export function extractMentions(text) {
     found.add(match[1].toLowerCase().replace(/[.]+$/, ''));
   }
   return [...found];
+}
+
+/** A fenced code block opener or closer — ``` or ~~~, indented up to three spaces. */
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
+
+/** The smallest useful piece — below this, splitting stops making progress. */
+const MIN_CHUNK = 200;
+
+/**
+ * Break text into pieces that each fit inside one message.
+ *
+ * A long answer used to be a lost answer: `serve` posts what the agent said,
+ * the post is refused for length, and the watcher retries the whole call —
+ * three model runs, three refusals, nothing to show for it. Long answers are
+ * ordinary, so they are split rather than refused. `post` itself stays strict:
+ * a human or an agent calling it directly should hear that the message is too
+ * long, not silently have it cut into four.
+ *
+ * Breaks fall between lines, and a fenced code block that a break lands inside
+ * is closed before it and reopened after it, so no piece renders as half a
+ * fence. A single line too long for any piece is cut where it falls — better
+ * than losing it.
+ *
+ * @param {string} text
+ * @param {number|null} [limit] characters per piece; Slick's own cap by default
+ * @returns {string[]} at least one piece, each one postable
+ */
+export function splitMessageText(text, limit = MAX_TEXT_LENGTH) {
+  const value = String(text ?? '');
+  const cap = Math.min(Math.max(Math.trunc(Number(limit)) || MAX_TEXT_LENGTH, MIN_CHUNK), MAX_TEXT_LENGTH);
+  if (value.length <= cap) return [value];
+
+  const closerFor = (fence) => fence.trim().match(FENCE_RE)[1];
+  /** What a piece must keep back for a fence it will have to close off. */
+  const reserve = (fence) => (fence ? closerFor(fence).length + 1 : 0);
+
+  const pieces = [];
+  /** The fence line the buffer is inside, as the buffer stands. */
+  let open = null;
+  /** What the last break seeded the buffer with, so a lone fence never ships. */
+  let carried = null;
+  let buf = '';
+
+  const emit = (fence) => {
+    // Blank lines can pile up into a piece with nothing in it, and a message
+    // with nothing in it is refused. Inside a fence the buffer always holds
+    // the fence line, so this only ever drops empty space.
+    if (buf.trim().length > 0) pieces.push(fence ? `${buf}\n${closerFor(fence)}` : buf);
+    carried = fence;
+    buf = fence ?? '';
+  };
+
+  for (const line of value.split('\n')) {
+    // Appending this line can itself open or close a fence, and a break can
+    // happen either side of it, so the room kept back is whichever of the two
+    // states needs more. Getting this wrong is how a piece ends up over the
+    // cap: the closer is appended by `emit`, long after the fit was decided.
+    const after = FENCE_RE.test(line) ? (open ? null : line) : open;
+    const keep = Math.max(reserve(open), reserve(after));
+
+    let rest = line;
+    for (;;) {
+      const free = cap - keep - buf.length - (buf.length ? 1 : 0);
+      if (rest.length <= free) {
+        buf = buf.length ? `${buf}\n${rest}` : rest;
+        break;
+      }
+      if (buf.length && buf !== carried) {
+        // Something worth shipping is here; the line tries again next piece.
+        emit(open);
+        continue;
+      }
+      // The piece is empty, or holds nothing but a reopened fence, and the
+      // line still does not fit. Cut it where it falls — at least one
+      // character, so this always makes progress.
+      const cut = Math.max(free, 1);
+      buf = buf.length ? `${buf}\n${rest.slice(0, cut)}` : rest.slice(0, cut);
+      emit(open);
+      rest = rest.slice(cut);
+    }
+    open = after;
+  }
+  if (buf.length && buf !== carried) emit(open);
+  // Only reachable for text that is nothing but blank lines, which has no
+  // pieces to make. Hand it back whole and let the message rules refuse it.
+  return pieces.length > 0 ? pieces : [value.slice(0, cap)];
+}
+
+/**
+ * The one metadata key with a schema.
+ *
+ * Metadata is otherwise the author's business — whatever JSON was handed in is
+ * stringified as-is, and that stays true here: an object with no `_think` in
+ * it comes back out as the very same object, so every existing caller writes
+ * exactly the bytes it wrote yesterday. `_think` is the exception because it
+ * is machine-written, unbounded, and re-sent with the message forever; see
+ * `thinking.js` for why the caps live there and why they clamp instead of
+ * throwing. A blob that normalizes to nothing takes the key with it rather
+ * than leaving a `null` behind for every reader to test for.
+ */
+function normalizeMetadata(metadata) {
+  if (metadata == null || typeof metadata !== 'object') return metadata;
+  if (!Object.prototype.hasOwnProperty.call(metadata, THINK_KEY)) return metadata;
+  const think = normalizeThinking(metadata[THINK_KEY]);
+  const out = { ...metadata };
+  if (think) out[THINK_KEY] = think;
+  else delete out[THINK_KEY];
+  return out;
 }
 
 function parseJson(value, fallback) {
@@ -120,6 +229,7 @@ export function createMessageService(ctx) {
    */
   function post(input) {
     const text = assertText(input.text);
+    const metadata = normalizeMetadata(input.metadata);
     const author = { ...defaultActor, ...(input.author ?? {}) };
     return transact(db, () => {
       const parentRef = input.parentId ?? input.threadId ?? null;
@@ -172,7 +282,7 @@ export function createMessageService(ctx) {
         author.label ?? null,
         text,
         JSON.stringify(mentions),
-        input.metadata == null ? null : JSON.stringify(input.metadata),
+        metadata == null ? null : JSON.stringify(metadata),
         input.sessionKey ?? null,
         seq,
         now,
@@ -292,7 +402,7 @@ export function createMessageService(ctx) {
           ? current.metadata
           : patch.metadata === null
             ? null
-            : { ...(current.metadata ?? {}), ...patch.metadata };
+            : normalizeMetadata({ ...(current.metadata ?? {}), ...patch.metadata });
 
       const textChanged = text !== current.text;
       const metaChanged = JSON.stringify(metadata ?? null) !== JSON.stringify(current.metadata ?? null);

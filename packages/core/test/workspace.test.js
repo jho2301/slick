@@ -391,16 +391,24 @@ describe('agent sessions', () => {
     ws.agents.setState(session.key, { _serveSessionId: 'abc' });
 
     const start = ws.seq();
+
+    // It owes the workspace a sign of life, but as a heartbeat — minutes
+    // apart — rather than a write of its own row on every pass.
+    const seenAt = ws.agents.get(session.key).lastSeenAt;
+    for (let i = 0; i < 5; i++) ws.agents.resume(session.key);
+    assert.equal(ws.agents.get(session.key).lastSeenAt, seenAt, '"last seen" holds still between beats');
+
     for (let i = 0; i < 20; i++) {
       ws.agents.resume(session.key);
       ws.agents.setState(session.key, { _serveSessionId: 'abc' }); // the same value, again
     }
     assert.equal(ws.seq(), start, 'a watcher that finds nothing new is not a writer');
-    assert.equal(ws.agents.get(session.key).resumeCount, 20, 'but the resume is still counted');
+    assert.equal(ws.agents.get(session.key).resumeCount, 0, 'not of its own row either');
 
     // Real news still lands in the log, for both.
     ws.messages.post({ channel: 'general', text: 'something to catch up on' });
     ws.agents.resume(session.key);
+    assert.equal(ws.agents.get(session.key).resumeCount, 1, 'a resume that caught up is counted');
     ws.agents.setState(session.key, { _serveSessionId: 'def' });
     const types = ws.hydratedEvents({ since: start }).map((e) => e.type);
     assert.ok(types.includes('agent.session.resumed'), 'a resume with news is recorded');
@@ -419,9 +427,10 @@ describe('agent sessions', () => {
 
   test('resume --create makes a session on first run and finds it after', () => {
     const first = ws.agents.resume('nightly', { create: true, agentId: 'claude', channel: 'general' });
+    ws.messages.post({ channel: 'general', text: 'news for the nightly run' });
     const second = ws.agents.resume('nightly', { create: true, agentId: 'claude' });
     assert.equal(second.session.key, first.session.key);
-    assert.equal(second.session.resumeCount, 2);
+    assert.equal(second.session.resumeCount, 1, 'the same session, one catch-up on');
   });
 
   test('reports an unknown key clearly, even with --create', () => {
@@ -472,6 +481,144 @@ describe('agent sessions', () => {
       resumed.missed.every((e) => e.type !== 'agent.typing'),
       'typing must not show up as something to handle'
     );
+  });
+
+  test('who is typing right now is a snapshot, so a tab opened mid-reply can catch up', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    const root = ws.messages.post({ channel: 'general', text: '@claude think about this' });
+    const lock = serveLockPath(session.key, home);
+
+    ws.agents.typing(session.key, { on: true, threadId: root.id, channelId: root.channelId });
+    assert.deepEqual(ws.agents.typingNow(), [], 'a watcher that holds no lock is not watching anything');
+
+    writeFileSync(lock, String(process.pid)); // a live pid: this test runner
+    try {
+      assert.deepEqual(ws.agents.typingNow(), [
+        {
+          threadId: root.id,
+          channelId: root.channelId,
+          agentId: 'claude',
+          sessionKey: session.key,
+          at: ws.events().at(-1).createdAt,
+        },
+      ]);
+
+      ws.agents.typing(session.key, { on: false, threadId: root.id, channelId: root.channelId });
+      assert.deepEqual(ws.agents.typingNow(), [], 'the last thing said about a thread is what counts');
+    } finally {
+      rmSync(lock, { force: true });
+    }
+  });
+
+  test('a killed watcher stops claiming to be typing, even with the "on" still in the log', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    const root = ws.messages.post({ channel: 'general', text: '@claude one more' });
+    const lock = serveLockPath(session.key, home);
+
+    writeFileSync(lock, '2147483646'); // a pid that cannot be running
+    try {
+      ws.agents.typing(session.key, { on: true, threadId: root.id, channelId: root.channelId });
+      assert.deepEqual(ws.agents.typingNow(), [], 'the lock is stale, so nobody is home to be typing');
+    } finally {
+      rmSync(lock, { force: true });
+    }
+  });
+
+  test('a gateway can say it is typing without a session here at all', () => {
+    const root = ws.messages.post({ channel: 'general', text: '@hermes are you there?' });
+
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: true });
+    assert.deepEqual(ws.agents.typingNow(), [
+      {
+        threadId: root.id,
+        channelId: root.channelId,
+        agentId: 'hermes',
+        sessionKey: null,
+        at: ws.events().at(-1).createdAt,
+      },
+    ]);
+
+    // No history key, so no lock to hold — and the snapshot does not ask for
+    // one. That is the whole difference from a session row.
+    assert.equal(ws.agents.typingNow()[0].sessionKey, null);
+    assert.equal(ws.agents.list().length, 0, 'and nothing invented a session on the way');
+
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: false });
+    assert.deepEqual(ws.agents.typingNow(), []);
+  });
+
+  test('it points at the thread, whichever end of it you name', () => {
+    const root = ws.messages.post({ channel: 'general', text: 'the question' });
+    const reply = ws.messages.reply(root.id, { text: 'a reply' });
+
+    // A caller holding a reply's id means the thread that reply is in.
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: reply.id, on: true });
+    const [live] = ws.agents.typingNow();
+    assert.equal(live.threadId, root.id);
+    assert.equal(live.channelId, root.channelId, 'and the channel comes from the message, not the caller');
+  });
+
+  test('and it refuses what it cannot point at', () => {
+    const root = ws.messages.post({ channel: 'general', text: 'anything' });
+    assert.throws(() => ws.agents.externalTyping({ agentId: 'hermes', threadId: 'msg_nope', on: true }), NotFoundError);
+    assert.throws(() => ws.agents.externalTyping({ agentId: 'hermes', on: true }), NotFoundError);
+    assert.throws(
+      () => ws.agents.externalTyping({ agentId: 'not a name', threadId: root.id, on: true }),
+      ValidationError
+    );
+  });
+
+  test('an external "on" is believed for the window and no longer', () => {
+    const root = ws.messages.post({ channel: 'general', text: 'a slow question' });
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: true });
+    assert.equal(ws.agents.typingNow().length, 1);
+
+    // Nothing here can be asked whether it is still alive, so age is the only
+    // thing keeping a dead gateway's indicator from spinning forever.
+    const seq = ws.events().at(-1).seq;
+    ws.db.prepare('UPDATE events SET created_at = ? WHERE seq = ?').run(Date.now() - 60 * 60 * 1000, seq);
+    assert.deepEqual(ws.agents.typingNow(), [], 'an hour later, nobody is typing');
+  });
+
+  test('two gateways in one thread do not hide each other', () => {
+    const root = ws.messages.post({ channel: 'general', text: 'everyone at once' });
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: true });
+    ws.agents.externalTyping({ agentId: 'other', threadId: root.id, on: true });
+    assert.deepEqual(
+      ws.agents.typingNow().map((entry) => entry.agentId).sort(),
+      ['hermes', 'other']
+    );
+
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: false });
+    assert.deepEqual(
+      ws.agents.typingNow().map((entry) => entry.agentId),
+      ['other'],
+      'one stopping does not stop the other'
+    );
+  });
+
+  test('a session still has to hold its lock, external or not', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    const root = ws.messages.post({ channel: 'general', text: 'both at once' });
+
+    ws.agents.typing(session.key, { on: true, threadId: root.id, channelId: root.channelId });
+    ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: true });
+    assert.deepEqual(
+      ws.agents.typingNow().map((entry) => entry.agentId),
+      ['hermes'],
+      'the session has no watcher, so only the gateway is typing'
+    );
+
+    const lock = serveLockPath(session.key, home);
+    writeFileSync(lock, String(process.pid));
+    try {
+      assert.deepEqual(
+        ws.agents.typingNow().map((entry) => entry.agentId).sort(),
+        ['claude', 'hermes']
+      );
+    } finally {
+      rmSync(lock, { force: true });
+    }
   });
 
   test('a session nobody serves is not callable', () => {
@@ -525,6 +672,91 @@ describe('agent sessions', () => {
   test('a model chosen by hand does not make an automation callable', () => {
     const automation = ws.agents.start({ agentId: 'hn-daily', channel: 'general' });
     assert.equal(ws.agents.setModel(automation.key, 'anthropic/claude-sonnet-4').callable, false);
+  });
+});
+
+describe('an agent’s thinking, and who gets to read it', () => {
+  const trace = () => ({
+    t: 'Working…',
+    p: 'streaming',
+    s: [{ id: 't1', t: 'Reading the thread…', st: 'in_progress' }],
+  });
+
+  test('a flush that says what the last one said is not a second row', () => {
+    const session = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    const root = ws.messages.post({ channel: 'general', text: '@claude a question' });
+
+    const before = ws.seq();
+    ws.agents.thinking(session.key, { think: trace(), threadId: root.id });
+    const written = ws.seq();
+    assert.ok(written > before, 'the first one is news');
+
+    // The watcher coalesces on a 120ms timer while a step lasts seconds, so
+    // most flushes repeat. This tier only ever answers "what now?", and the
+    // log it writes into is append-only and never pruned.
+    for (let i = 0; i < 5; i++) ws.agents.thinking(session.key, { think: trace(), threadId: root.id });
+    assert.equal(ws.seq(), written, 'five identical flushes wrote nothing');
+
+    const moved = trace();
+    moved.s[0].st = 'complete';
+    ws.agents.thinking(session.key, { think: moved, threadId: root.id });
+    assert.ok(ws.seq() > written, 'a step that actually changed is recorded');
+
+    // Per thread, not per agent: two answers running at once must not silence
+    // each other just because they happen to look alike.
+    const other = ws.messages.post({ channel: 'general', text: '@claude another question' });
+    const twoThreads = ws.seq();
+    ws.agents.thinking(session.key, { think: moved, threadId: other.id });
+    assert.ok(ws.seq() > twoThreads, 'the same blob about a different thread is a different fact');
+  });
+
+  test('and a gateway with no session of its own is deduped the same way', () => {
+    const root = ws.messages.post({ channel: 'general', text: '@hermes a question' });
+    ws.agents.externalThinking({ agentId: 'hermes', threadId: root.id, think: trace() });
+    const written = ws.seq();
+    ws.agents.externalThinking({ agentId: 'hermes', threadId: root.id, think: trace() });
+    assert.equal(ws.seq(), written);
+
+    // Resolved to the root, so a repeat aimed at a reply is still a repeat.
+    const reply = ws.messages.post({ channel: 'general', threadId: root.id, text: 'a reply' });
+    const afterReply = ws.seq();
+    ws.agents.externalThinking({ agentId: 'hermes', threadId: reply.id, think: trace() });
+    assert.equal(ws.seq(), afterReply, 'the reply named the same thread the root did');
+  });
+
+  test('the finished trace travels with the message, but never into another agent', () => {
+    const watcher = ws.agents.start({ agentId: 'claude', channel: 'general' });
+    const answered = ws.messages.post({
+      channel: 'general',
+      text: 'here is the answer',
+      author: { id: 'hermes', kind: 'agent', label: 'Hermes' },
+      metadata: {
+        _model: 'sonnet',
+        _effort: 'high',
+        _think: { t: 'Done', p: 'done', s: [{ id: 't1', t: 'Searched' }] },
+      },
+    });
+    assert.ok(ws.messages.get(answered.id).metadata._think, 'the trace is on the message where it was written');
+
+    // `message.created` *is* a conversation event, so leaving `agent.thinking`
+    // out of that list was never what kept the reasoning private.
+    const pulled = ws.agents.pull(watcher.key);
+    const seen = pulled.events.find((e) => e.message?.id === answered.id);
+    assert.ok(seen, 'the message itself still reaches the neighbour');
+    assert.equal(seen.message.metadata._think, undefined, 'without a step-by-step it was not asked for');
+    assert.equal(seen.message.metadata._model, 'sonnet', 'who answered is context it can use');
+    assert.equal(seen.message.metadata._effort, 'high');
+
+    const resumed = ws.agents.resume(watcher.key);
+    assert.ok(resumed.context.length > 0);
+    assert.ok(
+      resumed.context.every((m) => m.metadata?._think === undefined),
+      'the same for the channel context resume hands over'
+    );
+
+    // And the browser, which is who the box was built for, still gets it.
+    const live = ws.hydratedEvents({ since: 0 }).find((e) => e.message?.id === answered.id);
+    assert.ok(live.message.metadata._think, 'the live stream carries the trace it renders');
   });
 });
 

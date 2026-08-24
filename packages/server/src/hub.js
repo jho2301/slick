@@ -11,6 +11,7 @@
 const ACTIVE_POLL_MS = 250;
 const IDLE_POLL_MS = 2000;
 const HEARTBEAT_MS = 20_000;
+const MAX_CLIENT_BUFFER_BYTES = 1_000_000;
 
 export function createHub(ws, opts = {}) {
   const activePoll = opts.activePollMs ?? ACTIVE_POLL_MS;
@@ -25,9 +26,74 @@ export function createHub(ws, opts = {}) {
   // notification is to reach a phone that has no tab open at all.
   let notifiedCursor = ws.seq();
 
+  /**
+   * Stop serving a client and let it come back for itself.
+   *
+   * Deleting from the set mid-iteration is legal, and `flush()` is written to
+   * notice; `schedule()` is here because the poll interval is chosen from
+   * `clients.size`, and the `close` this `end()` provokes only arrives on a
+   * later tick.
+   */
+  function dropClient(client) {
+    clients.delete(client);
+    try {
+      client.res.end();
+    } catch {
+      /* already gone */
+    }
+    schedule();
+  }
+
+  /** @returns {boolean} whether the client is still being served */
   function write(client, event) {
-    if (client.channelId && event.channelId && event.channelId !== client.channelId) return;
+    // The return value of `write()` has been ignored here since the first
+    // version, and that was fair while the only traffic was log rows: a client
+    // too slow for those is a client that has already gone away, and the
+    // socket closes soon enough to clean itself up. Streamed deltas are the
+    // first pattern that can outrun a stalled socket faster than a close
+    // arrives, and every unwritten frame sits in Node's buffer until it does.
+    //
+    // A megabyte behind is not a reader any more — but a log row is the one
+    // thing that must not simply be skipped. `flush()` advances the cursor
+    // whether or not the row went out, so a skipped row is a hole the client
+    // never learns about and no reconnect ever fills. Ending the response is
+    // the recoverable move instead: EventSource comes back within its retry
+    // quoting the last id it really received, and the log replays the gap.
+    if (client.res.writableLength > MAX_CLIENT_BUFFER_BYTES) {
+      dropClient(client);
+      return false;
+    }
+    if (client.channelId && event.channelId && event.channelId !== client.channelId) return true;
     client.res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`);
+    return true;
+  }
+
+  /**
+   * Send a frame that is in no event log at all.
+   *
+   * Deliberately no `id:` line, following `stream.ready`, which has always gone
+   * out without one. `id:` is precisely what the browser stores as
+   * `Last-Event-ID`, and an ephemeral frame has no seq of its own to put there
+   * — it would have to borrow one. A client that then reconnected quoting a
+   * borrowed id would be claiming to have seen a row it never received, and
+   * everything the log wrote up to that seq would be skipped for good. With no
+   * `id:` the browser keeps the last real event id, so a stream that dropped
+   * mid-answer resumes exactly where it would have if nothing had streamed.
+   *
+   * @param {object} frame
+   * @param {{channelId?: string|null}} [options]
+   */
+  function broadcast(frame, { channelId = null } = {}) {
+    const payload = `data: ${JSON.stringify(frame)}\n\n`;
+    for (const client of clients) {
+      // Skipped, where `write()` disconnects, and the asymmetry is the whole
+      // point: a delta has no seq, so there is nothing for a reconnect to
+      // resume from and nothing lost by never sending it. The message it was
+      // a preview of arrives through the log either way.
+      if (client.res.writableLength > MAX_CLIENT_BUFFER_BYTES) continue;
+      if (client.channelId && channelId && channelId !== client.channelId) continue;
+      client.res.write(payload);
+    }
   }
 
   function checkPush(latest) {
@@ -64,14 +130,23 @@ export function createHub(ws, opts = {}) {
     for (const client of clients) {
       if (client.cursor >= latest) continue;
       let cursor = client.cursor;
+      let serving = true;
       // Drain in pages so a long-idle client cannot blow up a single write.
       for (let guard = 0; guard < 20 && cursor < latest; guard++) {
         const batch = ws.hydratedEvents({ since: cursor, limit: 200, channelId: client.channelId });
         if (batch.length === 0) break;
-        for (const event of batch) write(client, event);
+        for (const event of batch) {
+          if (write(client, event)) continue;
+          serving = false;
+          break;
+        }
+        if (!serving) break;
         cursor = batch[batch.length - 1].seq;
       }
-      client.cursor = Math.max(cursor, latest);
+      // A client `write()` gave up on is out of the set already, and its
+      // cursor is left where it stopped rather than jumped to `latest` — the
+      // point of hanging up was that it has *not* seen the rest.
+      if (serving) client.cursor = Math.max(cursor, latest);
     }
   }
 
@@ -159,5 +234,5 @@ export function createHub(ws, opts = {}) {
     clients.clear();
   }
 
-  return { subscribe, wake, close, get size() { return clients.size; } };
+  return { subscribe, broadcast, wake, close, get size() { return clients.size; } };
 }

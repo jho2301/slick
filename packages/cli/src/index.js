@@ -10,7 +10,7 @@ import { resolveWorkspace } from './client.js';
 import { COMMANDS, NO_WORKSPACE, findCommand, printCommandHelp, printHelp } from './commands/index.js';
 import { line, setColor, style } from './output.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.3.0';
 
 /** Exit codes worth branching on from a script. */
 const EXIT = {

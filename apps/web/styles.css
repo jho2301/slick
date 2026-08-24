@@ -439,6 +439,20 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .agent__model.is-set { color: var(--rail-fg); }
+.agent__effort {
+  display: inline-block;
+  margin-left: -5px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--rail-fg-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  opacity: 0.65;
+}
+.agent__effort.is-set { color: var(--rail-fg); opacity: 1; }
+.agent__effort:hover { background: var(--rail-active); color: #fff; opacity: 1; }
 .agent__model:hover { background: var(--rail-active); color: #fff; }
 
 .agent__copy {
@@ -647,6 +661,30 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   color: var(--agent);
 }
 .msg__badge--system { background: var(--bg-sunk); color: var(--fg-faint); }
+/* The model and the level are two chips, and they belong to each other: one
+   wrapper so the header's gap separates the pair from the name rather than
+   the pair from itself, and so they wrap onto a new line together. */
+.msg__badges { display: inline-flex; align-items: baseline; gap: 3px; min-width: 0; }
+/* Quieter than the model beside it: a setting, not a name. Same relationship
+   as the rail's model and effort buttons. */
+.msg__effort {
+  font-family: var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+/* Stands where the `agent` badge used to, and wears its pill — but a model id
+   is a literal name, so it keeps its own case and a monospace face. */
+.msg__model {
+  font-family: var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .msg__edited { font-size: 11px; color: var(--fg-faint); }
 
 .msg__body {
@@ -740,6 +778,310 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   max-width: 100%;
   overflow-x: auto;
   white-space: pre;
+}
+
+/* --------------------------------------------------------------- thinking */
+
+/* The box an agent's working is drawn in: what it looked up, what it ran, in
+   the order it said so. It wears the sunken box the model stamp above wears,
+   and for the same reason — this is the message talking about itself, not part
+   of what it said, and the two should not be told apart by size alone.
+
+   Every colour below is a token. Dark mode in this file is one
+   prefers-color-scheme block that redefines the palette and nothing else;
+   there is no data-theme hook to hang a second set of rules on, so a literal
+   colour here is a colour that is wrong in one of the two themes. */
+
+/* The glyphs, kept beside the rules that use them rather than up with the
+   palette: they are shapes, not colours — the mask picks the shape and the
+   `currentColor` underneath picks the colour, so none of them needs a
+   dark-mode counterpart. Inline because index.html ships
+   `default-src 'self'` with `img-src` widened only to `data:`; an icon fetched
+   from anywhere else would be blocked and simply never draw. */
+:root {
+  --think-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5L10.5 8 6 12.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  /* A ring with one bright quarter — it only reads as turning because the gap
+     goes round, so this is the one glyph that needs its own animation. */
+  --think-ring: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%23000' stroke-width='2' opacity='.3'/%3E%3Cpath d='M8 2a6 6 0 016 6' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --think-dot: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='3.2' fill='none' stroke='%23000' stroke-width='2'/%3E%3C/svg%3E");
+  /* Filled disc, check knocked out of it: one path, `evenodd`, so the tick is
+     the background showing through rather than a second element to colour. */
+  --think-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23000' fill-rule='evenodd' d='M8 0a8 8 0 100 16A8 8 0 008 0zm3.6 5.6a1 1 0 010 1.4l-4 4a1 1 0 01-1.4 0L4.4 9.2a1 1 0 111.4-1.4l1.1 1.1 3.3-3.3a1 1 0 011.4 0z'/%3E%3C/svg%3E");
+  --think-alert: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23000' fill-rule='evenodd' d='M8 0a8 8 0 100 16A8 8 0 008 0zM7 3.6h2l-.35 5.8h-1.3L7 3.6zm1 7.2a1.15 1.15 0 110 2.3 1.15 1.15 0 010-2.3z'/%3E%3C/svg%3E");
+}
+
+.think {
+  /* Deliberately not the width of the pane. The working is an aside about the
+     answer, and a line of it running the full width of a wide window reads as
+     the answer. */
+  max-width: 620px;
+  margin: 3px 0 6px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  /* The head's hover fill runs to the corners otherwise. */
+  overflow: hidden;
+}
+
+.think__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 5px 9px;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+.think__head:hover { background: var(--bg-hover); }
+.think__head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.think__chev {
+  flex: none;
+  display: block;
+  width: 12px; height: 12px;
+  background: currentColor;
+  -webkit-mask: var(--think-chevron) center / contain no-repeat;
+  mask: var(--think-chevron) center / contain no-repeat;
+  color: var(--fg-faint);
+  transition: transform 0.2s ease;
+}
+.think__head[aria-expanded="true"] .think__chev { transform: rotate(90deg); }
+
+.think__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Still going: the agent's own colour, with the light moving across it. The
+   line is the only thing on screen that is still changing, and a summary that
+   updates without any sign it is live looks like a summary that got stuck. */
+.think[data-phase="streaming"] .think__title {
+  color: var(--agent);
+  background: linear-gradient(
+    100deg,
+    var(--agent) 30%,
+    color-mix(in oklab, var(--agent) 30%, var(--fg-faint)) 50%,
+    var(--agent) 70%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: think-shimmer 2.6s linear infinite;
+}
+/* Done, and the answer is underneath it now — so the line stops advertising
+   itself and settles into ordinary body colour. */
+.think[data-phase="done"] .think__title { color: var(--fg); }
+.think[data-phase="error"] .think__title { color: var(--danger); }
+.think[data-phase="error"] { border-color: color-mix(in oklab, var(--danger) 35%, var(--line)); }
+
+/* One mark, four states, told apart by the glyph rather than by colour alone:
+   pending and complete are the same size and the same weight either side of a
+   run, and colour on its own would not survive a monochrome display. */
+.think__mark {
+  flex: none;
+  display: block;
+  width: 13px; height: 13px;
+  background: currentColor;
+  color: var(--fg-faint);
+  -webkit-mask: var(--think-mark-icon, var(--think-dot)) center / contain no-repeat;
+  mask: var(--think-mark-icon, var(--think-dot)) center / contain no-repeat;
+}
+.think__mark[data-status="pending"] {
+  --think-mark-icon: var(--think-dot);
+  animation: think-twinkle 2s ease-in-out infinite;
+}
+.think__mark[data-status="in_progress"] {
+  --think-mark-icon: var(--think-ring);
+  color: var(--agent);
+  animation: think-spin 0.9s linear infinite;
+}
+.think__mark[data-status="complete"] { --think-mark-icon: var(--think-check); color: var(--agent); }
+.think__mark[data-status="error"] { --think-mark-icon: var(--think-alert); color: var(--danger); }
+
+/* The mark in the head needs no rules of its own. It belongs to the box rather
+   than to a step, but the box's phase is handed to it as a step status —
+   streaming is a step in progress, done is a step complete, an error is an
+   error — so the four rules above already draw it, spinner and all, and the
+   collapsed line can still say by itself that something broke inside it. */
+
+/* The collapse. `display: none` would be simpler and is not an option: the
+   steps are content, and content taken out of the box is taken out of the
+   accessibility tree with it — a screen reader would be told the box exists
+   and never told what is in it. A row of `0fr` hides the pixels and keeps the
+   text, and it is also the only way the height animates at all, since `auto`
+   is not a length and has nothing to interpolate towards. */
+.think__body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.2s ease;
+}
+/* `~` rather than `+`, so the rule does not depend on where the box's live
+   region ends up among the head's siblings. It is the only thing collapsing
+   the body — the markup carries no `hidden`, which in this file is
+   `display: none !important` and would take the steps out of the reader's
+   reach and out of the transition with them. */
+.think__head[aria-expanded="true"] ~ .think__body { grid-template-rows: 1fr; }
+/* The row is zero-height; without this the child simply overflows it. */
+.think__body > * { overflow: hidden; min-height: 0; }
+
+/* No padding on the top and bottom of the grid item itself, and this is not a
+   style choice. A `0fr` track is really `minmax(auto, 0fr)`, and the `auto`
+   floor is the item's border-box minimum — `min-height: 0` and `overflow:
+   hidden` take the *content* to zero but leave the padding standing, so
+   `2px` over and `8px` under measured a collapsed box at ten stubborn pixels.
+   The breathing room moves inward, onto the first and last row, where it is
+   margin on a child that clips away with everything else. */
+.think__steps {
+  list-style: none;
+  margin: 0;
+  padding: 0 10px;
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.think__steps > :first-child { margin-top: 2px; }
+.think__steps > :last-child { margin-bottom: 8px; }
+.think__step {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  color: var(--fg-dim);
+}
+/* The step is a two-column grid with one thing in the first column, and every
+   other child belongs under the title rather than beside the mark. Without the
+   explicit column, auto-placement drops the details into the 13px marker
+   column and the output ends up about a character wide. And whatever lands in
+   the text column has to be allowed to shrink, or a long tool name pushes the
+   box past the width chosen above. */
+.think__step > :not(.think__mark) { min-width: 0; grid-column: 2; }
+.think__step .think__mark { margin-top: 2px; }
+/* The way back to the steps that were folded away — a row standing in for the
+   gap, not a control sitting on top of one. It gives up its platform button
+   chrome the way every other in-place control in this file does, and it is
+   indented past the marker column so it starts where the step titles under it
+   start rather than where their marks do. */
+.think__more {
+  padding-left: 21px;
+  color: var(--fg-faint);
+}
+.think__more button {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+}
+.think__more button:hover { color: var(--fg-dim); }
+.think__more button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+/* The step being worked on is the one worth reading; the rest are a record. */
+.think__step[data-status="in_progress"] .think__step-title { color: var(--fg); }
+.think__step[data-status="error"] .think__step-title { color: var(--danger); }
+
+.think__details {
+  list-style: none;
+  margin: 3px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+.think__output {
+  margin-top: 3px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+
+/* A `<ul>`, so it arrives with the browser's bullet and its ~40px indent until
+   it is told otherwise — the same reset `.think__steps` and `.think__details`
+   do above. And the flex items are the `<li>`s each link is wrapped in, not
+   the links themselves, so the shrinking has to be allowed there too. */
+.think__sources {
+  list-style: none;
+  margin: 5px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.think__sources > li { min-width: 0; }
+.think__source {
+  display: block;
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 11px;
+  text-decoration: none;
+}
+.think__source:hover { text-decoration: underline; }
+
+/* Said, not shown: the status suffix on each step, and the box's one live
+   region — which is a sibling of the collapsible body on purpose, because a
+   region announcing from inside a `0fr` row is a region announcing from inside
+   something the browser has been told is not there.
+
+   Clipped rather than hidden, since `display: none` and `visibility: hidden`
+   both take the words out of the accessibility tree along with the pixels. */
+.think__sr, .think__live {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* A draft is the typing bubble with the answer landing inside it rather than
+   beside it. It stops being dimmed the moment there is something to read:
+   0.8 says "not really here", which is right for a placeholder and wrong for
+   the answer itself arriving a word at a time. */
+.msg.is-typing:has(.msg__body:not(.msg__body--typing)) { opacity: 1; }
+.msg.is-typing .think { margin-top: 0; }
+
+@keyframes think-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+@keyframes think-spin {
+  to { transform: rotate(1turn); }
+}
+@keyframes think-twinkle {
+  50% { opacity: 0.4; }
+}
+
+/* The first reduced-motion block in this file, and it needs to cover only what
+   is above it: everything else that folds in this app snaps on purpose. A
+   category collapses by going `hidden`, and the rail's slide moves a column
+   width rather than revealing anything — this box is the only disclosure in
+   Slick where the content itself opens, and an opening box that also shimmers
+   and spins is the exact pile-up this setting exists to stop.
+
+   Nothing load-bearing is lost: the state lives in the chevron's direction,
+   the glyph and `aria-expanded`, none of which move. */
+@media (prefers-reduced-motion: reduce) {
+  .think__title, .think__mark { animation: none; }
+  .think__body, .think__chev { transition: none; }
 }
 
 .msg__thread {
@@ -924,6 +1266,72 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
 .mention-menu li.is-sel { background: var(--accent-soft); }
 .mention-menu .what { font-weight: 600; white-space: nowrap; }
 .mention-menu .where { font-size: 12px; color: var(--fg-faint); white-space: nowrap; }
+
+/* The slash menu is the mention menu with a longer right-hand column: a
+   command's summary is a sentence, not a handle. */
+.command-menu {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 100%;
+  margin-bottom: 6px;
+  list-style: none;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-height: 260px;
+  overflow-y: auto;
+  z-index: 20;
+}
+.command-menu li {
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.command-menu li.is-sel { background: var(--accent-soft); }
+/* Listed, but the agent said it cannot answer it from here. */
+.command-menu li.is-off { opacity: 0.55; }
+.command-menu .what { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+.command-menu .where {
+  font-size: 12px;
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A command's answer: one person's, above their own composer, gone on the
+   next thing they type. It is deliberately not shaped like a message. */
+.composer__out {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-soft, transparent);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.composer__out.is-warn { border-color: var(--danger, #c2410c); }
+.composer__out-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.composer__out-title { font-family: var(--mono); font-size: 12px; color: var(--fg-faint); }
+.composer__out-close {
+  border: 0; background: none; color: var(--fg-faint);
+  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px;
+}
+.composer__out-close:hover { color: var(--fg); }
+.composer__out-body { margin-top: 4px; font-size: 13.5px; }
+.composer__out-body pre { overflow-x: auto; }
 
 .send-btn {
   display: grid; place-items: center;

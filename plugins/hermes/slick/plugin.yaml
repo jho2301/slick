@@ -1,0 +1,68 @@
+name: slick-platform
+label: Slick
+kind: platform
+version: 1.1.0
+description: >
+  Slick gateway adapter for Hermes Agent.
+  Tails a Slick workspace's Server-Sent Events stream and relays channel and
+  thread messages between Slick and the Hermes agent.  No external
+  dependencies — the Slick daemon speaks plain HTTP + SSE, so this adapter
+  uses urllib and asyncio from the standard library only.
+author: fano
+# Nothing is required: ``slickd`` publishes its url and token to
+# ``$SLICK_HOME/daemon.json`` and the adapter reads them from there, so a
+# local workspace needs no configuration at all.  ``requires_env`` would only
+# make ``hermes plugins`` warn about vars that do not have to be set.
+requires_env: []
+# ``optional_env`` entries are surfaced in the ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+optional_env:
+  - name: SLICK_TOKEN
+    description: "Shared token, sent as Authorization: Bearer. Read from ~/.slick/daemon.json when unset; a --no-auth workspace needs none"
+    prompt: "Slick API token (blank = auto)"
+    password: true
+  - name: SLICK_CHANNEL
+    description: "Channel slug to listen on (e.g. general). Default '*' listens to every channel; comma-separate for several"
+    prompt: "Slick channel"
+    password: false
+  - name: SLICK_URL
+    description: "Base URL of the Slick daemon (default: from ~/.slick/daemon.json, else http://127.0.0.1:4477)"
+    prompt: "Slick URL"
+    password: false
+  - name: SLICK_HOME
+    description: "Slick workspace directory holding daemon.json (default: ~/.slick)"
+    prompt: "Slick home"
+    password: false
+  - name: SLICK_HOME_CHANNEL
+    description: "Channel for cron / notification delivery (defaults to SLICK_CHANNEL)"
+    prompt: "Home channel (or empty)"
+    password: false
+  - name: SLICK_ALLOWED_USERS
+    description: >-
+      Comma-separated Slick author ids allowed to talk to the bot ('*' = anyone).
+      REQUIRED to get a reply: this is the allowlist the gateway itself checks,
+      and with no allowlist anywhere it default-denies every sender in silence.
+      Setting allowed_users in config.yaml instead only narrows the adapter's
+      own pre-filter and authorises nobody.
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: SLICK_AGENT_ID
+    description: "Author id Hermes posts under (default: hermes). Must stay agent-kind so replies are not read back as user input"
+    prompt: "Agent id"
+    password: false
+  - name: SLICK_AGENT_LABEL
+    description: "Display name Hermes posts under (default: Hermes)"
+    prompt: "Agent label"
+    password: false
+  - name: SLICK_REQUEST_TIMEOUT
+    description: "Seconds to wait on a REST call (default: 15)"
+    prompt: "Request timeout"
+    password: false
+  - name: SLICK_STREAM_TIMEOUT
+    description: "Seconds of stream silence before reconnecting; must exceed the 20s keepalive (default: 90)"
+    prompt: "Stream timeout"
+    password: false
+  - name: SLICK_RETRY_SECONDS
+    description: "Base delay before reconnecting a dropped stream (default: 2)"
+    prompt: "Retry seconds"
+    password: false
