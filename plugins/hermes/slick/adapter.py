@@ -804,30 +804,82 @@ class _BoundedSet:
 def session_effort(session_id: Any) -> str:
     """How hard Hermes was told to think, out of its own session record.
 
-    The gateway's ``agent:end`` names the model but not the level, and reading
-    the level out of config instead would be a badge that lies the moment the
-    setting moves.  Hermes resolves it once, when a session is created, and
-    writes it into that session's row — so for a thread, whose session is its
-    own, that row is the honest answer.
+    The gateway's ``agent:end`` names the model but not the level, so where
+    Hermes wrote the level down is where it has to be read.  It resolves it
+    when a session is created and writes it into that session's row, and for a
+    thread — whose session is its own — that row is the honest answer.
+
+    It is not, however, a guaranteed one.  A session row can carry no
+    ``reasoning_config`` at all, which is not the same as carrying one that
+    says no level: the first means nobody wrote anything down, the second
+    means thinking was resolved and came out flat.  Only the second is an
+    answer, so the two are told apart here and the caller decides what to do
+    about the gap — see ``effort_for_turn``.
 
     Never raises and never waits long: a badge is a nicety, and a locked or
     missing store is not a reason to hold up a reply.
+
+    :returns: the level, or ``""`` when the row says nothing / does not exist.
     """
+    recorded, level = _session_reasoning(session_id)
+    return level if recorded else ""
+
+
+def _session_reasoning(session_id: Any) -> Tuple[bool, str]:
+    """``(was anything recorded, the level)`` for a session id."""
     key = str(session_id or "").strip()
     if not key or not os.path.isfile(HERMES_STATE_DB):
-        return ""
+        return (False, "")
     try:
         with sqlite3.connect(
             "file:{}?mode=ro".format(urllib.parse.quote(HERMES_STATE_DB)), uri=True, timeout=2
         ) as store:
             row = store.execute(
-                "SELECT json_extract(model_config, '$.reasoning_config.effort') "
+                "SELECT json_extract(model_config, '$.reasoning_config'), "
+                "       json_extract(model_config, '$.reasoning_config.effort') "
                 "FROM sessions WHERE id = ?",
                 (key,),
             ).fetchone()
     except (OSError, sqlite3.Error):
+        return (False, "")
+    if not row or row[0] is None:
+        return (False, "")
+    return (True, str(row[1]).strip() if row[1] else "")
+
+
+def config_effort(model: Any) -> str:
+    """The level Hermes *would* resolve for ``model`` right now, from config.
+
+    The fallback, and deliberately the second choice.  A session's own row is
+    history and stays true; config is today's setting, and reading it for a
+    reply answered yesterday is how a badge starts lying.  It earns its place
+    only where there is no row to prefer — a Hermes that records a session
+    with no ``reasoning_config`` leaves the badge with nothing at all to say,
+    and "what this model is set to think at" beats silence.
+
+    ``resolve_reasoning_config`` is Hermes' own chokepoint for the question,
+    so per-model overrides and a globally disabled ``reasoning_effort`` are
+    honoured here exactly as the agent honours them.  The import is guarded
+    and the failure is silent: this runs inside Hermes, but a badge is still
+    not worth an exception.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+
+        resolved = resolve_reasoning_config(load_config(), str(model or ""))
+    except Exception:
+        logger.debug("Slick: could not resolve reasoning effort from config", exc_info=True)
         return ""
-    return str(row[0]).strip() if row and row[0] else ""
+    if not isinstance(resolved, dict) or resolved.get("enabled") is False:
+        return ""
+    return str(resolved.get("effort") or "").strip()
+
+
+def effort_for_turn(session_id: Any, model: Any) -> str:
+    """The level to badge one reply with: what was recorded, else what is set."""
+    recorded, level = _session_reasoning(session_id)
+    return level if recorded else config_effort(model)
 
 
 def memo_key(chat_id: Any, thread_id: Any) -> str:
@@ -1206,6 +1258,9 @@ class _StreamBridge:
         self._adapter: Optional[Any] = None
         self._logs: "OrderedDict[str, _ThinkLog]" = OrderedDict()
         self._live: "OrderedDict[str, Dict[str, str]]" = OrderedDict()
+        # Distinct `surface` values the stream hooks have arrived with, so the
+        # log says once what this host actually sends. See `_note_surface`.
+        self._seen_surfaces: set = set()
         self._hooks: Optional[Tuple[Tuple[str, Any], ...]] = None
         # Routes a workspace turns out not to have.  An older daemon would
         # otherwise be asked for one that does not exist every 150ms, forever.
@@ -1363,10 +1418,40 @@ class _StreamBridge:
 
     # -- routing -----------------------------------------------------------
 
+    def _note_surface(self, surface: str) -> None:
+        """Say once, per distinct value, which surface the stream hooks name.
+
+        Whether a transport sets ``agent.platform`` at all is the difference
+        between live progress and silence, it varies by provider, and it is
+        invisible from the outside — the deltas simply never arrive. One line
+        the first time each value is seen turns that into something a log can
+        answer, at the cost of nothing on every delta after it.
+        """
+        with self._lock:
+            if surface in self._seen_surfaces:
+                return
+            self._seen_surfaces.add(surface)
+        logger.info(
+            "Slick: stream hooks arriving with surface=%r (%s)",
+            surface,
+            "routing by the live turn" if not surface else "named",
+        )
+
     def _stream_thread(self, payload: Dict[str, Any]) -> Optional[str]:
-        """Which Slick thread a streamed token belongs to, or None."""
-        if str(payload.get(SURFACE_KEY) or "") != PLATFORM_NAME:
+        """Which Slick thread a streamed token belongs to, or None.
+
+        The surface is an *exclusion* test, not an admission test. A payload
+        that names another surface is certainly not ours and is dropped; a
+        payload that names none is judged the same way the tool hooks are, on
+        whether a Slick turn is the one in flight. ``surface`` is
+        ``agent.platform``, and the transports do not all set it — the codex
+        runtimes in particular fire deltas from a subprocess bridge that never
+        learned which platform asked. Requiring it there cost every delta.
+        """
+        surface = str(payload.get(SURFACE_KEY) or "")
+        if surface and surface != PLATFORM_NAME:
             return None
+        self._note_surface(surface)
         thread_id = str((_TURN_TARGET.get() or {}).get("thread_id") or "")
         if thread_id:
             return thread_id
@@ -1673,8 +1758,11 @@ class SlickAdapter(BasePlatformAdapter):
         key = memo_key(chat_id, thread_id)
         self._turn_models.put(key, normalise_model(context.get("model")))
         # The hook says which model ran but not how hard it was told to think,
-        # so that comes from the session Hermes just wrote.
-        self._turn_efforts.put(key, session_effort(context.get("session_id")))
+        # so that comes from the session Hermes just wrote — and, where it
+        # wrote nothing, from what the model is set to think at today.
+        self._turn_efforts.put(
+            key, effort_for_turn(context.get("session_id"), context.get("model"))
+        )
 
     def _memo_keys(
         self,

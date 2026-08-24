@@ -1607,6 +1607,55 @@ class TestModelBadge(EnvSandbox, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(adapter.session_effort(""), "")
             self.assertEqual(adapter.session_effort(None), "")
 
+    def test_a_session_that_recorded_nothing_falls_back_to_what_is_set(self) -> None:
+        """A row with no reasoning_config at all is a gap, not an answer.
+
+        Hermes does not always write the block — a gateway session can land
+        with only its runtime in `model_config` — and a badge that goes quiet
+        because of that is reporting on Hermes' bookkeeping rather than on the
+        reply. Where nothing was recorded, today's setting is what is left.
+        """
+        store = self._state_db(
+            {
+                "s-recorded": '{"reasoning_config": {"enabled": true, "effort": "max"}}',
+                "s-flat": '{"reasoning_config": {"enabled": false}}',
+                "s-gap": '{"gateway_runtime": {"provider": "openai-codex"}}',
+            }
+        )
+        with unittest.mock.patch.object(adapter, "HERMES_STATE_DB", store):
+            with unittest.mock.patch.object(adapter, "config_effort", return_value="high"):
+                # A row that says something is believed, including when what it
+                # says is "no level" — that is resolved, not missing.
+                self.assertEqual(adapter.effort_for_turn("s-recorded", "m"), "max")
+                self.assertEqual(adapter.effort_for_turn("s-flat", "m"), "")
+                # A row that says nothing falls through to the config.
+                self.assertEqual(adapter.effort_for_turn("s-gap", "m"), "high")
+                self.assertEqual(adapter.effort_for_turn("never-existed", "m"), "high")
+
+    def test_config_effort_never_raises_and_honours_disabled(self) -> None:
+        """The fallback runs inside Hermes, but a badge is not worth a crash."""
+        # No hermes_cli/hermes_constants on the path under test → silent "".
+        with unittest.mock.patch.dict("sys.modules", {"hermes_cli.config": None}):
+            self.assertEqual(adapter.config_effort("m"), "")
+        fake = unittest.mock.Mock(return_value={"enabled": False, "effort": "max"})
+        with unittest.mock.patch.dict(
+            "sys.modules",
+            {
+                "hermes_cli.config": unittest.mock.Mock(load_config=lambda: {}),
+                "hermes_constants": unittest.mock.Mock(resolve_reasoning_config=fake),
+            },
+        ):
+            self.assertEqual(adapter.config_effort("m"), "", "thinking off is not a level")
+        fake = unittest.mock.Mock(return_value={"enabled": True, "effort": "xhigh"})
+        with unittest.mock.patch.dict(
+            "sys.modules",
+            {
+                "hermes_cli.config": unittest.mock.Mock(load_config=lambda: {}),
+                "hermes_constants": unittest.mock.Mock(resolve_reasoning_config=fake),
+            },
+        ):
+            self.assertEqual(adapter.config_effort("m"), "xhigh")
+
     def test_a_missing_or_broken_store_costs_a_badge_and_nothing_else(self) -> None:
         with unittest.mock.patch.object(adapter, "HERMES_STATE_DB", "/nowhere/state.db"):
             self.assertEqual(adapter.session_effort("s-max"), "")

@@ -11,3 +11,9 @@ shots/
 *.db-shm
 
 .DS_Store
+
+# Hermes loads plugins/hermes/slick through a symlink from ~/.hermes/plugins,
+# so the gateway compiles into the repo. The repo is the single source of truth
+# for the plugin; its bytecode is not.
+__pycache__/
+*.pyc
