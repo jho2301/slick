@@ -1,5 +1,3 @@
-// The shape the daemon's build-stamp rewrite looks for: a single-quoted
-// placeholder it replaces with the digest of the tree it is serving.
-const BUILD = '__BUILD__';
+// A stand-in for the built worker: served byte for byte, never rewritten.
 self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', () => console.log('test worker', BUILD));
+self.addEventListener('activate', () => console.log('test worker'));

@@ -1,0 +1,21 @@
+{
+  // The browser half. Vite bundles this, so the module settings are the
+  // bundler's rather than Node's; the strictness is the shared base's.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": ".tsbuild",
+    "rootDir": ".",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "jsx": "react-jsx",
+    "types": ["vite/client", "node"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx", "vite.config.ts"],
+  // The service worker has a different global scope; see tsconfig.sw.json.
+  "exclude": ["src/sw.ts"],
+  "references": [{ "path": "../../packages/core" }]
+}

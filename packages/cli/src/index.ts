@@ -10,7 +10,7 @@ import { resolveWorkspace, type ResolvedWorkspace } from './client.ts';
 import { COMMANDS, NO_WORKSPACE, findCommand, printCommandHelp, printHelp } from './commands/index.ts';
 import { line, setColor, style } from './output.ts';
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 
 /** Exit codes worth branching on from a script. */
 const EXIT = {

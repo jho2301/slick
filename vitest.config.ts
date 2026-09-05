@@ -23,12 +23,28 @@ const nodeProject = (name: string, dir: string): TestProjectConfiguration => ({
   },
 });
 
+/**
+ * The browser app, in jsdom. What jsdom lacks — `<dialog>`, `matchMedia`,
+ * `EventSource`, `CSS.escape` — the setup file stubs, so a component test
+ * exercises the same code the page runs.
+ */
+const webProject: TestProjectConfiguration = {
+  test: {
+    name: 'web',
+    environment: 'jsdom',
+    include: ['apps/web/test/**/*.test.{ts,tsx}'],
+    setupFiles: ['apps/web/test/setup.ts'],
+    testTimeout: 20_000,
+  },
+};
+
 export default defineConfig({
   test: {
     projects: [
       nodeProject('core', 'packages/core'),
       nodeProject('server', 'packages/server'),
       nodeProject('cli', 'packages/cli'),
+      webProject,
     ],
   },
 });

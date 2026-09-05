@@ -1,6 +1,15 @@
 import { test, describe, beforeAll, afterAll } from 'vitest';
 import assert from 'node:assert/strict';
-import { cpSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1112,33 +1121,30 @@ describe('web UI hosting', () => {
     assert.match(res.headers.get('content-type') ?? '', /application\/manifest\+json/);
 
     const manifest = (await res.json()) as { start_url: string; name: string; icons: unknown[] };
-    assert.equal(manifest.start_url, `./?token=${encodeURIComponent(TOKEN)}`);
-    // Relative, so it survives the daemon coming up on another port, and inside
-    // `scope` — a start_url outside it is not installable at all.
-    assert.ok(manifest.start_url.startsWith('./'));
+    assert.equal(manifest.start_url, `/?token=${encodeURIComponent(TOKEN)}`);
+    // Origin-relative, so it survives the daemon coming up on another port,
+    // and inside `scope` — a start_url outside it is not installable at all.
+    assert.ok(manifest.start_url.startsWith('/'));
     assert.equal(manifest.name, 'Slick');
     assert.ok(manifest.icons.length >= 2);
   });
 
-  // A worker is only replaced when its own bytes change. Without a stamp in
-  // it, a shell that ships new JS behind an unchanged sw.js leaves every
-  // installed app on the worker — and the cache — it already has.
-  test('the service worker carries the build it belongs to', async () => {
+  // The worker is a build artefact like the rest of the shell: the bundler
+  // writes the build's file list into it, so it changes whenever the UI does
+  // and the daemon serves it exactly as it is on disk.
+  test('the service worker is served as built, never cached', async () => {
     const res = await fetch(`${base}/sw.js`, { headers: { authorization: `Bearer ${TOKEN}` } });
     assert.equal(res.status, 200);
     assert.match(res.headers.get('content-type') ?? '', /text\/javascript/);
+    assert.match(res.headers.get('cache-control') ?? '', /no-cache/);
+    assert.equal(await res.text(), readFileSync(join(webRoot, 'sw.js'), 'utf8'));
 
-    const source = await res.text();
-    assert.doesNotMatch(source, /__BUILD__/, 'the placeholder should have been replaced');
-    const stamp = /const BUILD = ["']([0-9a-f]+)["']/.exec(source)?.[1];
-    assert.ok(stamp, 'the worker should name a build');
-
-    // The same build the daemon reports, or the app cannot tell whether the
-    // worker it is running is the one being served.
+    // The build the daemon reports is what tells an installed app it is out
+    // of date, so it has to be there whether or not a worker was rewritten.
     const health = (await fetch(`${base}/api/health`, {
       headers: { authorization: `Bearer ${TOKEN}` },
-    }).then((r) => r.json())) as { build: string };
-    assert.equal(health.build, stamp);
+    }).then((r) => r.json())) as { build: string | null };
+    assert.equal(health.build, buildStamp(webRoot));
   });
 
   test('and the build changes when the UI does', async () => {

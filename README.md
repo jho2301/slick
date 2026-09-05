@@ -28,8 +28,11 @@ change to the app, whoever made it.
 
 ## Install
 
-Needs Node 22.5 or newer (for the built-in `node:sqlite` — there is nothing to
-compile).
+Needs Node 22.18 or newer: the built-in `node:sqlite` means there is nothing
+to compile, and every package is TypeScript that Node runs as it is. The web
+UI is the one thing that gets built — `npm install` does it on the way in
+(Vite, into `packages/server/public`), and `npm run build` redoes it after a
+change.
 
 ```bash
 npm install
@@ -530,27 +533,44 @@ file to turn auth back on.
 
 ```
 packages/core      storage + domain rules (channels, categories, threads, messages, agents)
-packages/server    the daemon: REST, live SSE stream, hosts the web UI
+packages/server    the daemon: REST, live SSE stream, serves the built web UI
 packages/cli       the `slick` command
-apps/web           the UI — plain ES modules, no build step
+apps/web           the UI — React and jotai, built by Vite into packages/server/public
 apps/desktop       the Electron shell around it
-scripts            demo seeding, UI smoke test, screenshots
+scripts            demo seeding, the dev server, UI smoke test, screenshots
 ```
 
 `@slick/core` holds every rule. The CLI calls it directly; the server exposes
 it over HTTP; the app calls the server. There is exactly one implementation of
 "what happens when you post a message", so the two front ends cannot drift.
+The wire types are `@slick/core`'s too — a message is one TypeScript type
+whether the daemon is writing it or the browser is drawing it.
+
+Everything is TypeScript. The Node packages run their `.ts` sources directly
+(Node strips the types; there is no compile step and no loader), `tsc -b`
+checks them, and `npm run check` runs the type check, the lint, the format
+check and every test in one go. The vocabulary the code uses is written down in
+[CONTEXT.md](./CONTEXT.md).
 
 ## Tests
 
 ```bash
-npm test              # 201 tests: core, HTTP API, and the CLI end to end
-npm run smoke:ui      # loads the real UI in Electron and drives it
+npm test              # 534 tests: core, HTTP API, the CLI end to end, and the web app in jsdom
+npm run smoke:ui      # builds the UI, loads it in Electron and drives it
 npm run shots         # screenshots of the UI into $SLICK_HOME/shots
+npm run dev           # the UI with hot reload, on a throwaway seeded workspace
 ```
 
 The CLI suite spawns the real binary for every assertion, so agent resume is
-tested the way it is actually used: across separate processes.
+tested the way it is actually used: across separate processes. The web suite
+renders components into jsdom and drives the store the same way the live
+stream does. `npm run dev` seeds a workspace under the system temp directory
+and points Vite at a daemon of its own; set `SLICK_API_URL` to work against
+the one you already have running.
+
+The smoke test and the screenshots run against whatever `SLICK_HOME` says, so
+point it at a throwaway directory seeded with `scripts/seed-demo.mjs` rather
+than at your real workspace.
 
 In an environment that is already sandboxed (CI, containers), Chromium cannot
 nest its own sandbox:

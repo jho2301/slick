@@ -1,0 +1,22 @@
+{
+  "name": "@slick/web",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "description": "Slick web UI — the same app the desktop shell and a browser tab load from the daemon",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@slick/core": "^0.6.0",
+    "jotai": "^2.20.3",
+    "markdown-it": "^15.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}

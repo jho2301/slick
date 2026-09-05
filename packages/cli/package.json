@@ -1,6 +1,6 @@
 {
   "name": "@slick/cli",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "description": "slick — command line access to your workspace, for humans and agents",
@@ -9,8 +9,8 @@
     "slick": "./bin/slick.js"
   },
   "dependencies": {
-    "@slick/core": "^0.5.0",
-    "@slick/server": "^0.5.0"
+    "@slick/core": "^0.6.0",
+    "@slick/server": "^0.6.0"
   },
   "engines": {
     "node": ">=22.18.0"

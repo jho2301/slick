@@ -15,17 +15,11 @@ import { Workspace, isRecord } from '@slick/core';
 import { createRoutes, RAW } from './routes.ts';
 import { createHub, type Hub } from './hub.ts';
 import { createPushService, type PushService } from './push.ts';
-import {
-  buildStamp,
-  createStaticHandler,
-  manifestWithToken,
-  resolveWebRoot,
-  serviceWorkerWithBuild,
-} from './static.ts';
+import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot } from './static.ts';
 import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.ts';
 import type { Env } from './hermes.ts';
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 const COOKIE = 'slick_token';
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -196,21 +190,9 @@ export function createServer(opts: ServerOptions = {}) {
         }
       }
 
-      // Also ahead of the static handler: the copy on disk has a placeholder
-      // where the build stamp goes. See `serviceWorkerWithBuild`.
-      if (req.method === 'GET' && url.pathname === '/sw.js') {
-        const source = serviceWorkerWithBuild(webRoot, buildStamp(webRoot));
-        if (source !== null) {
-          res.writeHead(200, {
-            'content-type': 'text/javascript; charset=utf-8',
-            'content-length': Buffer.byteLength(source),
-            'cache-control': 'no-cache',
-          });
-          res.end(source);
-          return;
-        }
-      }
-
+      // The service worker is served as built: the bundler folds the build's
+      // own file list into it, so any change to the UI is a change to the
+      // worker without the daemon rewriting anything on the way out.
       if (req.method === 'GET' && serveStatic(req, res, url.pathname)) return;
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('Not found');

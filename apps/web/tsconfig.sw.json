@@ -1,0 +1,17 @@
+{
+  // The service worker alone: it runs in a worker scope, and the `webworker`
+  // lib cannot share a program with `dom`.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": ".tsbuild/sw",
+    "rootDir": ".",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2024", "webworker"],
+    "types": []
+  },
+  "include": ["src/sw.ts"]
+}

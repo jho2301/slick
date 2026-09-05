@@ -45,19 +45,13 @@ const IMMUTABLE_PREFIX = '/assets/';
 const here = dirname(fileURLToPath(import.meta.url));
 
 /**
- * Find the UI whether we run from the repo or from a build.
- *
- * The built bundle in `packages/server/public` wins over the source tree, so a
- * checkout that has been built serves the build and one that has not falls
- * back to whatever the web app's directory holds.
+ * Find the UI: an explicit root, `SLICK_WEB_ROOT`, or the built bundle in
+ * `packages/server/public` — what `npm run build` makes and `npm install`
+ * makes on the way in. A checkout that has never been built serves nothing,
+ * and `slick doctor` says so.
  */
 export function resolveWebRoot(explicit?: string | null): string | null {
-  const candidates = [
-    explicit,
-    process.env.SLICK_WEB_ROOT,
-    resolve(here, '../public'),
-    resolve(here, '../../../apps/web'),
-  ];
+  const candidates = [explicit, process.env.SLICK_WEB_ROOT, resolve(here, '../public')];
   for (const candidate of candidates) {
     if (!candidate) continue;
     if (existsSync(join(candidate, 'index.html'))) return resolve(candidate);
@@ -88,9 +82,9 @@ export function manifestWithToken(webRoot: string | null, token: string | null):
   try {
     const manifest: unknown = JSON.parse(readFileSync(file, 'utf8'));
     if (!isRecord(manifest)) return null;
-    // Relative, so it keeps working whatever port the daemon came up on, and
-    // stays inside `scope` — a start_url outside it is not installable.
-    manifest.start_url = `./?token=${encodeURIComponent(token)}`;
+    // Origin-relative, so it keeps working whatever port the daemon came up
+    // on, and inside `scope` — a start_url outside it is not installable.
+    manifest.start_url = `/?token=${encodeURIComponent(token)}`;
     return JSON.stringify(manifest);
   } catch {
     return null;
@@ -125,31 +119,6 @@ export function buildStamp(webRoot: string | null): string | null {
     hash.update(`${String(entry)}:${stat.size}:${Math.round(stat.mtimeMs)}\n`);
   }
   return hash.digest('hex').slice(0, 10);
-}
-
-/**
- * The service worker, with the build stamp folded into it.
- *
- * A worker is only replaced when its own bytes change, so a shell that ships
- * new JS behind an unchanged `sw.js` leaves every installed app on the worker
- * it already has — and a phone that is resumed rather than relaunched can sit
- * on that for weeks. Folding the stamp in makes any change to the UI a change
- * to the worker, which is the one thing browsers do check for on their own.
- *
- * @returns the source, or null if there is no worker to serve
- */
-export function serviceWorkerWithBuild(webRoot: string | null, stamp: string | null): string | null {
-  if (!webRoot || !stamp) return null;
-  const file = join(resolve(webRoot), 'sw.js');
-  if (!existsSync(file)) return null;
-  try {
-    const source = readFileSync(file, 'utf8');
-    // Served raw (no daemon in front of it) the placeholder stands, and the
-    // worker still works — it just stops noticing builds on its own.
-    return source.replace("'__BUILD__'", JSON.stringify(stamp));
-  } catch {
-    return null;
-  }
 }
 
 export type StaticHandler = (req: IncomingMessage, res: ServerResponse, pathname: string) => boolean;

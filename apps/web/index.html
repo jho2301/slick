@@ -3,238 +3,33 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; connect-src 'self'" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; connect-src 'self'"
+    />
     <title>Slick</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='23' font-size='20' font-family='system-ui' font-weight='700' fill='white' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Ctext x='16' y='23' font-size='20' font-family='system-ui' font-weight='700' fill='white' text-anchor='middle'%3ES%3C/text%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="./styles.css" />
 
     <!-- A manifest is fetched with credentials omitted unless it says otherwise
          — which against a daemon that wants a token on everything means a 401,
-         no manifest, and a browser that never offers to install the app. -->
-    <link rel="manifest" href="./manifest.webmanifest" crossorigin="use-credentials" />
+         no manifest, and a browser that never offers to install the app.
+         Absolute paths for it and the icons: they live in `public/` and are
+         served as they are, so the daemon can rewrite the manifest's
+         `start_url` on the way out. -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#16171d" media="(prefers-color-scheme: dark)" />
-    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Slick" />
   </head>
   <body>
-    <div id="app" class="app is-loading">
-      <aside class="rail" id="rail">
-        <header class="rail__head">
-          <div class="rail__workspace">
-            <span class="rail__mark">S</span>
-            <div>
-              <div class="rail__title" id="workspace-name">Slick</div>
-              <div class="rail__user" id="workspace-user"></div>
-            </div>
-          </div>
-          <button class="icon-btn icon-btn--ghost" id="btn-search" title="Search (⌘K)" aria-label="Search">
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M9 3a6 6 0 104.47 10.03l3.25 3.25 1.06-1.06-3.25-3.25A6 6 0 009 3zm0 1.5a4.5 4.5 0 110 9 4.5 4.5 0 010-9z"/></svg>
-          </button>
-          <button
-            class="icon-btn icon-btn--ghost"
-            id="btn-settings"
-            title="Menu"
-            aria-label="Menu"
-            aria-haspopup="dialog"
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14v1.7H3zM3 9.15h14v1.7H3zM3 13.3h14V15H3z"/></svg>
-          </button>
-        </header>
-
-        <nav class="rail__scroll" id="rail-scroll">
-          <!-- One section per category, rendered by app.js; the bucket below
-               holds every channel that is not in one. -->
-          <div id="category-sections"></div>
-
-          <section class="rail__section" id="channels-section">
-            <button class="rail__heading" id="toggle-channels" aria-expanded="true">
-              <span class="rail__chev">▾</span> Channels
-            </button>
-            <ul class="channel-list" id="channel-list"></ul>
-          </section>
-
-          <section class="rail__section rail__section--archived" id="archived-section" hidden>
-            <button class="rail__heading" id="toggle-archived" aria-expanded="false">
-              <span class="rail__chev">▸</span> Archived
-            </button>
-            <ul class="channel-list" id="archived-list" hidden></ul>
-          </section>
-        </nav>
-
-        <!-- Pinned under the scroller so it stays put rather than scrolling
-             away with the channels. Folded by default — a default you have
-             already set is not something to keep an eye on.
-
-             This is Hermes' own configuration, not Slick's: the provider and
-             model a profile hands out when no conversation has said otherwise.
-             A single chat's model is a different setting with a different
-             editor (`/model`), and the panel says so. -->
-        <section class="rail__section rail__pinned" id="hermes-section">
-          <button class="rail__heading" id="toggle-hermes" aria-expanded="false">
-            <span class="rail__chev">▸</span> Hermes
-          </button>
-          <div class="hermes" id="hermes-panel" hidden></div>
-        </section>
-
-        <!-- The account's own limits, deliberately *not* inside the folded
-             panel above. Those are settings, kept out of the way because they
-             are already decided; this is a number that moves on its own and is
-             worth seeing without opening anything. Hidden entirely for a
-             provider that has no limits to report. -->
-        <section class="rail__section rail__pinned rail__pinned--limits" id="hermes-limits-section" hidden>
-          <h2 class="rail__heading rail__heading--static rail__heading--row" id="hermes-limits-heading">
-            <span class="rail__heading-text">OpenAI limits</span>
-            <span class="hermes__usage-head" id="hermes-limits-head"></span>
-          </h2>
-          <div class="hermes" id="hermes-limits"></div>
-        </section>
-
-        <footer class="rail__foot">
-          <span class="dot" id="conn-dot"></span>
-          <span id="conn-label">connecting…</span>
-        </footer>
-      </aside>
-
-      <main class="main" id="main">
-        <header class="chan-head" id="chan-head">
-          <div class="chan-head__left">
-            <button class="icon-btn icon-btn--ghost only-narrow" id="btn-menu" aria-label="Back to channels">
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 3.5L6 10l6.5 6.5 1.4-1.4L8.8 10l5.1-5.1z"/></svg>
-            </button>
-            <!-- Wide viewports only: down where the rail is the whole screen
-                 there is nothing to collapse it away from. -->
-            <button
-              class="icon-btn icon-btn--ghost only-wide"
-              id="btn-rail"
-              title="Hide sidebar (⌘B)"
-              aria-label="Hide sidebar"
-              aria-expanded="true"
-              aria-controls="rail"
-            >
-              <svg viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M3.5 3h13A1.5 1.5 0 0118 4.5v11a1.5 1.5 0 01-1.5 1.5h-13A1.5 1.5 0 012 15.5v-11A1.5 1.5 0 013.5 3zm0 1.5v11H8v-11H3.5zm6 0v11h7v-11h-7z"/>
-              </svg>
-            </button>
-            <h1 class="chan-head__title" id="chan-title">#general</h1>
-            <button class="chan-head__topic" id="chan-topic" title="Edit topic"></button>
-          </div>
-          <div class="chan-head__actions">
-            <button class="chip" id="btn-edit-channel">Edit</button>
-            <button class="chip" id="btn-archive-channel">Archive</button>
-            <button class="chip chip--danger" id="btn-delete-channel">Delete</button>
-          </div>
-        </header>
-
-        <div class="timeline" id="timeline">
-          <div class="timeline__inner" id="messages"></div>
-        </div>
-
-        <button class="jump" id="btn-jump" hidden>Jump to latest ↓</button>
-
-        <form class="composer" id="composer">
-          <div class="composer__box">
-            <div class="composer__out" id="composer-out" hidden></div>
-            <ul class="command-menu" id="command-menu-main" hidden></ul>
-            <ul class="mention-menu" id="mention-menu-main" hidden></ul>
-            <textarea
-              id="composer-input"
-              class="composer__input"
-              rows="1"
-              placeholder="Message"
-              autocomplete="off"
-              spellcheck="true"
-            ></textarea>
-            <div class="composer__row">
-              <span class="composer__hint">
-                <b>Enter</b> to send · <b>Shift+Enter</b> for a new line
-              </span>
-              <button type="submit" class="send-btn" id="btn-send" disabled aria-label="Send">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10l16-7-7 16-2-6-7-3z"/></svg>
-              </button>
-            </div>
-          </div>
-        </form>
-      </main>
-
-      <aside class="thread" id="thread" hidden>
-        <!-- Laid over this pane's left border rather than given a column of its
-             own, so the split costs the layout nothing. Inside the thread and
-             not beside it for the same reason: out here it would be a grid item
-             and would have to be styled to stop being one. -->
-        <div
-          class="pane-resizer"
-          id="thread-resizer"
-          role="separator"
-          aria-orientation="vertical"
-          aria-label="Resize thread panel"
-          tabindex="0"
-          title="Drag to resize · double-click to reset"
-        ></div>
-        <header class="thread__head">
-          <div class="thread__head-left">
-            <button class="icon-btn icon-btn--ghost only-narrow" id="btn-thread-back" aria-label="Back to channel">
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M12.5 3.5L6 10l6.5 6.5 1.4-1.4L8.8 10l5.1-5.1z"/></svg>
-            </button>
-            <div>
-              <div class="thread__title">Thread</div>
-              <div class="thread__sub" id="thread-sub"></div>
-            </div>
-          </div>
-          <button class="icon-btn icon-btn--ghost" id="btn-close-thread" aria-label="Close thread">✕</button>
-        </header>
-        <div class="thread__scroll" id="thread-body"></div>
-        <form class="composer composer--thread" id="thread-composer">
-          <div class="composer__box">
-            <div class="composer__out" id="thread-composer-out" hidden></div>
-            <ul class="command-menu" id="command-menu-thread" hidden></ul>
-            <ul class="mention-menu" id="mention-menu-thread" hidden></ul>
-            <textarea id="thread-input" class="composer__input" rows="3" placeholder="Reply…"></textarea>
-            <button type="submit" class="send-btn" id="btn-thread-send" disabled aria-label="Send reply">
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2 10l16-7-7 16-2-6-7-3z"/></svg>
-            </button>
-          </div>
-        </form>
-      </aside>
-    </div>
-
-    <dialog class="modal" id="modal">
-      <form method="dialog" id="modal-form">
-        <h2 class="modal__title" id="modal-title">Title</h2>
-        <div class="modal__body" id="modal-body"></div>
-        <footer class="modal__foot">
-          <div class="modal__extra" id="modal-extra" hidden></div>
-          <button type="button" class="btn btn--ghost" id="modal-cancel">Cancel</button>
-          <button type="submit" class="btn btn--primary" id="modal-ok">Save</button>
-        </footer>
-      </form>
-    </dialog>
-
-    <dialog class="modal settings" id="settings" aria-label="Settings">
-      <header class="settings__head">
-        <h2>Settings</h2>
-        <button class="icon-btn icon-btn--ghost" id="btn-close-settings" aria-label="Close settings">✕</button>
-      </header>
-      <div class="settings__body" id="settings-body"></div>
-    </dialog>
-
-    <div class="palette" id="palette" hidden>
-      <div class="palette__box">
-        <input
-          id="palette-input"
-          class="palette__input"
-          placeholder="Jump to a channel, or type to search messages…"
-          autocomplete="off"
-        />
-        <ul class="palette__results" id="palette-results"></ul>
-        <div class="palette__foot"><b>↑↓</b> move · <b>Enter</b> open · <b>Esc</b> close</div>
-      </div>
-    </div>
-
-    <div class="toasts" id="toasts"></div>
-
-    <script type="module" src="./js/app.js"></script>
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
   </body>
 </html>

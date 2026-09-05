@@ -3,7 +3,6 @@ node_modules/
 dist/
 packages/server/public/
 apps/web/dev-dist/
-apps/web-legacy/
 package-lock.json
 plugins/
 scripts/
@@ -16,3 +15,5 @@ shots/
 *.md
 *.yaml
 *.yml
+# Kept byte for byte from the previous UI; not reformatted.
+apps/web/styles.css

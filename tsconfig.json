@@ -8,6 +8,8 @@
     { "path": "packages/core" },
     { "path": "packages/server" },
     { "path": "packages/cli" },
-    { "path": "apps/desktop" }
+    { "path": "apps/desktop" },
+    { "path": "apps/web" },
+    { "path": "apps/web/tsconfig.sw.json" }
   ]
 }

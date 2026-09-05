@@ -16,7 +16,6 @@ export default tseslint.config(
       '**/.tsbuild/**',
       '**/dist/**',
       'packages/server/public/**',
-      'apps/web-legacy/**',
       'apps/web/dev-dist/**',
       '.claude/**',
       '.agents/**',
@@ -34,7 +33,8 @@ export default tseslint.config(
   {
     languageOptions: {
       parserOptions: {
-        projectService: true,
+        // The root runner config belongs to no package; lint it on its own.
+        projectService: { allowDefaultProject: ['vitest.config.ts'] },
         tsconfigRootDir: import.meta.dirname,
       },
       globals: globals.node,
