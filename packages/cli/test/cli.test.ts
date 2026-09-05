@@ -1,26 +1,27 @@
-import { test, describe, before, after } from 'node:test';
+import { test, describe, beforeAll, afterAll } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { createServer } from 'node:http';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parse, withGlobals } from '../src/args.js';
+import { parse, withGlobals } from '../src/args.ts';
 
 const BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../bin/slick.js');
 const FAKE_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/fake-agent.js');
 const PLAIN_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/plain-agent.js');
 const STDERR_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/stderr-agent.js');
 const STREAM_AGENT = resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/stream-agent.js');
-let home;
+let home: string;
 
-before(() => {
+beforeAll(() => {
   home = mkdtempSync(join(tmpdir(), 'slick-cli-'));
 });
 
-after(() => {
+afterAll(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -28,7 +29,15 @@ after(() => {
  * Run the real binary in a real subprocess. Every call is a cold start, which
  * is exactly the situation `slick agent resume` exists for.
  */
-function slick(args, opts = {}) {
+interface Run {
+  code: number;
+  stdout: string;
+  stderr: string;
+  /** Parsed stdout when it was JSON; loosely typed so assertions read like the CLI's own output. */
+  json: any;
+}
+
+function slick(args: string[], opts: { env?: Record<string, string> } = {}): Promise<Run> {
   return new Promise((done) => {
     execFile(
       process.execPath,
@@ -38,13 +47,13 @@ function slick(args, opts = {}) {
         encoding: 'utf8',
       },
       (err, stdout, stderr) => {
-        let json = null;
+        let json: unknown = null;
         try {
           json = JSON.parse(stdout);
         } catch {
           /* human output */
         }
-        done({ code: err?.code ?? 0, stdout: stdout.trim(), stderr: stderr.trim(), json });
+        done({ code: Number(err?.code ?? 0), stdout: stdout.trim(), stderr: stderr.trim(), json });
       }
     );
   });
@@ -94,26 +103,31 @@ describe('the basics', () => {
   });
 
   test('reads message text from a pipe', async () => {
-    const result = await new Promise((done) => {
+    const result = await new Promise<any>((done) => {
       const child = execFile(
         process.execPath,
         [BIN, 'send', 'general', '-', '--json'],
         { env: { ...process.env, SLICK_HOME: home, NO_COLOR: '1' }, encoding: 'utf8' },
         (err, stdout) => done(JSON.parse(stdout))
       );
-      child.stdin.end('piped in\n');
+      child.stdin?.end('piped in\n');
     });
     assert.equal(result.message.text, 'piped in');
   });
 
   test('channel lifecycle', async () => {
-    assert.equal((await slick(['channel', 'create', 'cli-room', '--topic', 'made by a test', '--json'])).code, 0);
+    assert.equal(
+      (await slick(['channel', 'create', 'cli-room', '--topic', 'made by a test', '--json'])).code,
+      0
+    );
     const shown = await slick(['channel', 'show', 'cli-room', '--json']);
     assert.equal(shown.json.channel.topic, 'made by a test');
     await slick(['channel', 'update', 'cli-room', '--rename', 'cli-den', '--json']);
     assert.equal((await slick(['channel', 'show', 'cli-room'])).code, 4, 'old name is gone');
     await slick(['channel', 'archive', 'cli-den']);
-    assert.ok(!(await slick(['channel', 'list', '--json'])).json.channels.some((c) => c.slug === 'cli-den'));
+    assert.ok(
+      !(await slick(['channel', 'list', '--json'])).json.channels.some((c: any) => c.slug === 'cli-den')
+    );
     await slick(['channel', 'unarchive', 'cli-den']);
     assert.equal((await slick(['channel', 'delete', 'cli-den', '--json'])).json.channel.deleted, true);
   });
@@ -122,19 +136,19 @@ describe('the basics', () => {
     const created = (await slick(['category', 'create', 'Ops & Deploys', '--json'])).json.category;
     assert.equal(created.slug, 'ops-deploys');
 
-    const inside = (await slick(['channel', 'create', 'cli-deploys', '--category', 'ops-deploys', '--json'])).json
-      .channel;
+    const inside = (await slick(['channel', 'create', 'cli-deploys', '--category', 'ops-deploys', '--json']))
+      .json.channel;
     assert.equal(inside.category.name, 'Ops & Deploys');
 
     // `channel list` reports the grouping, `category list` reports the groups.
     const listed = (await slick(['channel', 'list', '--json'])).json.channels;
-    assert.equal(listed.find((c) => c.slug === 'cli-deploys').categoryId, created.id);
+    assert.equal(listed.find((c: any) => c.slug === 'cli-deploys').categoryId, created.id);
     const grouped = (await slick(['category', 'list', '--json'])).json;
-    assert.equal(grouped.categories.find((c) => c.id === created.id).channelCount, 1);
+    assert.equal(grouped.categories.find((c: any) => c.id === created.id).channelCount, 1);
 
     await slick(['category', 'create', 'Design', '--json']);
     assert.deepEqual(
-      (await slick(['category', 'reorder', 'design', '--json'])).json.categories.map((c) => c.slug),
+      (await slick(['category', 'reorder', 'design', '--json'])).json.categories.map((c: any) => c.slug),
       ['design', 'ops-deploys']
     );
 
@@ -142,10 +156,19 @@ describe('the basics', () => {
     assert.equal((await slick(['category', 'expand', 'design', '--json'])).json.category.collapsed, false);
 
     // Taking a channel out, then deleting the category, both leave it standing.
-    assert.equal((await slick(['category', 'move', 'cli-deploys', 'design', '--json'])).json.channel.category.slug, 'design');
-    assert.equal((await slick(['category', 'move', 'cli-deploys', 'none', '--json'])).json.channel.categoryId, null);
+    assert.equal(
+      (await slick(['category', 'move', 'cli-deploys', 'design', '--json'])).json.channel.category.slug,
+      'design'
+    );
+    assert.equal(
+      (await slick(['category', 'move', 'cli-deploys', 'none', '--json'])).json.channel.categoryId,
+      null
+    );
     await slick(['category', 'move', 'cli-deploys', 'design', '--json']);
-    assert.equal((await slick(['category', 'delete', 'design', '--json'])).json.category.uncategorisedChannels, 1);
+    assert.equal(
+      (await slick(['category', 'delete', 'design', '--json'])).json.category.uncategorisedChannels,
+      1
+    );
     assert.equal((await slick(['channel', 'show', 'cli-deploys', '--json'])).json.channel.categoryId, null);
 
     assert.equal((await slick(['category', 'move', 'cli-deploys', 'nope', '--json'])).code, 4);
@@ -178,10 +201,20 @@ describe('the basics', () => {
 });
 
 describe('agent history keys across processes', () => {
-  let key;
+  let key: string;
 
   test('start prints a key on its own with -q', async () => {
-    const result = await slick(['agent', 'start', '--agent', 'claude', '--name', 'cli', '--channel', 'general', '-q']);
+    const result = await slick([
+      'agent',
+      'start',
+      '--agent',
+      'claude',
+      '--name',
+      'cli',
+      '--channel',
+      'general',
+      '-q',
+    ]);
     key = result.stdout;
     assert.match(key, /^slk_h1_[0-9a-z]{20}$/);
   });
@@ -213,7 +246,10 @@ describe('agent history keys across processes', () => {
     assert.equal(posted.message.author.kind, 'agent');
     assert.equal(posted.message.author.id, 'claude');
     assert.equal((await slick(['agent', 'pull', key, '--json'])).json.events.length, 0);
-    assert.equal((await slick(['agent', 'pull', key, '--json', '--include-own', '--peek'])).json.events.length, 1);
+    assert.equal(
+      (await slick(['agent', 'pull', key, '--json', '--include-own', '--peek'])).json.events.length,
+      1
+    );
   });
 
   test('state survives between processes', async () => {
@@ -225,7 +261,7 @@ describe('agent history keys across processes', () => {
 
   test('sessions can be found again by name when the key is lost', async () => {
     const listed = (await slick(['agent', 'sessions', '--json'])).json.sessions;
-    assert.ok(listed.some((s) => s.key === key && s.name === 'cli'));
+    assert.ok(listed.some((s: any) => s.key === key && s.name === 'cli'));
     const byName = (await slick(['agent', 'resume', 'cli', '--agent', 'claude', '--json'])).json;
     assert.equal(byName.session.key, key);
   });
@@ -245,10 +281,10 @@ describe('agent history keys across processes', () => {
 });
 
 describe('agent serve', () => {
-  let key;
+  let key: string;
   /** Threads reused across tests, to exercise continuity within one thread. */
-  let planThread;
-  let memoryThread;
+  let planThread: string;
+  let memoryThread: string;
 
   test('sets up a session and a mention to answer', async () => {
     key = (
@@ -261,7 +297,10 @@ describe('agent serve', () => {
   test('--once calls the fake agent only for the @mention and posts its reply', async () => {
     const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json']);
     assert.equal(result.code, 0);
-    const lines = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const lines = result.stdout
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
     assert.equal(lines.length, 1);
     assert.equal(lines[0].message.text, 'echo(resumed=false): @claude what is the plan');
     assert.equal(lines[0].message.author.id, 'claude');
@@ -320,7 +359,11 @@ describe('agent serve', () => {
 
   test('a transcript too big to send retires that thread instead of retrying into it', async () => {
     const before = (await slick(['agent', 'state', 'get', key, '--json'])).json;
-    assert.equal(before.state._serveThreads[planThread].sessionId, 'fake-session-1', 'a session is saved to resume');
+    assert.equal(
+      before.state._serveThreads[planThread].sessionId,
+      'fake-session-1',
+      'a session is saved to resume'
+    );
 
     await slick(['send', 'general', '--thread', planThread, '@claude answer despite the oversized history']);
     const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json'], {
@@ -361,13 +404,13 @@ describe('agent serve', () => {
     assert.match(result.stderr, /\(1\/1\)/);
 
     const thread = (await slick(['read', 'general', '--limit', '20', '--replies', '--json'])).json;
-    const note = thread.messages.find((m) => m.text.includes('could not answer this'));
+    const note = thread.messages.find((m: any) => m.text.includes('could not answer this'));
     assert.ok(note, 'the failure is visible to the human, not just in stderr');
     assert.match(note.text, /boom/);
 
     const pulled = (await slick(['agent', 'pull', key, '--json', '--peek'])).json;
     assert.ok(
-      !pulled.events.some((e) => e.message?.text?.includes('this one fails')),
+      !pulled.events.some((e: any) => e.message?.text?.includes('this one fails')),
       'the unanswerable message no longer wedges everything behind it'
     );
   });
@@ -386,7 +429,7 @@ describe('agent serve', () => {
   });
 
   /** Serve one round and return exactly what the child process was handed. */
-  async function serveDump(extra = [], env = {}) {
+  async function serveDump(extra: string[] = [], env: Record<string, string> = {}) {
     const dump = join(home, 'fake-agent-call.json');
     const result = await slick(['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', ...extra], {
       env: { FAKE_AGENT_DUMP: dump, ...env },
@@ -482,7 +525,7 @@ describe('agent serve', () => {
 
     const listed = (await slick(['agent', 'model', lister, '--list', '--json'])).json;
     assert.deepEqual(
-      listed.choices.map((c) => c.id),
+      listed.choices.map((c: any) => c.id),
       ['north::big', 'north::small', 'south::quick']
     );
     assert.equal(listed.choices[0].group, 'north', 'grouped the way the agent grouped them');
@@ -558,7 +601,17 @@ describe('agent serve', () => {
   test('the reply records which model answered it, as the binary reports it', async () => {
     await slick(['send', 'general', '@claude who answered this']);
     const result = await slick(
-      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', '--model', 'anthropic/claude-sonnet-4'],
+      [
+        'agent',
+        'serve',
+        key,
+        '--once',
+        '--cmd',
+        FAKE_AGENT,
+        '--json',
+        '--model',
+        'anthropic/claude-sonnet-4',
+      ],
       { env: { FAKE_AGENT_REPORTS_MODEL: 'anthropic/claude-sonnet-4-20250514' } }
     );
     assert.equal(result.code, 0, result.stderr);
@@ -572,9 +625,17 @@ describe('agent serve', () => {
 
   test('and falls back to what we asked for when the binary does not say', async () => {
     await slick(['send', 'general', '@claude and now a quiet one']);
-    const asked = await slick(
-      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', '--model', 'anthropic/claude-opus-4']
-    );
+    const asked = await slick([
+      'agent',
+      'serve',
+      key,
+      '--once',
+      '--cmd',
+      FAKE_AGENT,
+      '--json',
+      '--model',
+      'anthropic/claude-opus-4',
+    ]);
     assert.equal(JSON.parse(asked.stdout.trim()).message.metadata._model, 'anthropic/claude-opus-4');
 
     await slick(['send', 'general', '@claude with nothing set anywhere']);
@@ -592,9 +653,19 @@ describe('agent serve', () => {
     assert.equal(call.effort, 'xhigh', 'the level reaches the binary');
 
     await slick(['send', 'general', '@claude and once more']);
-    const result = await slick(
-      ['agent', 'serve', key, '--once', '--cmd', FAKE_AGENT, '--json', '--model', 'opus', '--effort', 'high']
-    );
+    const result = await slick([
+      'agent',
+      'serve',
+      key,
+      '--once',
+      '--cmd',
+      FAKE_AGENT,
+      '--json',
+      '--model',
+      'opus',
+      '--effort',
+      'high',
+    ]);
     assert.equal(result.code, 0, result.stderr);
     const posted = JSON.parse(result.stdout.trim()).message;
     assert.equal(posted.metadata._model, 'opus');
@@ -636,16 +707,16 @@ describe('agent serve', () => {
 });
 
 describe('agent adapters', () => {
-  let key;
+  let key: string;
 
   test('the built-in calling conventions are listed', async () => {
     const listed = await slick(['agent', 'adapters', '--json']);
     assert.equal(listed.code, 0);
     assert.deepEqual(
-      listed.json.adapters.map((a) => a.name),
+      listed.json.adapters.map((a: any) => a.name),
       ['claude', 'plain']
     );
-    const claude = listed.json.adapters.find((a) => a.name === 'claude');
+    const claude = listed.json.adapters.find((a: any) => a.name === 'claude');
     assert.equal(claude.cmd, 'claude');
     assert.equal(claude.resume, true);
     assert.equal(claude.source, 'built-in');
@@ -669,7 +740,9 @@ describe('agent adapters', () => {
       })
     );
 
-    const tiny = (await slick(['agent', 'adapters', '--json'])).json.adapters.find((a) => a.name === 'tiny');
+    const tiny = (await slick(['agent', 'adapters', '--json'])).json.adapters.find(
+      (a: any) => a.name === 'tiny'
+    );
     assert.equal(tiny.maxMessageLength, 400);
     assert.equal(tiny.source, join(home, 'adapters', 'tiny.json'));
 
@@ -685,14 +758,23 @@ describe('agent adapters', () => {
 
   test('an answer too long for one message is posted as several, not lost', async () => {
     await slick(['send', 'general', '@tiny write me an essay']);
-    const result = await slick(['agent', 'serve', key, '--once', '--adapter', 'tiny', '--json', '--model', 'big'], {
-      env: { FAKE_AGENT_LONG: '1500' },
-    });
+    const result = await slick(
+      ['agent', 'serve', key, '--once', '--adapter', 'tiny', '--json', '--model', 'big'],
+      {
+        env: { FAKE_AGENT_LONG: '1500' },
+      }
+    );
     assert.equal(result.code, 0, result.stderr);
 
-    const posted = result.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l).message);
+    const posted = result.stdout
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l).message);
     assert.ok(posted.length >= 4, `1500 characters at 400 a message is more than one: got ${posted.length}`);
-    assert.ok(posted.every((m) => m.text.length <= 400), 'every piece is postable');
+    assert.ok(
+      posted.every((m) => m.text.length <= 400),
+      'every piece is postable'
+    );
     assert.match(posted[0].text, /^line 0: /, 'and they arrive in the order they were written');
     assert.ok(posted.map((m) => m.text).join('\n').length >= 1500, 'the whole answer is there');
 
@@ -705,12 +787,30 @@ describe('agent adapters', () => {
 
   test('the plain adapter feeds stdin and takes the answer as it stands', async () => {
     const plainKey = (
-      await slick(['agent', 'start', '--agent', 'plain', '--name', 'plain-serve', '--channel', 'general', '-q'])
+      await slick([
+        'agent',
+        'start',
+        '--agent',
+        'plain',
+        '--name',
+        'plain-serve',
+        '--channel',
+        'general',
+        '-q',
+      ])
     ).stdout;
     await slick(['send', 'general', '@plain are you there']);
-    const result = await slick(
-      ['agent', 'serve', plainKey, '--once', '--adapter', 'plain', '--cmd', PLAIN_AGENT, '--json']
-    );
+    const result = await slick([
+      'agent',
+      'serve',
+      plainKey,
+      '--once',
+      '--adapter',
+      'plain',
+      '--cmd',
+      PLAIN_AGENT,
+      '--json',
+    ]);
     assert.equal(result.code, 0, result.stderr);
     assert.match(JSON.parse(result.stdout.trim()).message.text, /^plain saw: .*are you there$/);
 
@@ -727,14 +827,28 @@ describe('agent adapters', () => {
         args: {
           prompt: ['-q', '{prompt}'],
           resume: ['--resume', '{session}'],
-          model: { match: '^(.+?)::(.+)$', args: ['-m', '{2}', '--provider', '{1}'], else: ['-m', '{value}'] },
+          model: {
+            match: '^(.+?)::(.+)$',
+            args: ['-m', '{2}', '--provider', '{1}'],
+            else: ['-m', '{value}'],
+          },
         },
         reply: { format: 'text', sessionId: { pattern: 'session_id:\\s*(\\S+)', from: 'stderr' } },
       })
     );
 
     const bot = (
-      await slick(['agent', 'start', '--agent', 'stderrbot', '--name', 'stderr-serve', '--channel', 'general', '-q'])
+      await slick([
+        'agent',
+        'start',
+        '--agent',
+        'stderrbot',
+        '--name',
+        'stderr-serve',
+        '--channel',
+        'general',
+        '-q',
+      ])
     ).stdout;
     const thread = (await slick(['send', 'general', '@stderrbot first question', '--json'])).json.message.id;
 
@@ -764,7 +878,7 @@ describe('agent adapters', () => {
     });
     assert.match(failed.stderr, /provider unreachable/);
     const pending = (await slick(['agent', 'pull', bot, '--json', '--peek'])).json;
-    assert.ok(pending.events.some((e) => e.message?.text?.includes('this one dies')));
+    assert.ok(pending.events.some((e: any) => e.message?.text?.includes('this one dies')));
   });
 
   test('an adapter with no binary of its own says so before it starts', async () => {
@@ -786,8 +900,11 @@ describe('agent adapters', () => {
     try {
       const listed = await slick(['agent', 'adapters', '--json']);
       assert.equal(listed.code, 0);
-      assert.match(listed.json.adapters.find((a) => a.name === 'broken').error, /not valid JSON/);
-      assert.ok(listed.json.adapters.some((a) => a.name === 'tiny'), 'the working ones still list');
+      assert.match(listed.json.adapters.find((a: any) => a.name === 'broken').error, /not valid JSON/);
+      assert.ok(
+        listed.json.adapters.some((a: any) => a.name === 'tiny'),
+        'the working ones still list'
+      );
     } finally {
       rmSync(broken, { force: true });
     }
@@ -796,10 +913,10 @@ describe('agent adapters', () => {
 
 describe('an agent that narrates while it answers', () => {
   /** Every POST the watcher made, in the order the daemon received it. */
-  const deltas = [];
-  const thinking = [];
-  let server;
-  let key;
+  const deltas: any[] = [];
+  const thinking: any[] = [];
+  let server: Server | undefined;
+  let key: string;
 
   /**
    * The same agent, described twice: once by an adapter that knows how to read
@@ -807,7 +924,7 @@ describe('an agent that narrates while it answers', () => {
    * identical either way, which is the whole test — streaming is a second
    * reading of it, never a different call.
    */
-  const manifest = (stream) => ({
+  const manifest = (stream: boolean) => ({
     label: stream ? 'Narrating agent' : 'The same agent, unheard',
     cmd: STREAM_AGENT,
     args: { prompt: ['-p', '{prompt}'], resume: ['--resume', '{session}'] },
@@ -830,24 +947,32 @@ describe('an agent that narrates while it answers', () => {
     },
   });
 
-  before(async () => {
+  beforeAll(async () => {
     // A delta is the one thing the watcher cannot write down itself, so it
     // needs something answering where the daemon would be.
     server = createServer((req, res) => {
       let body = '';
-      req.on('data', (chunk) => (body += chunk));
+      req.setEncoding('utf8');
+      req.on('data', (chunk: string) => {
+        body += chunk;
+      });
       req.on('end', () => {
-        const payload = body ? JSON.parse(body) : {};
+        const payload: unknown = body ? JSON.parse(body) : {};
         if (req.url === '/api/stream/delta') deltas.push(payload);
         if (req.url === '/api/thinking') thinking.push(payload);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       });
     });
-    await new Promise((done) => server.listen(0, '127.0.0.1', done));
+    const listening = server;
+    await new Promise<void>((done) => listening.listen(0, '127.0.0.1', done));
     writeFileSync(
       join(home, 'daemon.json'),
-      JSON.stringify({ url: `http://127.0.0.1:${server.address().port}`, token: 'watching', pid: process.pid })
+      JSON.stringify({
+        url: `http://127.0.0.1:${(listening.address() as AddressInfo).port}`,
+        token: 'watching',
+        pid: process.pid,
+      })
     );
 
     mkdirSync(join(home, 'adapters'), { recursive: true });
@@ -855,11 +980,21 @@ describe('an agent that narrates while it answers', () => {
     writeFileSync(join(home, 'adapters', 'quiet.json'), JSON.stringify(manifest(false)));
 
     key = (
-      await slick(['agent', 'start', '--agent', 'narrator', '--name', 'narrator-serve', '--channel', 'general', '-q'])
+      await slick([
+        'agent',
+        'start',
+        '--agent',
+        'narrator',
+        '--name',
+        'narrator-serve',
+        '--channel',
+        'general',
+        '-q',
+      ])
     ).stdout;
   });
 
-  after(() => {
+  afterAll(() => {
     server?.close();
     // Nothing after this describe should think a daemon is running.
     rmSync(join(home, 'daemon.json'), { force: true });
@@ -897,7 +1032,7 @@ describe('an agent that narrates while it answers', () => {
     assert.equal(settled.agentId, 'narrator');
     assert.equal(settled.think.p, 'done', 'a finished run leaves nothing spinning');
     assert.deepEqual(
-      settled.think.s.map((step) => [step.t, step.st]),
+      settled.think.s.map((step: any) => [step.t, step.st]),
       [['Reading the thread', 'complete']],
       'one tool, reported twice, is one step'
     );
@@ -906,9 +1041,11 @@ describe('an agent that narrates while it answers', () => {
     // The stream is gone the moment it is drawn; the message is what a reader
     // arriving late has.
     const thread = (await slick(['read', 'general', '--limit', '10', '--replies', '--json'])).json;
-    const answer = thread.messages.find((m) => m.text.startsWith('streamed(resumed=false): @narrator say something'));
+    const answer = thread.messages.find((m: any) =>
+      m.text.startsWith('streamed(resumed=false): @narrator say something')
+    );
     assert.deepEqual(
-      answer.metadata._think.s.map((step) => step.t),
+      answer.metadata._think.s.map((step: any) => step.t),
       ['Reading the thread'],
       'and the steps are on the answer itself, not only on the wire'
     );
@@ -945,7 +1082,7 @@ describe('an agent that narrates while it answers', () => {
     const settled = thinking.at(-1);
     assert.equal(settled.think.p, 'error', 'the run did not finish, and the box says so');
     assert.deepEqual(
-      settled.think.s.map((step) => step.st),
+      settled.think.s.map((step: any) => step.st),
       ['error'],
       'nothing it was in the middle of is called complete'
     );

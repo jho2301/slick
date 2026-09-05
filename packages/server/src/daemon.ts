@@ -33,10 +33,14 @@ export interface DaemonInfo {
   startedAt: number;
 }
 
+/** A daemon that answered its health check. */
+export type RunningDaemon = { running: true; health: JsonObject } & DaemonInfo;
+
+/** No daemon answered; at most a rendezvous file was left behind. */
+export type StoppedDaemon = { running: false; stale?: boolean } & Partial<DaemonInfo>;
+
 /** A daemon that answered, or one that only left a file behind. */
-export type DaemonStatus =
-  | ({ running: true; health: JsonObject } & DaemonInfo)
-  | ({ running: false; stale?: boolean } & Partial<DaemonInfo>);
+export type DaemonStatus = RunningDaemon | StoppedDaemon;
 
 export function readDaemonFile(home?: string | null): DaemonInfo | null {
   const file = paths(home).daemonFile;
@@ -109,7 +113,8 @@ export interface StartDaemonOptions {
   timeoutMs?: number;
 }
 
-export type StartedDaemon = DaemonStatus & { alreadyRunning?: boolean; started?: boolean };
+/** What `startDaemon` and `ensureDaemon` hand back: always a daemon that answered. */
+export type StartedDaemon = RunningDaemon & { alreadyRunning?: boolean; started?: boolean };
 
 /**
  * Start the daemon in the background and wait until it answers.

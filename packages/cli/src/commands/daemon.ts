@@ -4,20 +4,16 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ValidationError } from '@slick/core';
 import { paths } from '@slick/core/paths';
-import {
-  SLICKD_ENTRY,
-  daemonStatus,
-  ensureDaemon,
-  startDaemon,
-  stopDaemon,
-} from '@slick/server/daemon';
+import { SLICKD_ENTRY, daemonStatus, ensureDaemon, startDaemon, stopDaemon } from '@slick/server/daemon';
 
-import { ago, json, line, note, ok, style } from '../output.js';
+import { flagNumber, flagOn, flagText } from '../args.ts';
+import type { Command } from '../context.ts';
+import { ago, json, line, note, ok, style } from '../output.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const DESKTOP_DIR = resolve(here, '../../../../apps/desktop');
 
-export const daemon = {
+export const daemon: Command = {
   name: 'daemon',
   aliases: ['d'],
   summary: 'Control the background server that the desktop app talks to',
@@ -44,7 +40,9 @@ export const daemon = {
           note(`  started ${ago(info.startedAt)} · db ${info.db}`);
           note(`  open   ${info.url}${info.token ? `?token=${info.token}` : ''}`);
         } else if (info.stale) {
-          line(`${style.yellow('!')} Not running (stale record for pid ${info.pid} — cleaning up on next start)`);
+          line(
+            `${style.yellow('!')} Not running (stale record for pid ${info.pid} — cleaning up on next start)`
+          );
         } else {
           note('Not running. Start it with: slick daemon start');
         }
@@ -54,8 +52,8 @@ export const daemon = {
       case 'start': {
         const info = await startDaemon({
           home,
-          port: ctx.flags.port ? Number(ctx.flags.port) : undefined,
-          host: ctx.flags.host,
+          port: flagNumber(ctx.flags, 'port'),
+          host: flagText(ctx.flags, 'host'),
         });
         if (ctx.json) return json(info);
         ok(
@@ -69,15 +67,17 @@ export const daemon = {
       case 'stop': {
         const result = await stopDaemon({ home });
         if (ctx.json) return json(result);
-        return result.stopped ? ok(`Stopped (pid ${result.pid}).`) : note(`Nothing to stop — ${result.reason}.`);
+        return result.stopped
+          ? ok(`Stopped (pid ${result.pid}).`)
+          : note(`Nothing to stop — ${result.reason}.`);
       }
 
       case 'restart': {
         await stopDaemon({ home });
         const info = await startDaemon({
           home,
-          port: ctx.flags.port ? Number(ctx.flags.port) : undefined,
-          host: ctx.flags.host,
+          port: flagNumber(ctx.flags, 'port'),
+          host: flagText(ctx.flags, 'host'),
         });
         if (ctx.json) return json(info);
         return ok(`Restarted on ${style.bold(info.url)}`);
@@ -88,7 +88,7 @@ export const daemon = {
         const file = paths(home).daemonLog;
         if (!existsSync(file)) return note(`No log yet at ${file}`);
         const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
-        const count = Number(ctx.flags.lines ?? 40);
+        const count = flagNumber(ctx.flags, 'lines') ?? 40;
         if (ctx.json) return json({ file, lines: lines.slice(-count) });
         for (const entry of lines.slice(-count)) line(entry);
         return;
@@ -96,7 +96,8 @@ export const daemon = {
 
       case 'url': {
         const info = await daemonStatus(home);
-        if (!info.running) throw new ValidationError('The daemon is not running.', { hint: 'slick daemon start' });
+        if (!info.running)
+          throw new ValidationError('The daemon is not running.', { hint: 'slick daemon start' });
         const url = `${info.url}${info.token ? `?token=${info.token}` : ''}`;
         return ctx.json ? json({ url }) : line(url);
       }
@@ -109,7 +110,7 @@ export const daemon = {
   },
 };
 
-export const serve = {
+export const serve: Command = {
   name: 'serve',
   summary: 'Run the server in the foreground (ctrl-c to stop)',
   usage: `slick serve [--port <n>] [--host <addr>]
@@ -121,14 +122,16 @@ device on your network with --host 0.0.0.0.`,
     // Hand over to slickd so there is exactly one implementation of "serve".
     const args = [SLICKD_ENTRY, '--foreground'];
     if (ctx.home) args.push('--home', ctx.home);
-    if (ctx.flags.port) args.push('--port', String(ctx.flags.port));
-    if (ctx.flags.host) args.push('--host', String(ctx.flags.host));
+    const port = flagText(ctx.flags, 'port');
+    const host = flagText(ctx.flags, 'host');
+    if (port) args.push('--port', port);
+    if (host) args.push('--host', host);
     const child = spawn(process.execPath, args, { stdio: 'inherit' });
     await new Promise((res) => child.on('exit', res));
   },
 };
 
-export const app = {
+export const app: Command = {
   name: 'app',
   aliases: ['open', 'desktop', 'ui'],
   summary: 'Open the desktop app (falls back to your browser)',
@@ -142,7 +145,7 @@ opens in your default browser.`,
     const info = await ensureDaemon({ home: ctx.home });
     const url = `${info.url}${info.token ? `?token=${info.token}` : ''}`;
 
-    if (!ctx.flags.browser && existsSync(resolve(DESKTOP_DIR, 'main.js'))) {
+    if (!flagOn(ctx.flags, 'browser') && existsSync(resolve(DESKTOP_DIR, 'main.ts'))) {
       const electron = await loadElectronBinary();
       if (electron) {
         const child = spawn(electron, [DESKTOP_DIR], {
@@ -163,9 +166,10 @@ opens in your default browser.`,
   },
 };
 
-async function loadElectronBinary() {
+async function loadElectronBinary(): Promise<string | null> {
   try {
-    const mod = await import('electron');
+    // Outside Electron the package resolves to the path of its binary.
+    const mod = (await import('electron')) as unknown as { default?: unknown };
     const bin = mod.default;
     return typeof bin === 'string' && existsSync(bin) ? bin : null;
   } catch {
@@ -173,8 +177,8 @@ async function loadElectronBinary() {
   }
 }
 
-function openInBrowser(url) {
-  const [command, args] =
+function openInBrowser(url: string): void {
+  const [command, args]: [string, string[]] =
     process.platform === 'darwin'
       ? ['open', [url]]
       : process.platform === 'win32'

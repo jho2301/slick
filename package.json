@@ -17,7 +17,7 @@
     "serve": "node packages/server/bin/slickd.js --foreground",
     "desktop": "npm start --workspace @slick/desktop",
     "test": "vitest run && npm run test:legacy",
-    "test:legacy": "node --test --no-warnings \"packages/server/test/*.test.js\" \"packages/cli/test/*.test.js\" \"apps/web/test/*.test.js\"",
+    "test:legacy": "node --test --no-warnings \"apps/web/test/*.test.js\"",
     "test:watch": "vitest",
     "test:core": "vitest run --project core",
     "test:server": "vitest run --project server",

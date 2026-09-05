@@ -1,7 +1,10 @@
-import { ValidationError } from '@slick/core';
-import { ago, channelHeading, json, line, note, ok, style, table } from '../output.js';
+import { ValidationError, type ChannelPatch } from '@slick/core';
+import { flagOn, flagText } from '../args.ts';
+import type { Command } from '../context.ts';
+import { workspaceOf } from '../context.ts';
+import { ago, channelHeading, json, line, note, ok, style, table } from '../output.ts';
 
-export const channel = {
+export const channel: Command = {
   name: 'channel',
   aliases: ['channels', 'ch'],
   summary: 'Create, list, rename, archive and delete channels',
@@ -32,12 +35,13 @@ Sidebar sections live in \`slick category\`.`,
 
   async run(ctx) {
     const [sub = 'list', ...rest] = ctx.argv;
-    const { ws, flags } = ctx;
+    const ws = workspaceOf(ctx);
+    const { flags } = ctx;
 
     switch (sub) {
       case 'list':
       case 'ls': {
-        const channels = await ws.channels.list({ includeArchived: Boolean(flags.all) });
+        const channels = await ws.channels.list({ includeArchived: flagOn(flags, 'all') });
         if (ctx.json) return json({ channels });
         if (channels.length === 0) return note('No channels yet. Create one: slick channel create general');
         table(
@@ -62,14 +66,15 @@ Sidebar sections live in \`slick category\`.`,
       case 'create':
       case 'new':
       case 'add': {
-        const name = rest[0] ?? flags.name;
+        const name = rest[0] ?? flagText(flags, 'name');
         if (!name) throw new ValidationError('Give the channel a name: slick channel create <name>');
+        const category = flagText(flags, 'category');
         const created = await ws.channels.create({
           slug: name,
-          name: flags.name,
-          topic: flags.topic,
-          purpose: flags.purpose,
-          category: flags.category === undefined || isClear(flags.category) ? null : flags.category,
+          name: flagText(flags, 'name'),
+          topic: flagText(flags, 'topic'),
+          purpose: flagText(flags, 'purpose'),
+          category: category === undefined || isClear(category) ? null : category,
         });
         if (ctx.json) return json({ channel: created });
         ok(
@@ -87,7 +92,7 @@ Sidebar sections live in \`slick category\`.`,
         if (ctx.json) return json({ channel: found });
         line(channelHeading(found));
         line();
-        const rows = [
+        const rows: [string, string][] = [
           ['id', found.id],
           ['name', found.name],
           ['category', found.category ? found.category.name : style.dim('—')],
@@ -104,12 +109,17 @@ Sidebar sections live in \`slick category\`.`,
       case 'update':
       case 'edit': {
         const ref = requireRef(rest[0], 'channel');
-        const patch = {};
-        if (flags.name !== undefined) patch.name = flags.name;
-        if (flags.topic !== undefined) patch.topic = flags.topic;
-        if (flags.purpose !== undefined) patch.purpose = flags.purpose;
-        if (flags.rename !== undefined) patch.slug = flags.rename;
-        if (flags.category !== undefined) patch.category = isClear(flags.category) ? null : flags.category;
+        const patch: ChannelPatch = {};
+        const name = flagText(flags, 'name');
+        const topic = flagText(flags, 'topic');
+        const purpose = flagText(flags, 'purpose');
+        const rename = flagText(flags, 'rename');
+        const category = flagText(flags, 'category');
+        if (name !== undefined) patch.name = name;
+        if (topic !== undefined) patch.topic = topic;
+        if (purpose !== undefined) patch.purpose = purpose;
+        if (rename !== undefined) patch.slug = rename;
+        if (category !== undefined) patch.category = isClear(category) ? null : category;
         if (Object.keys(patch).length === 0) {
           throw new ValidationError('Nothing to change.', {
             hint: 'Pass --name, --topic, --purpose, --rename or --category.',
@@ -139,7 +149,7 @@ Sidebar sections live in \`slick category\`.`,
       case 'delete':
       case 'rm': {
         const removed = await ws.channels.remove(requireRef(rest[0], 'channel'), {
-          force: Boolean(flags.force),
+          force: flagOn(flags, 'force'),
         });
         if (ctx.json) return json({ channel: removed });
         ok(
@@ -157,7 +167,7 @@ Sidebar sections live in \`slick category\`.`,
   },
 };
 
-export function requireRef(value, what) {
+export function requireRef(value: string | undefined, what: string): string {
   if (!value) throw new ValidationError(`Which ${what}?`, { hint: `Pass a ${what} as the next argument.` });
   return value;
 }
@@ -168,4 +178,5 @@ export function requireRef(value, what) {
  */
 const CLEARED = new Set(['none', '-', 'clear', 'null', 'uncategorised', 'uncategorized']);
 
-export const isClear = (value) => value === undefined || CLEARED.has(String(value).trim().toLowerCase());
+export const isClear = (value: unknown): boolean =>
+  value === undefined || CLEARED.has(String(value).trim().toLowerCase());

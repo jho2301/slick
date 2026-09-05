@@ -6,15 +6,21 @@
  * without stripping anything.
  */
 
-const FORCE_COLOR = process.env.FORCE_COLOR === '1';
-let colorEnabled = FORCE_COLOR || (process.stdout.isTTY && !process.env.NO_COLOR);
+import type { Channel, Message } from '@slick/core';
 
-export function setColor(enabled) {
+const FORCE_COLOR = process.env.FORCE_COLOR === '1';
+let colorEnabled = FORCE_COLOR || (Boolean(process.stdout.isTTY) && !process.env.NO_COLOR);
+
+export function setColor(enabled: boolean): void {
   colorEnabled = enabled;
 }
 
-const wrap = (open, close) => (text) =>
-  colorEnabled ? `\u001b[${open}m${text}\u001b[${close}m` : String(text);
+type Painter = (text: unknown) => string;
+
+const wrap =
+  (open: number, close: number): Painter =>
+  (text) =>
+    colorEnabled ? `[${open}m${String(text)}[${close}m` : String(text);
 
 export const style = {
   bold: wrap(1, 22),
@@ -32,23 +38,23 @@ export const style = {
 };
 
 /** Stable per-name colour so the same author always looks the same. */
-const NAME_COLORS = [style.cyan, style.green, style.yellow, style.magenta, style.blue, style.red];
-export function nameColor(name) {
+const NAME_COLORS: Painter[] = [style.cyan, style.green, style.yellow, style.magenta, style.blue, style.red];
+export function nameColor(name: unknown): Painter {
   let hash = 0;
   for (const ch of String(name)) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
-  return NAME_COLORS[hash % NAME_COLORS.length];
+  return NAME_COLORS[hash % NAME_COLORS.length] ?? style.cyan;
 }
 
-export function stripAnsi(text) {
-  // eslint-disable-next-line no-control-regex
-  return String(text).replace(/\u001b\[[0-9;]*m/g, '');
+export function stripAnsi(text: unknown): string {
+  // eslint-disable-next-line no-control-regex -- the escape byte is what is being stripped
+  return String(text).replace(/\[[0-9;]*m/g, '');
 }
 
-export function width(text) {
+export function width(text: unknown): number {
   return stripAnsi(text).length;
 }
 
-export function pad(text, size) {
+export function pad(text: string, size: number): string {
   const diff = size - width(text);
   return diff > 0 ? text + ' '.repeat(diff) : text;
 }
@@ -58,16 +64,16 @@ export function pad(text, size) {
 const TIME_FMT = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
 const DAY_FMT = new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
 
-export function clock(ts) {
+export function clock(ts: number): string {
   return TIME_FMT.format(new Date(ts));
 }
 
-export function dayKey(ts) {
+export function dayKey(ts: number): string {
   const d = new Date(ts);
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-export function dayLabel(ts) {
+export function dayLabel(ts: number): string {
   const today = dayKey(Date.now());
   const yesterday = dayKey(Date.now() - 86_400_000);
   const key = dayKey(ts);
@@ -76,10 +82,10 @@ export function dayLabel(ts) {
   return DAY_FMT.format(new Date(ts));
 }
 
-export function ago(ts) {
+export function ago(ts: number | null | undefined): string {
   if (!ts) return 'never';
   const diff = Date.now() - ts;
-  const units = [
+  const units: [number, string][] = [
     [86_400_000 * 365, 'y'],
     [86_400_000 * 30, 'mo'],
     [86_400_000 * 7, 'w'],
@@ -96,15 +102,15 @@ export function ago(ts) {
 
 // --------------------------------------------------------------- writing ---
 
-export function line(text = '') {
+export function line(text = ''): void {
   process.stdout.write(`${text}\n`);
 }
 
-export function json(value) {
+export function json(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
-export function ndjson(value) {
+export function ndjson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
@@ -116,36 +122,39 @@ export const icon = {
   agent: '🤖',
 };
 
-export function ok(text) {
+export function ok(text: string): void {
   line(`${icon.ok} ${text}`);
 }
 
-export function note(text) {
+export function note(text: string): void {
   line(style.dim(text));
 }
 
-export function warn(text) {
+export function warn(text: string): void {
   process.stderr.write(`${icon.warn} ${text}\n`);
 }
 
 // ---------------------------------------------------------------- tables ---
 
-/**
- * @param {Array<Record<string, string>>} data
- * @param {Array<{key: string, label: string, align?: 'right'}>} columns
- */
-export function table(data, columns) {
+export interface Column {
+  key: string;
+  label: string;
+  align?: 'right';
+}
+
+export function table(data: Record<string, string>[], columns: Column[]): void {
   if (data.length === 0) return;
   const widths = columns.map((col) =>
     Math.max(width(col.label), ...data.map((rowData) => width(String(rowData[col.key] ?? ''))))
   );
-  line(columns.map((col, i) => style.dim(pad(col.label.toUpperCase(), widths[i]))).join('  '));
+  line(columns.map((col, i) => style.dim(pad(col.label.toUpperCase(), widths[i] ?? 0))).join('  '));
   for (const rowData of data) {
     line(
       columns
         .map((col, i) => {
           const cell = String(rowData[col.key] ?? '');
-          return col.align === 'right' ? ' '.repeat(Math.max(0, widths[i] - width(cell))) + cell : pad(cell, widths[i]);
+          const size = widths[i] ?? 0;
+          return col.align === 'right' ? ' '.repeat(Math.max(0, size - width(cell))) + cell : pad(cell, size);
         })
         .join('  ')
         .trimEnd()
@@ -158,9 +167,9 @@ export function table(data, columns) {
 const TERM_WIDTH = () => Math.min(process.stdout.columns || 100, 110);
 
 /** Soft-wrap a paragraph to the terminal, preserving intentional newlines. */
-export function reflow(text, indent = '', maxWidth = TERM_WIDTH()) {
+export function reflow(text: string, indent = '', maxWidth = TERM_WIDTH()): string {
   const limit = Math.max(20, maxWidth - indent.length);
-  const out = [];
+  const out: string[] = [];
   for (const paragraph of String(text).split('\n')) {
     if (paragraph.length <= limit) {
       out.push(indent + paragraph);
@@ -180,7 +189,7 @@ export function reflow(text, indent = '', maxWidth = TERM_WIDTH()) {
   return out.join('\n');
 }
 
-function authorTag(message) {
+function authorTag(message: Message): string {
   const label = message.author.label || message.author.id;
   const colored = style.bold(nameColor(label)(label));
   if (message.author.kind === 'agent') return `${colored} ${style.dim('[agent]')}`;
@@ -189,19 +198,24 @@ function authorTag(message) {
 }
 
 /** Light markdown so `**bold**` and `` `code` `` read the way they were typed. */
-export function inlineMarkdown(text) {
+export function inlineMarkdown(text: string): string {
   if (!colorEnabled) return text;
   return String(text)
-    .replace(/`([^`\n]+)`/g, (_, code) => style.cyan(code))
-    .replace(/\*\*([^*\n]+)\*\*/g, (_, b) => style.bold(b))
-    .replace(/(^|\s)@([a-z0-9][a-z0-9._-]*)/gi, (_, pre, name) => `${pre}${style.bgYellow(style.bold(`@${name}`))}`);
+    .replace(/`([^`\n]+)`/g, (_, code: string) => style.cyan(code))
+    .replace(/\*\*([^*\n]+)\*\*/g, (_, b: string) => style.bold(b))
+    .replace(
+      /(^|\s)@([a-z0-9][a-z0-9._-]*)/gi,
+      (_, pre: string, name: string) => `${pre}${style.bgYellow(style.bold(`@${name}`))}`
+    );
 }
 
-/**
- * @param {any} message
- * @param {{showId?: boolean, indent?: string, highlight?: string[]}} [opts]
- */
-export function renderMessage(message, opts = {}) {
+export interface RenderOptions {
+  showId?: boolean;
+  indent?: string;
+  highlight?: string[];
+}
+
+export function renderMessage(message: Message, opts: RenderOptions = {}): string {
   const indent = opts.indent ?? '';
   const head = `${indent}${authorTag(message)}  ${style.dim(clock(message.createdAt))}${
     message.editedAt ? style.dim(' (edited)') : ''
@@ -210,7 +224,7 @@ export function renderMessage(message, opts = {}) {
     ? `${indent}  ${style.dim(style.italic('(message deleted)'))}`
     : reflow(inlineMarkdown(message.text), `${indent}  `);
 
-  const meta = [];
+  const meta: string[] = [];
   if (opts.showId !== false) meta.push(style.dim(message.id));
   if (message.replyCount > 0) {
     meta.push(style.blue(`${message.replyCount} ${message.replyCount === 1 ? 'reply' : 'replies'}`));
@@ -224,11 +238,10 @@ export function renderMessage(message, opts = {}) {
 
 /**
  * A channel transcript with day separators.
- * @param {any[]} messages
  */
-export function renderTranscript(messages, opts = {}) {
-  const out = [];
-  let lastDay = null;
+export function renderTranscript(messages: Message[], opts: RenderOptions = {}): string {
+  const out: string[] = [];
+  let lastDay: string | null = null;
   for (const message of messages) {
     const key = dayKey(message.createdAt);
     if (key !== lastDay) {
@@ -243,7 +256,7 @@ export function renderTranscript(messages, opts = {}) {
   return out.join('\n').trimEnd();
 }
 
-export function channelHeading(channel) {
+export function channelHeading(channel: Channel): string {
   const bits = [style.bold(`#${channel.slug}`)];
   if (channel.archived) bits.push(style.yellow('(archived)'));
   if (channel.topic) bits.push(style.dim(`— ${channel.topic}`));

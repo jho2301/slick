@@ -4,30 +4,24 @@ import { paths } from '@slick/core/paths';
 import { daemonStatus } from '@slick/server/daemon';
 import { resolveWebRoot } from '@slick/server';
 
-import {
-  ago,
-  json,
-  line,
-  ndjson,
-  note,
-  ok,
-  renderMessage,
-  style,
-  table,
-  icon,
-} from '../output.js';
+import { flagNumber, flagOn, flagText } from '../args.ts';
+import type { Command } from '../context.ts';
+import { workspaceOf } from '../context.ts';
+import { ago, json, line, ndjson, note, ok, renderMessage, style, table, icon } from '../output.ts';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export const init = {
+export const init: Command = {
   name: 'init',
   summary: 'Create the workspace (safe to run twice)',
   usage: `slick init [--name <workspace>] [--user <your name>]`,
   spec: { strings: ['name', 'user'] },
   async run(ctx) {
-    const { ws, flags } = ctx;
-    if (flags.user) await ws.setUser({ id: slugUser(flags.user), name: flags.user });
-    if (flags.name) await ws.setMeta('workspace.name', flags.name);
+    const ws = workspaceOf(ctx);
+    const user = flagText(ctx.flags, 'user');
+    const name = flagText(ctx.flags, 'name');
+    if (user) await ws.setUser({ id: slugUser(user), name: user });
+    if (name) await ws.setMeta('workspace.name', name);
     const info = await ws.info();
     if (ctx.json) return json(info);
     ok(`Workspace ready at ${style.bold(info.file)}`);
@@ -42,19 +36,15 @@ export const init = {
   },
 };
 
-export const status = {
+export const status: Command = {
   name: 'status',
   aliases: ['info'],
   summary: 'Workspace summary: channels, activity, agents',
   usage: `slick status`,
   spec: {},
   async run(ctx) {
-    const { ws } = ctx;
-    const [info, channels, sessions] = await Promise.all([
-      ws.info(),
-      ws.channels.list(),
-      ws.agents.list({}),
-    ]);
+    const ws = workspaceOf(ctx);
+    const [info, channels, sessions] = await Promise.all([ws.info(), ws.channels.list(), ws.agents.list({})]);
     if (ctx.json) return json({ ...info, channels, sessions });
 
     line(`${style.bold(info.name)} ${style.dim(`· ${ctx.mode}`)}`);
@@ -96,7 +86,7 @@ export const status = {
   },
 };
 
-export const search = {
+export const search: Command = {
   name: 'search',
   aliases: ['find', 's'],
   summary: 'Search messages',
@@ -115,11 +105,11 @@ Options
   async run(ctx) {
     const query = ctx.argv.join(' ');
     if (!query.trim()) throw new ValidationError('What are you looking for?');
-    const result = await ctx.ws.search(query, {
-      channel: ctx.flags.channel,
-      author: ctx.flags.author,
-      kind: ctx.flags.kind,
-      limit: ctx.flags.limit ? Number(ctx.flags.limit) : undefined,
+    const result = await workspaceOf(ctx).search(query, {
+      channel: flagText(ctx.flags, 'channel'),
+      author: flagText(ctx.flags, 'author'),
+      kind: flagText(ctx.flags, 'kind'),
+      limit: flagNumber(ctx.flags, 'limit'),
     });
     if (ctx.json) return json(result);
     if (result.results.length === 0) return note(`No messages match ${style.bold(query)}.`);
@@ -133,7 +123,7 @@ Options
   },
 };
 
-export const tail = {
+export const tail: Command = {
   name: 'tail',
   aliases: ['watch'],
   summary: 'Follow the workspace live',
@@ -149,14 +139,19 @@ Options
   --all                         include every event type, not just messages`,
   spec: { booleans: ['all'], strings: ['channel', 'since', 'interval'] },
   async run(ctx) {
-    const { ws, flags } = ctx;
-    const channel = flags.channel ? await ws.channels.get(flags.channel) : null;
-    const interval = Math.max(Number(flags.interval ?? 500), 100);
-    let cursor = flags.since !== undefined ? Number(flags.since) : await ws.seq();
+    const ws = workspaceOf(ctx);
+    const { flags } = ctx;
+    const channelRef = flagText(flags, 'channel');
+    const channel = channelRef ? await ws.channels.get(channelRef) : null;
+    const interval = Math.max(flagNumber(flags, 'interval') ?? 500, 100);
+    const since = flagNumber(flags, 'since');
+    let cursor = since !== undefined ? since : await ws.seq();
 
     const asJson = ctx.json || !process.stdout.isTTY;
     if (!asJson) {
-      note(`Tailing ${channel ? `#${channel.slug}` : 'the whole workspace'} from seq ${cursor} — ctrl-c to stop.`);
+      note(
+        `Tailing ${channel ? `#${channel.slug}` : 'the whole workspace'} from seq ${cursor} — ctrl-c to stop.`
+      );
       line();
     }
 
@@ -168,7 +163,7 @@ Options
       });
       for (const event of events) {
         cursor = Math.max(cursor, event.seq);
-        if (!flags.all && !event.message) continue;
+        if (!flagOn(flags, 'all') && !event.message) continue;
         if (asJson) {
           ndjson(event);
         } else if (event.message) {
@@ -185,19 +180,22 @@ Options
   },
 };
 
-export const doctor = {
+export const doctor: Command = {
   name: 'doctor',
   summary: 'Check that everything is wired up',
   usage: `slick doctor`,
   spec: {},
   async run(ctx) {
     const p = paths(ctx.home);
-    const checks = [];
-    const add = (label, good, detail) => checks.push({ label, good, detail });
+    const checks: { label: string; good: boolean; detail: string }[] = [];
+    const add = (label: string, good: boolean, detail: string) => checks.push({ label, good, detail });
 
-    const major = Number(process.versions.node.split('.')[0]);
-    const minor = Number(process.versions.node.split('.')[1]);
-    add('node >= 22.5', major > 22 || (major === 22 && minor >= 5), `v${process.versions.node}`);
+    const [majorText = '0', minorText = '0'] = process.versions.node.split('.');
+    const major = Number(majorText);
+    const minor = Number(minorText);
+    // 22.18 is where Node started stripping types without a flag, which is
+    // what runs every package in this repo.
+    add('node >= 22.18', major > 22 || (major === 22 && minor >= 18), `v${process.versions.node}`);
     add('workspace directory', existsSync(p.root), p.root);
     add(
       'database',
@@ -206,7 +204,7 @@ export const doctor = {
     );
 
     const web = resolveWebRoot();
-    add('web UI files', Boolean(web), web ?? 'not found — the desktop app will not render');
+    add('web UI files', Boolean(web), web ?? 'not found — run `npm run build`, or the app will not render');
 
     const daemon = await daemonStatus(ctx.home);
     add(
@@ -215,13 +213,19 @@ export const doctor = {
       daemon.running ? `${daemon.url} (pid ${daemon.pid})` : daemon.stale ? 'stale record' : 'not running'
     );
 
-    let electron = null;
+    let electron: string | null = null;
     try {
-      electron = (await import('electron')).default;
+      // Outside Electron the package resolves to the path of its binary.
+      const mod = (await import('electron')) as unknown as { default?: unknown };
+      electron = typeof mod.default === 'string' ? mod.default : null;
     } catch {
       /* optional */
     }
-    add('electron', Boolean(electron), electron ? 'installed' : 'not installed — `slick app` will use your browser');
+    add(
+      'electron',
+      Boolean(electron),
+      electron ? 'installed' : 'not installed — `slick app` will use your browser'
+    );
 
     if (ctx.json) return json({ checks, daemon, paths: p });
     for (const check of checks) {
@@ -230,6 +234,12 @@ export const doctor = {
   },
 };
 
-function slugUser(name) {
-  return String(name).trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'you';
+function slugUser(name: string): string {
+  return (
+    String(name)
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'you'
+  );
 }

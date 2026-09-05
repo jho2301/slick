@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "slick — command line access to your workspace, for humans and agents",
-  "main": "./src/index.js",
+  "main": "./src/index.ts",
   "bin": {
     "slick": "./bin/slick.js"
   },
@@ -13,6 +13,6 @@
     "@slick/server": "^0.5.0"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.18.0"
   }
 }

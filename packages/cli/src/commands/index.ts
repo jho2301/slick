@@ -1,12 +1,13 @@
-import { channel } from './channel.js';
-import { category } from './category.js';
-import { message, read, send, thread } from './message.js';
-import { agent } from './agent.js';
-import { doctor, init, search, status, tail } from './workspace.js';
-import { app, daemon, serve } from './daemon.js';
-import { line, note, style } from '../output.js';
+import { channel } from './channel.ts';
+import { category } from './category.ts';
+import { message, read, send, thread } from './message.ts';
+import { agent } from './agent.ts';
+import { doctor, init, search, status, tail } from './workspace.ts';
+import { app, daemon, serve } from './daemon.ts';
+import { line, note, style } from '../output.ts';
+import type { Command } from '../context.ts';
 
-export const COMMANDS = [
+export const COMMANDS: Command[] = [
   init,
   status,
   send,
@@ -24,27 +25,27 @@ export const COMMANDS = [
   doctor,
 ];
 
-const BY_NAME = new Map();
+const BY_NAME = new Map<string, Command>();
 for (const command of COMMANDS) {
   BY_NAME.set(command.name, command);
   for (const alias of command.aliases ?? []) BY_NAME.set(alias, command);
 }
 
-export function findCommand(name) {
+export function findCommand(name: string): Command | null {
   return BY_NAME.get(name) ?? null;
 }
 
 /** Commands that never need to touch the workspace database. */
 export const NO_WORKSPACE = new Set(['daemon', 'serve', 'app', 'doctor']);
 
-const GROUPS = [
+const GROUPS: [string, string[]][] = [
   ['Talking', ['send', 'read', 'thread', 'search', 'tail']],
   ['Organising', ['channel', 'category', 'message', 'status', 'init']],
   ['Agents', ['agent']],
   ['Apps', ['app', 'daemon', 'serve', 'doctor']],
 ];
 
-export function printHelp() {
+export function printHelp(): void {
   line(`${style.bold('slick')} ${style.dim('— a Slack-shaped workspace for you and your agents')}`);
   line();
   line(`${style.dim('usage:')} slick <command> [args] [--json]`);
@@ -67,6 +68,6 @@ export function printHelp() {
   note('  slick <command> --help   for details on any command');
 }
 
-export function printCommandHelp(command) {
+export function printCommandHelp(command: Command): void {
   line(command.usage ?? `slick ${command.name}`);
 }

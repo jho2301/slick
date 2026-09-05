@@ -281,7 +281,7 @@ code{background:#f4f4f5;padding:.15em .4em;border-radius:4px;font-size:.9em}</st
 
 export { createHub, createPushService, resolveWebRoot };
 export type { Hub, PushService, Env };
-export type { DaemonInfo, DaemonStatus, StartedDaemon } from './daemon.ts';
+export type { DaemonInfo, DaemonStatus, RunningDaemon, StoppedDaemon, StartedDaemon } from './daemon.ts';
 export type { CommandEntry, CommandList, CommandOutput } from './commands.ts';
 export type {
   AccountUsage,

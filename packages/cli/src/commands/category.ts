@@ -1,8 +1,11 @@
-import { ValidationError } from '@slick/core';
-import { ago, json, line, note, ok, pad, style } from '../output.js';
-import { isClear, requireRef } from './channel.js';
+import { ValidationError, type Category, type CategoryPatch, type Channel } from '@slick/core';
+import { flagOn, flagText } from '../args.ts';
+import type { Command } from '../context.ts';
+import { workspaceOf } from '../context.ts';
+import { ago, json, line, note, ok, pad, style } from '../output.ts';
+import { isClear, requireRef } from './channel.ts';
 
-export const category = {
+export const category: Command = {
   name: 'category',
   aliases: ['categories', 'cat'],
   summary: 'Group channels into sidebar sections',
@@ -32,14 +35,15 @@ A channel belongs to at most one category. Channels in none of them live under
 
   async run(ctx) {
     const [sub = 'list', ...rest] = ctx.argv;
-    const { ws, flags } = ctx;
+    const ws = workspaceOf(ctx);
+    const { flags } = ctx;
 
     switch (sub) {
       case 'list':
       case 'ls': {
         const [categories, channels] = await Promise.all([
           ws.categories.list(),
-          ws.channels.list({ includeArchived: Boolean(flags.all) }),
+          ws.channels.list({ includeArchived: flagOn(flags, 'all') }),
         ]);
         if (ctx.json) return json({ categories, channels });
         if (categories.length === 0) {
@@ -63,9 +67,9 @@ A channel belongs to at most one category. Channels in none of them live under
       case 'create':
       case 'new':
       case 'add': {
-        const name = rest.join(' ').trim() || flags.name;
+        const name = rest.join(' ').trim() || flagText(flags, 'name');
         if (!name) throw new ValidationError('Give the category a name: slick category create <name>');
-        const created = await ws.categories.create({ name, slug: flags.rename });
+        const created = await ws.categories.create({ name, slug: flagText(flags, 'rename') });
         if (ctx.json) return json({ category: created });
         ok(`Created ${style.bold(created.name)} ${style.dim(`(${created.slug})`)}`);
         note(`  Put a channel in it: slick category move <channel> ${created.slug}`);
@@ -75,18 +79,19 @@ A channel belongs to at most one category. Channels in none of them live under
       case 'show':
       case 'info': {
         const found = await ws.categories.get(requireRef(rest[0], 'category'));
-        const channels = await ws.channels.list({ includeArchived: Boolean(flags.all) });
+        const channels = await ws.channels.list({ includeArchived: flagOn(flags, 'all') });
         const inside = channels.filter((c) => c.categoryId === found.id);
         if (ctx.json) return json({ category: found, channels: inside });
         line(heading(found, inside.length));
         line();
-        for (const [key, value] of [
+        const rows: [string, string][] = [
           ['id', found.id],
           ['handle', found.slug],
           ['position', String(found.position)],
           ['collapsed', found.collapsed ? 'yes' : 'no'],
           ['created', `${new Date(found.createdAt).toLocaleString()} by ${found.createdBy}`],
-        ]) {
+        ];
+        for (const [key, value] of rows) {
           line(`  ${style.dim(key.padEnd(11))}${value}`);
         }
         line();
@@ -99,12 +104,14 @@ A channel belongs to at most one category. Channels in none of them live under
       case 'edit':
       case 'rename': {
         const ref = requireRef(rest[0], 'category');
-        const patch = {};
+        const patch: CategoryPatch = {};
         // `slick category rename design Design System` reads better than a flag.
         const words = rest.slice(1).join(' ').trim();
         if (words) patch.name = words;
-        if (flags.name !== undefined) patch.name = flags.name;
-        if (flags.rename !== undefined) patch.slug = flags.rename;
+        const name = flagText(flags, 'name');
+        const rename = flagText(flags, 'rename');
+        if (name !== undefined) patch.name = name;
+        if (rename !== undefined) patch.slug = rename;
         if (Object.keys(patch).length === 0) {
           throw new ValidationError('Nothing to change.', { hint: 'Pass --name or --rename.' });
         }
@@ -117,7 +124,7 @@ A channel belongs to at most one category. Channels in none of them live under
       case 'move':
       case 'set': {
         const channelRef = requireRef(rest[0], 'channel');
-        const target = rest[1] ?? flags.name;
+        const target = rest[1] ?? flagText(flags, 'name');
         const updated = await ws.channels.update(channelRef, {
           category: isClear(target) ? null : target,
         });
@@ -172,19 +179,19 @@ A channel belongs to at most one category. Channels in none of them live under
   },
 };
 
-function heading(item, count) {
+function heading(item: Category, count: number): string {
   return (
     `${style.bold(item.name)} ${style.dim(`(${item.slug})`)} ` +
     style.dim(`· ${count} channel${count === 1 ? '' : 's'}${item.collapsed ? ' · collapsed' : ''}`)
   );
 }
 
-function channelLine(channel) {
+function channelLine(channel: Channel): string {
   const name = channel.archived ? style.dim(`#${channel.slug}`) : `#${channel.slug}`;
   const meta = [
     `${channel.messageCount ?? 0} msg`,
     channel.lastMessageAt ? ago(channel.lastMessageAt) : 'quiet',
     channel.archived ? style.yellow('archived') : null,
-  ].filter(Boolean);
+  ].filter((part): part is string => Boolean(part));
   return `${pad(name, 24)} ${style.dim(meta.join(' · '))}`;
 }

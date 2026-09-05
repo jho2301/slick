@@ -21,7 +21,7 @@ process.stdout.on('error', (err) => {
   if (err.code === 'EPIPE') process.exit(0);
 });
 
-const { main } = await import('../src/index.js');
+const { main } = await import('../src/index.ts');
 
 try {
   process.exitCode = await main(process.argv.slice(2));

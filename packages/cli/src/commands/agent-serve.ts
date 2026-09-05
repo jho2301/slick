@@ -17,7 +17,7 @@
  * thread has to pay for on every turn.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { readDaemonFile } from '@slick/server/daemon';
@@ -28,8 +28,11 @@ import {
   SERVE_ADAPTER_KEY,
   SERVE_MODELS_AT_KEY,
   ValidationError,
+  Workspace,
   buildAgentArgs,
   buildModelListArgs,
+  errorCode,
+  errorMessage,
   loadAdapter,
   lookupReported,
   normalizeModelChoices,
@@ -42,11 +45,25 @@ import {
   slotFires,
   splitMessageText,
   supportsResume,
+  type Adapter,
+  type AgentReply,
+  type HydratedEvent,
+  type Message,
+  type MessageMetadata,
+  type ModelChoice,
+  type SessionState,
+  type StepStatus,
+  type StreamFrame,
+  type ThinkingPhase,
+  type ThinkingStep,
+  type TypingInput,
 } from '@slick/core';
-import { RemoteWorkspace } from '../client.js';
-import { line, note, ok, style, warn } from '../output.js';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+import { flagNumber, flagOn, flagText, type ArgSpec, type Flags } from '../args.ts';
+import { RemoteWorkspace, type WorkspaceApi } from '../client.ts';
+import { line, note, ok, style, warn } from '../output.ts';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Longest we will wait between passes once something is going wrong. */
 const MAX_BACKOFF_MS = 60_000;
@@ -97,7 +114,14 @@ const DELTA_EVERY_MS = 120;
 const DELTA_EVERY_CHARS = 400;
 
 /** The four the wire knows; anything else a binary invents means "running". */
-const STEP_STATUSES = new Set(['pending', 'in_progress', 'complete', 'error']);
+const STEP_STATUSES: ReadonlySet<string> = new Set<StepStatus>([
+  'pending',
+  'in_progress',
+  'complete',
+  'error',
+]);
+const isStepStatus = (value: string | null): value is StepStatus =>
+  value !== null && STEP_STATUSES.has(value);
 
 /** Caps borrowed from the think blob's own, so nothing outgrows them here. */
 const THINK_TITLE_MAX = 200;
@@ -124,15 +148,27 @@ const SESSION_FATAL = [
   /session .{0,80}? not found/i,
 ];
 
-const isSessionFatal = (message) => SESSION_FATAL.some((re) => re.test(message ?? ''));
+const isSessionFatal = (message: string | null | undefined): boolean =>
+  SESSION_FATAL.some((re) => re.test(message ?? ''));
+
+/** One child conversation, as remembered per thread under `_serveThreads`. */
+interface ThreadEntry {
+  sessionId: string | null;
+  stateSig: string | null;
+  /** How far into the conversation this session has been shown. */
+  seq: number;
+  at: number;
+}
+
+/** A `message.created` event that actually carries its message. */
+type MessageEvent = HydratedEvent & { message: Message };
 
 /**
  * One `serve` per history key, per machine. Two watchers sharing a key consume
  * each other's messages — AGENTS.md warns about it — and double every process
  * they spawn, which is how one wedged retry became two hot loops.
- * @returns {() => void} release
  */
-function claimSession(home, key) {
+function claimSession(home: string | undefined, key: string): () => void {
   // The path comes from the core because the lock is not private bookkeeping:
   // it is how everything else — the rail, the mention picker — knows this
   // session answers when you talk to it.
@@ -157,7 +193,7 @@ function claimSession(home, key) {
         }
       };
       process.once('exit', release);
-      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
         process.once(signal, () => {
           release();
           process.exit(signal === 'SIGINT' ? 130 : 143);
@@ -166,14 +202,17 @@ function claimSession(home, key) {
       return release;
     } catch (err) {
       // An unwritable home is not a reason to refuse to work.
-      if (err.code !== 'EEXIST') return () => {};
+      if (errorCode(err) !== 'EEXIST') return () => {};
       // Same reader the rest of Slick uses to decide whether this session has
       // a watcher, so "someone holds the lock" means one thing everywhere.
       const owner = readServeLock(key, home)?.pid ?? 0;
       if (owner && owner !== process.pid) {
-        throw new ConflictError(`Another \`slick agent serve\` (pid ${owner}) is already watching "${key}".`, {
-          hint: `Stop it first, or run this one against a different session. Lock: ${file}`,
-        });
+        throw new ConflictError(
+          `Another \`slick agent serve\` (pid ${owner}) is already watching "${key}".`,
+          {
+            hint: `Stop it first, or run this one against a different session. Lock: ${file}`,
+          }
+        );
       }
       // The holder is gone (crash, kill -9). Clear its lock and try again.
       try {
@@ -186,7 +225,7 @@ function claimSession(home, key) {
   return () => {};
 }
 
-function plainTranscript(messages) {
+function plainTranscript(messages: Message[]): string {
   return messages
     .filter((m) => !m.deleted)
     .map((m) => `[${timeFmt.format(m.createdAt)}] ${m.author.label}: ${m.text}`)
@@ -199,23 +238,17 @@ function plainTranscript(messages) {
  * `slick agent state set`, and neither belongs in a prompt: the model cannot
  * use them, and they would make "has the state changed?" fire on our writes.
  */
-function publicState(state) {
-  const out = {};
+function publicState(state: SessionState | null | undefined): SessionState {
+  const out: SessionState = {};
   for (const [key, value] of Object.entries(state ?? {})) {
     if (!key.startsWith('_')) out[key] = value;
   }
   return out;
 }
 
-const stateSignature = (json) => createHash('sha256').update(json).digest('hex').slice(0, 16);
+const stateSignature = (json: string): string => createHash('sha256').update(json).digest('hex').slice(0, 16);
 
-/**
- * Which model the child should run *this pass*. `--model` fixes a default when
- * the watcher starts, but a watcher can stay up for days, and a launch flag
- * cannot be reached once it has. The session's own state can be, from the CLI
- * (`slick agent model`), from the app, or from anything else holding the
- * database — so that is where the answer lives, and it is re-read every pass.
- */
+const stringOrNull = (value: unknown): string | null => (typeof value === 'string' ? value : null);
 
 /**
  * The child sessions this watcher is holding, as stored under `_serveThreads`:
@@ -223,27 +256,27 @@ const stateSignature = (json) => createHash('sha256').update(json).digest('hex')
  * in this process so a restart — or a `--once` cron run — picks every thread
  * back up where it left off instead of starting each one over.
  */
-function loadThreads(state) {
-  const threads = new Map();
-  const stored = state?._serveThreads;
+function loadThreads(state: SessionState | null | undefined): Map<string, ThreadEntry> {
+  const threads = new Map<string, ThreadEntry>();
+  const stored: unknown = state?._serveThreads;
   if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return threads;
-  for (const [threadId, entry] of Object.entries(stored)) {
+  for (const [threadId, entry] of Object.entries(stored as Record<string, unknown>)) {
     if (!entry || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
     threads.set(threadId, {
-      sessionId: typeof entry.sessionId === 'string' ? entry.sessionId : null,
-      stateSig: typeof entry.stateSig === 'string' ? entry.stateSig : null,
-      // How far into the conversation this session has been shown. Missing on
-      // an entry written before there was one, which reads as "shown nothing"
-      // — one last full context block, then never again.
-      seq: Number(entry.seq) || 0,
-      at: Number(entry.at) || 0,
+      sessionId: stringOrNull(record.sessionId),
+      stateSig: stringOrNull(record.stateSig),
+      // Missing on an entry written before there was one, which reads as
+      // "shown nothing" — one last full context block, then never again.
+      seq: Number(record.seq) || 0,
+      at: Number(record.at) || 0,
     });
   }
   return threads;
 }
 
 /** Drop the empty and the least recently used entries, in place. */
-function prune(threads) {
+function prune(threads: Map<string, ThreadEntry>): Record<string, ThreadEntry> {
   for (const [threadId, entry] of threads) {
     if (!entry.sessionId && !entry.stateSig) threads.delete(threadId);
   }
@@ -260,17 +293,25 @@ function prune(threads) {
  * it is what orients a brand-new session — but once a thread has a session of
  * its own, other people's other threads are noise inside it.
  *
- * @returns {Promise<Array|null>} null when the caller should use the channel tail
+ * Null when the caller should use the channel tail.
  */
-async function threadContext(ws, message, limit) {
+function threadContext(ws: Workspace, message: Message, limit: number): Message[] | null {
   if (limit <= 0 || !message.threadId || message.threadId === message.id) return null;
   try {
-    const { root, replies } = await ws.messages.thread(message.threadId);
-    const earlier = [root, ...replies].filter((m) => m && !m.deleted && m.seq < message.seq);
+    const { root, replies } = ws.messages.thread(message.threadId);
+    const earlier = [root, ...replies].filter((m) => !m.deleted && m.seq < message.seq);
     return earlier.length > 0 ? earlier.slice(-limit) : null;
   } catch {
     return null; // context is a nicety — never fail an answer over it
   }
+}
+
+interface PromptParts {
+  event: MessageEvent;
+  context: Message[];
+  contextLabel: string;
+  stateJson: string | null;
+  extra: string | undefined;
 }
 
 /**
@@ -279,14 +320,29 @@ async function threadContext(ws, message, limit) {
  * behind `--cmd` already knows what it is from its own configuration, and one
  * resumed transcript would otherwise carry a fresh copy per message forever.
  */
-function buildPrompt({ event, context, contextLabel, stateJson, extra }) {
+function buildPrompt({ event, context, contextLabel, stateJson, extra }: PromptParts): string {
   const message = event.message;
-  const parts = [];
-  if (context?.length > 0) parts.push(`${contextLabel}\n${plainTranscript(context)}`);
+  const parts: string[] = [];
+  if (context.length > 0) parts.push(`${contextLabel}\n${plainTranscript(context)}`);
   if (stateJson) parts.push(`Your saved state from earlier runs:\n${stateJson}`);
   parts.push(`The message to answer, from ${message.author.label}:\n${message.text}`);
   if (extra) parts.push(extra);
   return parts.join('\n\n');
+}
+
+interface CallOptions {
+  adapter: Adapter;
+  cmd: string;
+  prompt: string;
+  resumeId: string | null;
+  permissionMode: string | undefined;
+  allowedTools: string | undefined;
+  skipPermissions: boolean;
+  model: string | null;
+  effort: string | null;
+  appendSystemPrompt: string | undefined;
+  timeoutMs: number;
+  onDelta: ((frame: StreamFrame) => void) | null;
 }
 
 /**
@@ -294,7 +350,7 @@ function buildPrompt({ event, context, contextLabel, stateJson, extra }) {
  *
  * *How* to call it, and how to read it back, belong to the adapter: which
  * arguments carry the prompt and the resumed conversation, where in the output
- * the answer sits (see `adapters.js`). What is left here is the part that needs
+ * the answer sits (see `adapters.ts`). What is left here is the part that needs
  * a process — the pipes, the timeout, and the rule that a binary which will not
  * start is a failed answer rather than a crashed watcher.
  *
@@ -302,8 +358,6 @@ function buildPrompt({ event, context, contextLabel, stateJson, extra }) {
  * It changes nothing about what gets posted: the reply is still parsed once,
  * at `close`, out of everything that was printed. It only means somebody gets
  * to watch it being written.
- *
- * @returns {Promise<{text: string, sessionId: string|null, model: string|null, error: string|null}>}
  */
 function callAgent({
   adapter,
@@ -318,7 +372,7 @@ function callAgent({
   appendSystemPrompt,
   timeoutMs,
   onDelta,
-}) {
+}: CallOptions): Promise<AgentReply> {
   return new Promise((resolve) => {
     const args = buildAgentArgs(adapter, {
       prompt,
@@ -338,7 +392,10 @@ function callAgent({
     // What the store already said for this conversation, before the call. An
     // adapter that reads its answer back out of a store needs this to tell a
     // fresh answer from the one that was already there.
-    const priorAnswer = adapter.reply?.text?.lookup && resumeId ? lookupReported(adapter, { sessionId: resumeId }, 'text') : null;
+    const priorAnswer =
+      adapter.reply.text?.lookup && resumeId
+        ? lookupReported(adapter, { sessionId: resumeId }, 'text')
+        : null;
 
     const child = spawn(cmd, args, { stdio: [viaStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -351,9 +408,9 @@ function callAgent({
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
-    timer.unref?.();
+    timer.unref();
 
-    if (viaStdin) {
+    if (viaStdin && child.stdin) {
       // A child that died before reading its prompt is reported by `error`
       // below; the broken pipe on the way there is not news.
       child.stdin.on('error', () => {});
@@ -367,11 +424,13 @@ function callAgent({
     // time, forward, a completed line at a time — `narrated` is how far that
     // reading has got, so no line is ever sent twice and a line split across
     // two chunks waits for its other half.
-    const narrating = Boolean(adapter.stream && onDelta);
+    const stream = adapter.stream;
+    const narrating = Boolean(stream && onDelta);
     let narrated = 0;
-    child.stdout.on('data', (chunk) => {
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
       stdout += chunk;
-      if (!narrating) return;
+      if (!narrating || !stream || !onDelta) return;
       const end = stdout.lastIndexOf('\n');
       if (end < narrated) return;
       const complete = stdout.slice(narrated, end).split('\n');
@@ -379,7 +438,7 @@ function callAgent({
       for (const printed of complete) {
         const frame = printed.trim();
         if (!frame) continue;
-        let parsed;
+        let parsed: unknown;
         try {
           parsed = JSON.parse(frame);
         } catch {
@@ -389,16 +448,25 @@ function callAgent({
           // about: the answer is still read out of the whole of stdout.
           continue;
         }
-        const delta = adapter.stream.read(parsed);
+        const delta = stream.read(parsed);
         if (delta) onDelta(delta);
       }
     });
-    child.stderr.on('data', (chunk) => (stderr += chunk));
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
     child.on('error', (err) => {
       // The one place an install hint helps: the binary is not there at all.
       const hint = adapter.installHint ? ` — ${adapter.installHint}` : '';
       clearTimeout(timer);
-      resolve({ text: '', sessionId: null, model: null, error: `could not start "${cmd}": ${err.message}${hint}` });
+      resolve({
+        text: '',
+        sessionId: null,
+        model: null,
+        effort: null,
+        error: `could not start "${cmd}": ${err.message}${hint}`,
+      });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
@@ -408,12 +476,16 @@ function callAgent({
         // therefore the only surviving trace of a run that timed out, which
         // is most of the argument for streaming at all.
         const seconds = Math.round(timeoutMs / 1000);
-        resolve({ text: '', sessionId: null, model: null, error: `${cmd} did not answer within ${seconds}s` });
+        resolve({
+          text: '',
+          sessionId: null,
+          model: null,
+          effort: null,
+          error: `${cmd} did not answer within ${seconds}s`,
+        });
         return;
       }
       const reply = parseAgentReply(adapter, { stdout, stderr, code, cmd });
-      // An agent that keeps its own record of what it ran is asked for it once
-      // the session id is known — the request we made is only a request.
       // A console is a display. An agent that keeps its own record of the run
       // is asked for it once the session id is known: what it wrote down beats
       // what it drew, and the request we made is only a request.
@@ -421,7 +493,7 @@ function callAgent({
         model: reply.model ?? lookupReported(adapter, reply, 'model'),
         effort: reply.effort ?? lookupReported(adapter, reply, 'effort'),
       };
-      if (reply.error || !adapter.reply?.text?.lookup) {
+      if (reply.error || !adapter.reply.text?.lookup) {
         resolve({ ...reply, ...rest });
         return;
       }
@@ -429,7 +501,7 @@ function callAgent({
       // A resumed conversation already had an answer in there. If the store
       // says the same thing it said before the call, this run wrote nothing —
       // posting that would be answering the new message with the old reply.
-      const fresh = recorded && recorded !== priorAnswer;
+      const fresh = recorded !== null && recorded !== priorAnswer;
       resolve({
         ...reply,
         ...rest,
@@ -441,6 +513,9 @@ function callAgent({
     });
   });
 }
+
+/** How a delta reaches the daemon: a POST to one of its live routes. */
+type PostDelta = (path: string, body: object) => Promise<unknown>;
 
 /**
  * Where a delta goes.
@@ -454,12 +529,8 @@ function callAgent({
  * With no daemon running there is nobody watching, and a run costs exactly
  * what it cost before: nothing is spawned, nothing is dialled, and the answer
  * arrives as one finished message the way it always has.
- *
- * @returns {((path: string, body: object) => Promise<any>)|null}
  */
-function openDeltas(ws, home, token) {
-  // A watcher already pointed at a daemon is holding the client we need.
-  if (ws.remote) return (path, body) => ws.request('POST', path, body);
+function openDeltas(home: string | undefined, token: string | undefined): PostDelta | null {
   const target = readDaemonFile(home);
   if (!target?.url) return null;
   const client = new RemoteWorkspace({
@@ -467,6 +538,24 @@ function openDeltas(ws, home, token) {
     token: token ?? process.env.SLICK_TOKEN ?? target.token ?? null,
   });
   return (path, body) => client.request('POST', path, body);
+}
+
+/** The blob as it is built here, in the wire's short keys; core clamps and stores it. */
+interface LiveTrace {
+  t: string | null;
+  p: ThinkingPhase;
+  s: ThinkingStep[];
+}
+
+interface Streamer {
+  /** What `callAgent` calls for every frame it managed to read. */
+  delta(frame: StreamFrame): void;
+  /** The call is over; settle the blob and flush what is buffered. */
+  finish(outcome: 'done' | 'error'): Promise<void>;
+  /** The answer has landed (or never will); take the draft back. */
+  close(): Promise<void>;
+  /** The blob to stamp on the message, or null if the run never narrated. */
+  think(): LiveTrace | null;
 }
 
 /**
@@ -492,33 +581,40 @@ function openDeltas(ws, home, token) {
  * Nothing here can fail a call: a delta the daemon refused, or a daemon that
  * died mid-answer, costs the display and not the reply.
  */
-function openStreamer(post, { agentId, threadId }) {
+function openStreamer(
+  post: PostDelta,
+  { agentId, threadId }: { agentId: string; threadId: string }
+): Streamer {
   /** Text waiting for the next flush. */
   let pending = '';
-  let timer = null;
+  let timer: NodeJS.Timeout | null = null;
   /** Posts are chained rather than fired, so they arrive in the order written. */
-  let sending = Promise.resolve();
+  let sending: Promise<void> = Promise.resolve();
 
-  /** The blob, in the wire's short keys — the shape core clamps and stores. */
-  const think = { t: null, p: 'streaming', s: [] };
+  const think: LiveTrace = { t: null, p: 'streaming', s: [] };
   /** The tail of what has been reasoned, which is where the title comes from. */
   let reasoned = '';
-  const steps = new Map();
+  const steps = new Map<string, ThinkingStep>();
   /** Something about the blob changed since the last frame carried a copy. */
   let liveDirty = false;
   let thought = false;
   /** Whether anything at all was ever sent, which decides if there is an end. */
   let narrated = false;
 
-  const send = (path, body) => {
-    sending = sending.then(() => post(path, { agentId, threadId, ...body }).catch(() => {}));
+  const send = (path: string, body: object): Promise<void> => {
+    sending = sending.then(() =>
+      post(path, { agentId, threadId, ...body }).then(
+        () => undefined,
+        () => undefined
+      )
+    );
     return sending;
   };
 
   // A fresh object each time: the blob keeps being edited after this one is
   // handed off, and a step that changed status in flight would rewrite a frame
   // that has already gone out.
-  const snapshot = () => ({ ...think, s: think.s.map((step) => ({ ...step })) });
+  const snapshot = (): LiveTrace => ({ ...think, s: think.s.map((step) => ({ ...step })) });
 
   /**
    * The durable half, on the step set's own clock.
@@ -529,7 +625,7 @@ function openStreamer(post, { agentId, threadId }) {
    */
   const sendThinking = () => {
     liveDirty = false;
-    send('/api/thinking', { think: snapshot() });
+    void send('/api/thinking', { think: snapshot() });
   };
 
   const flush = () => {
@@ -541,25 +637,25 @@ function openStreamer(post, { agentId, threadId }) {
     const text = pending;
     pending = '';
     narrated = true;
-    // The blob rides along on a frame that was going out anyway, so the draft
-    // bubble can draw its own box without a second request. Only here: the
-    // title moves at reasoning speed, which is the one rate the durable route
-    // must never see.
+    // The blob rides along on a frame that was going out anyway, so the
+    // streaming bubble can draw its own box without a second request. Only
+    // here: the title moves at reasoning speed, which is the one rate the
+    // durable route must never see.
     const live = thought && liveDirty ? snapshot() : null;
     if (live) liveDirty = false;
-    send('/api/stream/delta', live ? { text, think: live } : { text });
+    void send('/api/stream/delta', live ? { text, think: live } : { text });
   };
 
   const later = () => {
     if (timer) return;
     timer = setTimeout(flush, DELTA_EVERY_MS);
-    timer.unref?.();
+    timer.unref();
   };
 
-  /** @returns {boolean} whether the step set moved, which is what earns a row. */
-  const noteStep = (title, status) => {
+  /** Whether the step set moved, which is what earns a row. */
+  const noteStep = (title: string, status: string | null): boolean => {
     thought = true;
-    const known = STEP_STATUSES.has(status) ? status : null;
+    const known = isStepStatus(status) ? status : null;
     const existing = steps.get(title);
     if (existing) {
       // The same step named twice is that step reporting back, never a second
@@ -571,14 +667,17 @@ function openStreamer(post, { agentId, threadId }) {
       return true;
     }
     if (think.s.length >= THINK_STEPS_MAX) return false; // the blob's own cap; the tail is dropped
-    const step = { id: `s${think.s.length}`, t: title.slice(0, THINK_TITLE_MAX), st: known ?? 'in_progress' };
+    const step: ThinkingStep = {
+      id: `s${think.s.length}`,
+      t: title.slice(0, THINK_TITLE_MAX),
+      st: known ?? 'in_progress',
+    };
     steps.set(title, step);
     think.s.push(step);
     return true;
   };
 
   return {
-    /** What `callAgent` calls for every frame it managed to read. */
     delta({ text, reasoning, step, stepStatus }) {
       if (text) {
         pending += text;
@@ -621,14 +720,16 @@ function openStreamer(post, { agentId, threadId }) {
      * `complete` would put "Finished thinking" over the exact moment the reader
      * needs to look at — so a failed call lands them on `error`, which is also
      * the one phase the box opens itself for.
-     *
-     * @param {'done'|'error'} outcome
      */
     async finish(outcome) {
       if (thought) {
-        const settled = outcome === 'error' ? 'error' : 'done';
+        // A step is `complete` or `error`; only the trace itself is `done`.
+        // (Stamping the trace's word on the steps used to read as an unknown
+        // status, which core settles to `pending` — a finished run whose
+        // tools all showed as never having started.)
+        const settled: StepStatus = outcome === 'error' ? 'error' : 'complete';
         for (const step of think.s) if (step.st === 'pending' || step.st === 'in_progress') step.st = settled;
-        think.p = settled;
+        think.p = outcome;
         sendThinking();
       }
       flush();
@@ -636,26 +737,32 @@ function openStreamer(post, { agentId, threadId }) {
     },
 
     /**
-     * The answer has landed; there is nothing left to draft.
+     * The answer has landed; there is nothing left to stream.
      *
      * This is deliberately not part of `finish()`. The call ends before the
-     * reply is posted, and a `done` frame sent there blanks the draft one whole
-     * round trip before the real message can replace it — the reader watches a
-     * finished answer disappear and come back. `message.created` already clears
-     * the draft for the agent that was drafting, so by the time this is sent
-     * the frame is only insurance for the paths where no message is ever posted
-     * at all: a call that ran out of attempts, a thread that went away.
+     * reply is posted, and a `done` frame sent there blanks the streaming
+     * bubble one whole round trip before the real message can replace it —
+     * the reader watches a finished answer disappear and come back.
+     * `message.created` already clears the bubble for the agent that was
+     * streaming, so by the time this is sent the frame is only insurance for
+     * the paths where no message is ever posted at all: a call that ran out
+     * of attempts, a thread that went away.
      */
     async close() {
       // A run that never showed anything has nothing to take back, and its
       // "done" would be the only frame anyone ever saw.
-      if (narrated) send('/api/stream/delta', { done: true });
+      if (narrated) void send('/api/stream/delta', { done: true });
       await sending;
     },
 
-    /** The blob to stamp on the message, or null if the run never narrated. */
-    think: () => (thought ? { ...think, s: think.s.map((step) => ({ ...step })) } : null),
+    think: () => (thought ? snapshot() : null),
   };
+}
+
+interface Doorbell {
+  /** `pollMs` with no stream to listen to; `idleMs` with one — a backstop, not a cadence. */
+  wait(pollMs: number, idleMs: number): Promise<void>;
+  close(): void;
 }
 
 /**
@@ -673,24 +780,22 @@ function openStreamer(post, { agentId, threadId }) {
  * same cursor as before. That way a missed frame, a dead daemon or a stream
  * that never connects costs nothing but the interval we would have waited
  * anyway.
- *
- * @returns {{wait: (pollMs: number, idleMs: number) => Promise<void>, close: () => void}|null}
  */
-function openDoorbell(home) {
+function openDoorbell(home: string | undefined): Doorbell | null {
   const target = readDaemonFile(home);
   if (!target?.url) return null; // no daemon: the interval is the only clock
 
   const url = `${String(target.url).replace(/\/+$/, '')}/api/stream`;
-  const headers = {
+  const headers: Record<string, string> = {
     accept: 'text/event-stream',
     ...(target.token ? { authorization: `Bearer ${target.token}` } : {}),
   };
 
   let connected = false;
   let pending = false;
-  let wake = null;
+  let wake: (() => void) | null = null;
   let closed = false;
-  let controller = null;
+  let controller: AbortController | null = null;
 
   /** Something happened. If a pass is waiting, cut the wait short; if not, remember. */
   const ring = () => {
@@ -698,7 +803,7 @@ function openDoorbell(home) {
     wake?.();
   };
 
-  async function listen() {
+  async function listen(): Promise<void> {
     const decoder = new TextDecoder();
     while (!closed) {
       controller = new AbortController();
@@ -707,7 +812,7 @@ function openDoorbell(home) {
         if (!res.ok || !res.body) throw new Error(`stream answered ${res.status}`);
         connected = true;
         let buffer = '';
-        for await (const chunk of res.body) {
+        for await (const chunk of res.body as AsyncIterable<Uint8Array>) {
           if (closed) break;
           buffer += decoder.decode(chunk, { stream: true });
           const lines = buffer.split('\n');
@@ -728,19 +833,15 @@ function openDoorbell(home) {
     }
   }
 
-  listen();
+  void listen();
 
   return {
-    /**
-     * @param {number} pollMs  how long to wait with no stream to listen to
-     * @param {number} idleMs  how long to wait with one — a backstop, not a cadence
-     */
     wait(pollMs, idleMs) {
       if (pending || closed) {
         pending = false;
         return Promise.resolve();
       }
-      return new Promise((resolve) => {
+      return new Promise<void>((resolve) => {
         const done = () => {
           clearTimeout(timer);
           wake = null;
@@ -748,7 +849,7 @@ function openDoorbell(home) {
           resolve();
         };
         const timer = setTimeout(done, connected ? idleMs : pollMs);
-        timer.unref?.();
+        timer.unref();
         wake = done;
       });
     },
@@ -769,30 +870,37 @@ function openDoorbell(home) {
  * answer too: it just means this session types its model rather than picking
  * it.
  *
- * @returns {Promise<Array|null>} null when the binary did not answer with a list
+ * Null when the binary did not answer with a list.
  */
-function askModels(adapter, cmd) {
+function askModels(adapter: Adapter, cmd: string): Promise<ModelChoice[] | null> {
   const listArgs = buildModelListArgs(adapter);
   if (!listArgs) return Promise.resolve(null);
   return new Promise((resolve) => {
-    let child;
+    let child: ChildProcess;
     try {
       child = spawn(cmd, listArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
     } catch {
-      return resolve(null);
+      resolve(null);
+      return;
     }
     let stdout = '';
     const timer = setTimeout(() => child.kill('SIGKILL'), MODELS_TIMEOUT_MS);
-    timer.unref?.();
-    child.stdout.on('data', (chunk) => (stdout += chunk));
-    child.stderr.on('data', () => {}); // drained so a chatty binary cannot block
+    timer.unref();
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr?.on('data', () => {}); // drained so a chatty binary cannot block
     child.on('error', () => {
       clearTimeout(timer);
       resolve(null);
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code !== 0) return resolve(null);
+      if (code !== 0) {
+        resolve(null);
+        return;
+      }
       try {
         const choices = normalizeModelChoices(JSON.parse(stdout));
         resolve(choices.length > 0 ? choices : null);
@@ -803,26 +911,40 @@ function askModels(adapter, cmd) {
   });
 }
 
+export interface ServeContext {
+  agentId: string | undefined;
+  flags: Flags;
+  json: boolean;
+}
+
 /**
- * Run the watch-and-respond loop for one session.
- * @param {import('@slick/core').Workspace} ws
- * @param {string} ref
- * @param {{agentId: string|undefined, flags: Record<string, any>}} ctx
+ * The watcher's bookkeeping is written straight into the database, and its
+ * typing indicator has to be switchable off from an `exit` handler, which is
+ * only possible when the write is synchronous. Both mean a local workspace.
  */
-export async function serve(ws, ref, ctx) {
+function localWorkspace(ws: WorkspaceApi): Workspace {
+  if (ws instanceof Workspace) return ws;
+  throw new ValidationError('`slick agent serve` needs a local workspace.', {
+    hint: 'Run it on the machine that holds the database, without --remote.',
+  });
+}
+
+/** Run the watch-and-respond loop for one session. */
+export async function serve(api: WorkspaceApi, ref: string, ctx: ServeContext): Promise<void> {
+  const ws = localWorkspace(api);
   const { flags } = ctx;
-  const session = await ws.agents.get(ref, { agentId: ctx.agentId });
+  const session = ws.agents.get(ref, { agentId: ctx.agentId });
   const respondAgentId = ctx.agentId ?? session.agentId;
 
-  const interval = Math.max(Number(flags.interval ?? 2000), 500);
-  const once = Boolean(flags.once);
-  const all = Boolean(flags.all);
-  const dryRun = Boolean(flags['dry-run']);
-  const contextLimit = flags.context !== undefined ? Number(flags.context) : 20;
+  const interval = Math.max(flagNumber(flags, 'interval') ?? 2000, 500);
+  const once = flagOn(flags, 'once');
+  const all = flagOn(flags, 'all');
+  const dryRun = flagOn(flags, 'dry-run');
+  const contextLimit = flagNumber(flags, 'context') ?? 20;
   // Which calling convention this binary speaks. `--cmd` still names the
   // binary; an adapter is about *how* it is called, not where it lives.
-  const adapter = loadAdapter(flags.adapter ?? DEFAULT_ADAPTER, ws.home);
-  const cmd = flags.cmd ?? adapter.cmd;
+  const adapter = loadAdapter(flagText(flags, 'adapter') ?? DEFAULT_ADAPTER, ws.home);
+  const cmd = flagText(flags, 'cmd') ?? adapter.cmd;
   if (!cmd) {
     throw new ValidationError(`The "${adapter.name}" adapter does not name a binary to run.`, {
       hint: `Say which one: slick agent serve --adapter ${adapter.name} --cmd ./my-agent`,
@@ -833,23 +955,26 @@ export async function serve(ws, ref, ctx) {
   // answer "what commands does this agent have?".
   if (readServeAdapter(session.state) !== adapter.name) {
     try {
-      await ws.agents.setState(ref, { [SERVE_ADAPTER_KEY]: adapter.name }, { agentId: ctx.agentId, merge: true });
+      ws.agents.setState(ref, { [SERVE_ADAPTER_KEY]: adapter.name }, { agentId: ctx.agentId, merge: true });
     } catch (err) {
-      warn(`Could not record the adapter on this session: ${err.message}`);
+      warn(`Could not record the adapter on this session: ${errorMessage(err)}`);
     }
   }
   // An agent that cannot be handed a conversation starts every message fresh,
   // so there is no id worth saving and no memory to assume it is holding.
   const canResume = supportsResume(adapter);
-  const timeoutMs = flags.timeout ? Number(flags.timeout) : 10 * 60 * 1000;
-  const maxAttempts = Math.max(Number(flags['max-attempts'] ?? 3), 1);
-  const shared = Boolean(flags['shared-session']);
+  const timeoutMs = flagNumber(flags, 'timeout') ?? 10 * 60 * 1000;
+  const maxAttempts = Math.max(flagNumber(flags, 'max-attempts') ?? 3, 1);
+  const shared = flagOn(flags, 'shared-session');
 
-  const readOpts = {
-    agentId: ctx.agentId,
-    channel: flags.channel,
-    scope: flags.scope ?? (flags['this-channel'] ? 'session' : undefined),
-  };
+  const scopeFlag = flagText(flags, 'scope');
+  const scope: 'session' | 'workspace' | undefined =
+    scopeFlag === 'session' || scopeFlag === 'workspace'
+      ? scopeFlag
+      : flagOn(flags, 'this-channel')
+        ? 'session'
+        : undefined;
+  const readOpts = { agentId: ctx.agentId, channel: flagText(flags, 'channel'), scope };
 
   const asJson = ctx.json || !process.stdout.isTTY;
   if (!asJson) {
@@ -872,21 +997,18 @@ export async function serve(ws, ref, ctx) {
   // Before this was per-thread there was a single id for the whole watcher.
   // Which thread it belongs to is unknowable now, so it is only worth keeping
   // when this watcher is deliberately still sharing one conversation.
-  const legacyId = session.state?._serveSessionId ?? null;
+  const legacyId = stringOrNull(session.state._serveSessionId);
+  const legacySig = stringOrNull(session.state._serveStateSig);
   if (shared && legacyId && !threads.has(SHARED_THREAD)) {
-    threads.set(SHARED_THREAD, {
-      sessionId: legacyId,
-      stateSig: session.state?._serveStateSig ?? null,
-      at: Date.now(),
-    });
+    threads.set(SHARED_THREAD, { sessionId: legacyId, stateSig: legacySig, seq: 0, at: Date.now() });
   }
-  let staleKeys = legacyId != null || session.state?._serveStateSig != null;
+  let staleKeys = legacyId != null || session.state._serveStateSig != null;
   /** What the last pass used, so a change is announced once, not per pass. */
-  let activeModel = readServeModel(session.state) ?? flags.model ?? null;
-  let activeEffort = readServeEffort(session.state) ?? flags.effort ?? null;
+  let activeModel = readServeModel(session.state) ?? flagText(flags, 'model') ?? null;
+  let activeEffort = readServeEffort(session.state) ?? flagText(flags, 'effort') ?? null;
   let threadsChanged = false;
   /** message id → consecutive failed attempts, so one bad message cannot wedge the queue. */
-  const failures = new Map();
+  const failures = new Map<string, number>();
   let backoff = interval;
 
   /**
@@ -899,7 +1021,7 @@ export async function serve(ws, ref, ctx) {
    * write is synchronous, which is the only kind of write that can still land
    * from here.
    */
-  let showingTyping = null;
+  let showingTyping: TypingInput | null = null;
   process.once('exit', () => {
     if (!showingTyping) return;
     try {
@@ -911,44 +1033,46 @@ export async function serve(ws, ref, ctx) {
 
   // Only an adapter that can describe its frames has anything to send, so an
   // agent that says nothing about streaming never even looks for a daemon.
-  const postDelta = adapter.stream ? openDeltas(ws, ws.home, flags.token) : null;
+  const postDelta = adapter.stream ? openDeltas(ws.home, flagText(flags, 'token')) : null;
 
-  const release = flags['no-lock'] ? () => {} : claimSession(ws.home, session.key);
+  const release = flagOn(flags, 'no-lock') ? () => {} : claimSession(ws.home, session.key);
   // A single pass has nothing to wait for, so it never opens one.
   const doorbell = once ? null : openDoorbell(ws.home);
   try {
     for (;;) {
-      const resumed = await ws.agents.resume(ref, { ...readOpts, contextLimit, limit: 200 });
-      const created = resumed.missed.filter((e) => e.type === 'message.created' && e.message);
-      const targets = all ? created : created.filter((e) => (e.message.mentions ?? []).includes(respondAgentId));
+      const resumed = ws.agents.resume(ref, { ...readOpts, contextLimit, limit: 200 });
+      const created = resumed.missed.filter(
+        (e): e is MessageEvent => e.type === 'message.created' && Boolean(e.message)
+      );
+      const targets = all ? created : created.filter((e) => e.message.mentions.includes(respondAgentId));
 
       // A message we failed to answer, and everything after it, stays unread —
       // we would rather retry (and risk a duplicate reply once the trouble
       // clears) than silently skip something nobody ever saw.
-      let failedAtSeq = null;
+      let failedAtSeq: number | null = null;
 
       // Keep the app's model picker stocked. It is the watcher that knows how
       // to reach the binary, so it is the watcher that asks — on the way past,
       // at most once a TTL, and never at the cost of an answer.
-      if (!dryRun && Date.now() - Number(resumed.state?.[SERVE_MODELS_AT_KEY] ?? 0) > MODELS_TTL_MS) {
+      if (!dryRun && Date.now() - Number(resumed.state[SERVE_MODELS_AT_KEY] ?? 0) > MODELS_TTL_MS) {
         const choices = await askModels(adapter, cmd);
         try {
           // The timestamp is written either way: a binary with no such flag
           // must be asked once a TTL, not once a pass.
-          await ws.agents.setModelChoices(ref, choices, { agentId: ctx.agentId });
+          ws.agents.setModelChoices(ref, choices, { agentId: ctx.agentId });
           if (choices && !asJson) note(`${cmd} offers ${choices.length} model(s)`);
         } catch (err) {
-          warn(`Could not save the model list: ${err.message}`);
+          warn(`Could not save the model list: ${errorMessage(err)}`);
         }
       }
 
       // Re-read every pass, so `slick agent model` reaches a running watcher.
-      const model = readServeModel(resumed.state) ?? flags.model ?? null;
+      const model = readServeModel(resumed.state) ?? flagText(flags, 'model') ?? null;
       if (model !== activeModel) {
         if (!asJson) note(`Model → ${style.bold(model ?? `${cmd} default`)}`);
         activeModel = model;
       }
-      const effort = readServeEffort(resumed.state) ?? flags.effort ?? null;
+      const effort = readServeEffort(resumed.state) ?? flagText(flags, 'effort') ?? null;
       if (effort !== activeEffort) {
         if (!asJson) note(`Effort → ${style.bold(effort ?? `${cmd} default`)}`);
         activeEffort = effort;
@@ -959,19 +1083,24 @@ export async function serve(ws, ref, ctx) {
       const currentSig = stateJson ? stateSignature(stateJson) : null;
 
       for (const event of targets) {
-        const threadKey = shared ? SHARED_THREAD : (event.message.threadId ?? event.message.id);
-        const thread = threads.get(threadKey) ?? { sessionId: null, stateSig: null, seq: 0, at: 0 };
+        const threadKey = shared ? SHARED_THREAD : event.message.threadId || event.message.id;
+        const thread: ThreadEntry = threads.get(threadKey) ?? {
+          sessionId: null,
+          stateSig: null,
+          seq: 0,
+          at: 0,
+        };
 
         // A fresh session has never seen the agent's memory; a resumed one is
         // still holding the copy we sent it, so it only needs the new value
         // when the human (or the agent) has actually changed something.
-        const includeState = (fresh) =>
+        const includeState = (fresh: boolean): boolean =>
           Boolean(stateJson) && (fresh || !thread.sessionId || currentSig !== thread.stateSig);
-        const inThread = shared ? null : await threadContext(ws, event.message, contextLimit);
+        const inThread = shared ? null : threadContext(ws, event.message, contextLimit);
         // The channel tail is a plain window on the channel, so it holds the
         // message we are about to quote in full underneath it. One copy is
         // enough. (`threadContext` already stops short of it.)
-        const tail = (inThread ?? resumed.context ?? []).filter((m) => m.id !== event.message.id);
+        const tail = (inThread ?? resumed.context).filter((m) => m.id !== event.message.id);
         // The same reasoning, for the conversation itself. A resumed transcript
         // is already holding every turn we sent it, so re-sending the whole
         // tail made each message carry another copy of the last twenty: the
@@ -980,11 +1109,11 @@ export async function serve(ws, ref, ctx) {
         // message it last answered — the quiet messages nobody mentioned it
         // in, another agent's reply — so that is what it gets. The watermark,
         // not the window.
-        const contextFor = (fresh) => {
-          const seen = fresh || !thread.sessionId ? 0 : (thread.seq ?? 0);
-          return seen > 0 ? tail.filter((m) => Number(m.seq ?? 0) > seen) : tail;
+        const contextFor = (fresh: boolean): Message[] => {
+          const seen = fresh || !thread.sessionId ? 0 : thread.seq;
+          return seen > 0 ? tail.filter((m) => m.seq > seen) : tail;
         };
-        const promptFor = (fresh) =>
+        const promptFor = (fresh: boolean): string =>
           buildPrompt({
             event,
             context: contextFor(fresh),
@@ -992,7 +1121,7 @@ export async function serve(ws, ref, ctx) {
               ? 'Earlier in this thread:'
               : `Recent conversation in #${event.channelSlug ?? event.message.channelSlug ?? '?'}:`,
             stateJson: includeState(fresh) ? stateJson : null,
-            extra: flags.system,
+            extra: flagText(flags, 'system'),
           });
 
         if (dryRun) {
@@ -1002,7 +1131,7 @@ export async function serve(ws, ref, ctx) {
           continue;
         }
 
-        const typingOpts = {
+        const typingOpts: TypingInput = {
           agentId: ctx.agentId,
           threadId: event.message.threadId,
           channelId: event.message.channelId,
@@ -1013,33 +1142,34 @@ export async function serve(ws, ref, ctx) {
         // The narration outlives the call it narrates: the frame that says no
         // more is coming belongs after the reply has landed, and the reply is
         // posted well below the `finally` that ends the call.
-        let streamer = null;
+        let streamer: Streamer | null = null;
         try {
           showingTyping = typingOpts;
-          await ws.agents.typing(ref, { ...typingOpts, on: true });
+          ws.agents.typing(ref, { ...typingOpts, on: true });
           // One narration per message answered, not per watcher: the thread it
           // belongs to is the thing being answered, and the blob it collects
           // is stamped on the answer below.
           streamer = postDelta
             ? openStreamer(postDelta, { agentId: respondAgentId, threadId: event.message.threadId })
             : null;
-          let result;
+          let result: AgentReply | undefined;
           let sentState = includeState(false);
           try {
-            const call = (resumeId, prompt) =>
+            const narrator = streamer;
+            const call = (resumeId: string | null, prompt: string) =>
               callAgent({
                 adapter,
                 cmd,
                 prompt,
                 resumeId,
-                permissionMode: flags['permission-mode'],
-                allowedTools: flags['allowed-tools'],
-                skipPermissions: Boolean(flags['dangerously-skip-permissions']),
+                permissionMode: flagText(flags, 'permission-mode'),
+                allowedTools: flagText(flags, 'allowed-tools'),
+                skipPermissions: flagOn(flags, 'dangerously-skip-permissions'),
                 model,
                 effort,
-                appendSystemPrompt: flags['append-system-prompt'],
+                appendSystemPrompt: flagText(flags, 'append-system-prompt'),
                 timeoutMs,
-                onDelta: streamer ? (delta) => streamer.delta(delta) : null,
+                onDelta: narrator ? (frame) => narrator.delta(frame) : null,
               });
             result = await call(thread.sessionId, promptFor(false));
 
@@ -1055,7 +1185,11 @@ export async function serve(ws, ref, ctx) {
               threads.delete(threadKey);
               // The whole map goes out, so nothing another thread earned
               // earlier in this pass is left waiting to be written.
-              await ws.agents.setState(ref, { _serveThreads: prune(threads) }, { agentId: ctx.agentId, merge: true });
+              ws.agents.setState(
+                ref,
+                { _serveThreads: prune(threads) },
+                { agentId: ctx.agentId, merge: true }
+              );
               threadsChanged = false;
               sentState = includeState(true);
               result = await call(null, promptFor(true));
@@ -1064,12 +1198,15 @@ export async function serve(ws, ref, ctx) {
             showingTyping = null;
             // The narration ends with the call, however the call ended — a
             // failure, a retired session, a timeout. Anything else leaves a
-            // half-written draft on screen with nothing coming to replace it.
+            // half-written answer on screen with nothing coming to replace it.
             // How it ended goes with it: `result` is unset only if the call
             // threw, which is not a run that finished thinking either.
             await streamer?.finish(result && !result.error ? 'done' : 'error');
-            await ws.agents.typing(ref, { ...typingOpts, on: false });
+            ws.agents.typing(ref, { ...typingOpts, on: false });
           }
+          // The call threw if this is still unset, and a throw lands in the
+          // catch below before this line is ever reached.
+          if (!result) continue;
 
           // Only a session that worked is worth remembering. Saving the id from
           // a failed call is what let the unusable one survive every restart.
@@ -1097,12 +1234,12 @@ export async function serve(ws, ref, ctx) {
             // message behind this one, so say so in the thread and move on.
             failures.delete(event.message.id);
             try {
-              await ws.agents.reply(ref, event.message.threadId, {
+              ws.agents.reply(ref, event.message.threadId, {
                 agentId: ctx.agentId,
                 text: `⚠️ I could not answer this after ${maxAttempts} attempts. Last error: ${result.error}`,
               });
             } catch (err) {
-              warn(`Could not post the failure note for ${event.message.id}: ${err.message}`);
+              warn(`Could not post the failure note for ${event.message.id}: ${errorMessage(err)}`);
             }
             continue;
           }
@@ -1123,9 +1260,6 @@ export async function serve(ws, ref, ctx) {
           // somewhere to ask it, since an adapter with no model group never
           // carried the request. One answer says it once, so the first piece
           // carries it and the rest say nothing.
-          // Only a request that actually reached the binary is worth claiming:
-          // a match-form group can drop a value it does not recognise, and
-          // then nothing was asked at all.
           const badge = result.model || (slotFires(adapter, 'model', model) ? model : null);
           // Effort reads the other way round from the model. `--effort` is a
           // per-run override the agent applies to *this* call, while a level in
@@ -1138,7 +1272,7 @@ export async function serve(ws, ref, ctx) {
           // message is all anyone arriving late — or reloading the page — has
           // of the steps that produced the answer.
           const thinking = streamer?.think() ?? null;
-          const stamp =
+          const stamp: MessageMetadata | null =
             badge || level || thinking
               ? {
                   ...(badge ? { _model: badge } : {}),
@@ -1146,26 +1280,27 @@ export async function serve(ws, ref, ctx) {
                   ...(thinking ? { _think: thinking } : {}),
                 }
               : null;
-          let posted = null;
+          let posted: Message | null = null;
           for (const [index, piece] of pieces.entries()) {
-            posted = await ws.agents.reply(ref, event.message.threadId, {
+            posted = ws.agents.reply(ref, event.message.threadId, {
               agentId: ctx.agentId,
               text: piece,
               metadata: index === 0 ? stamp : null,
-            });
-            if (asJson) line(JSON.stringify({ repliedTo: event.message.id, message: posted.message }));
+            }).message;
+            if (asJson) line(JSON.stringify({ repliedTo: event.message.id, message: posted }));
           }
+          if (!posted) continue; // splitMessageText always yields at least one piece
           // Our own answer is a message in this thread too, and the child does
           // not need to be told what it just said — the watermark moves past
           // it rather than up to it.
           const entry = threads.get(threadKey);
-          if (entry && Number(posted.message?.seq) > (entry.seq ?? 0)) {
-            entry.seq = Number(posted.message.seq);
+          if (entry && posted.seq > entry.seq) {
+            entry.seq = posted.seq;
             threadsChanged = true;
           }
           if (!asJson) {
             const parts = pieces.length > 1 ? ` in ${pieces.length} messages` : '';
-            ok(`Replied in thread ${style.dim(posted.message.threadId)}${parts}`);
+            ok(`Replied in thread ${style.dim(posted.threadId)}${parts}`);
           }
         } catch (err) {
           // A message that has been hard-removed can never be answered — retrying
@@ -1179,7 +1314,7 @@ export async function serve(ws, ref, ctx) {
           }
           const attempts = (failures.get(event.message.id) ?? 0) + 1;
           failures.set(event.message.id, attempts);
-          warn(`Could not answer ${event.message.id} (${attempts}/${maxAttempts}): ${err.message}`);
+          warn(`Could not answer ${event.message.id} (${attempts}/${maxAttempts}): ${errorMessage(err)}`);
           if (attempts >= maxAttempts) {
             failures.delete(event.message.id);
             continue;
@@ -1188,15 +1323,15 @@ export async function serve(ws, ref, ctx) {
           break;
         } finally {
           // Whatever happened — the answer went in, the thread was gone, we ran
-          // out of attempts — the draft is over. It is said here rather than
-          // beside each of those endings because every one of them leaves a
-          // bubble on somebody's screen otherwise.
+          // out of attempts — the streaming reply is over. It is said here
+          // rather than beside each of those endings because every one of
+          // them leaves a bubble on somebody's screen otherwise.
           await streamer?.close();
         }
       }
 
       if (!dryRun) {
-        const patch = {};
+        const patch: SessionState = {};
         if (threadsChanged) patch._serveThreads = prune(threads);
         // The one-session-for-everything bookkeeping this replaced. Nothing
         // reads it any more, so clear it rather than leave a dead id behind
@@ -1206,13 +1341,16 @@ export async function serve(ws, ref, ctx) {
           patch._serveStateSig = null;
         }
         if (Object.keys(patch).length > 0) {
-          await ws.agents.setState(ref, patch, { agentId: ctx.agentId, merge: true });
+          ws.agents.setState(ref, patch, { agentId: ctx.agentId, merge: true });
           threadsChanged = false;
           staleKeys = false;
         }
-        const safeCount = failedAtSeq == null ? resumed.missed.length : resumed.missed.findIndex((e) => e.seq === failedAtSeq);
+        const safeCount =
+          failedAtSeq == null
+            ? resumed.missed.length
+            : resumed.missed.findIndex((e) => e.seq === failedAtSeq);
         if (safeCount > 0) {
-          await ws.agents.pull(ref, { ...readOpts, limit: safeCount });
+          ws.agents.pull(ref, { ...readOpts, limit: safeCount });
         }
       }
 
@@ -1247,4 +1385,4 @@ export const SERVE_SPEC = {
     'append-system-prompt',
     'max-attempts',
   ],
-};
+} satisfies ArgSpec;

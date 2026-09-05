@@ -14,6 +14,7 @@
 import {
   ValidationError,
   adapterDir,
+  isRecord,
   listAdapters,
   looksLikeHistoryKey,
   readServeEffort,
@@ -21,8 +22,15 @@ import {
   readServeModelChoices,
   supportsModelList,
   supportsResume,
+  type AgentSession,
+  type HydratedEvent,
+  type JsonObject,
+  type Message,
+  type MessageMetadata,
 } from '@slick/core';
-import { parseJsonFlag, resolveText } from '../args.js';
+import { flagNumber, flagOn, flagText, parseJsonFlag, resolveText } from '../args.ts';
+import type { Command, CommandContext } from '../context.ts';
+import { workspaceOf } from '../context.ts';
 import {
   ago,
   json,
@@ -35,17 +43,19 @@ import {
   style,
   table,
   warn,
-} from '../output.js';
-import { requireRef } from './channel.js';
-import { serve, SERVE_SPEC } from './agent-serve.js';
+} from '../output.ts';
+import { requireRef } from './channel.ts';
+import { serve, SERVE_SPEC } from './agent-serve.ts';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Where a history key can come from, in order of explicitness. */
-function sessionRef(ctx, positional) {
-  if (ctx.flags.key) return String(ctx.flags.key);
+function sessionRef(ctx: CommandContext, positional: string | undefined): string {
+  const key = flagText(ctx.flags, 'key');
+  if (key) return key;
   if (positional && looksLikeHistoryKey(positional)) return positional;
-  if (ctx.flags.name) return String(ctx.flags.name);
+  const name = flagText(ctx.flags, 'name');
+  if (name) return name;
   if (positional) return positional;
   const fromEnv = process.env.SLICK_AGENT_KEY;
   if (fromEnv) return fromEnv;
@@ -54,30 +64,47 @@ function sessionRef(ctx, positional) {
   });
 }
 
-function agentId(ctx) {
-  return ctx.flags.agent ? String(ctx.flags.agent) : process.env.SLICK_AGENT_ID || undefined;
+function agentId(ctx: CommandContext): string | undefined {
+  return flagText(ctx.flags, 'agent') ?? (process.env.SLICK_AGENT_ID || undefined);
 }
 
-function readOptions(ctx) {
+function readOptions(ctx: CommandContext) {
+  const scopeFlag = flagText(ctx.flags, 'scope');
+  // Annotated, not asserted: an object literal would widen the literal to
+  // `string`, and the services only take the two words.
+  const scope: 'session' | 'workspace' | undefined =
+    scopeFlag === 'session' || scopeFlag === 'workspace'
+      ? scopeFlag
+      : flagOn(ctx.flags, 'this-channel')
+        ? 'session'
+        : undefined;
   return {
     agentId: agentId(ctx),
-    limit: ctx.flags.limit ? Number(ctx.flags.limit) : undefined,
-    channel: ctx.flags.channel,
-    scope: ctx.flags.scope ?? (ctx.flags['this-channel'] ? 'session' : undefined),
-    includeOwn: Boolean(ctx.flags['include-own']),
+    limit: flagNumber(ctx.flags, 'limit'),
+    channel: flagText(ctx.flags, 'channel'),
+    scope,
+    includeOwn: flagOn(ctx.flags, 'include-own'),
   };
 }
 
-function sessionHeadline(session) {
+/** `--meta` as the agent service takes it. */
+function metadataFlag(ctx: CommandContext): MessageMetadata | null {
+  const parsed = parseJsonFlag(ctx.flags.meta, 'meta');
+  if (parsed == null) return null;
+  if (!isRecord(parsed)) throw new ValidationError('--meta must be a JSON object.');
+  return parsed;
+}
+
+function sessionHeadline(session: AgentSession): string {
   const bits = [
     `${style.bold(session.agentId)} ${style.dim('[agent]')}`,
     session.name ? style.cyan(session.name) : null,
     style.dim(session.key),
-  ].filter(Boolean);
+  ].filter((bit): bit is string => Boolean(bit));
   return bits.join(style.dim(' · '));
 }
 
-function printSessionDetail(session, pending) {
+function printSessionDetail(session: AgentSession, pending?: number): void {
   line(sessionHeadline(session));
   const facts = [
     session.channelSlug ? `#${session.channelSlug}` : 'no default channel',
@@ -91,8 +118,8 @@ function printSessionDetail(session, pending) {
 }
 
 /** Human-friendly rendering of a batch of events from pull/resume. */
-function printEvents(events) {
-  const messages = events.filter((e) => e.message).map((e) => e.message);
+function printEvents(events: HydratedEvent[]): void {
+  const messages = events.map((e) => e.message).filter((m): m is Message => Boolean(m));
   if (messages.length > 0) {
     line(renderTranscript(messages));
     line();
@@ -103,7 +130,7 @@ function printEvents(events) {
   }
 }
 
-export const agent = {
+export const agent: Command = {
   name: 'agent',
   aliases: ['a'],
   summary: 'Agent sessions: history keys, catching up, posting',
@@ -200,19 +227,20 @@ Serving
 
   async run(ctx) {
     const [sub = 'sessions', ...rest] = ctx.argv;
-    const { ws, flags } = ctx;
+    const ws = workspaceOf(ctx);
+    const { flags } = ctx;
 
     switch (sub) {
       // ------------------------------------------------------------ start ---
       case 'start':
       case 'join': {
         const session = await ws.agents.start({
-          agentId: flags.agent ?? process.env.SLICK_AGENT_ID ?? 'agent',
-          name: flags.name ?? rest[0] ?? null,
-          title: flags.title,
-          channel: flags.channel,
-          fromBeginning: Boolean(flags['from-beginning']),
-          reuse: Boolean(flags.reuse),
+          agentId: flagText(flags, 'agent') ?? process.env.SLICK_AGENT_ID ?? 'agent',
+          name: flagText(flags, 'name') ?? rest[0] ?? null,
+          title: flagText(flags, 'title'),
+          channel: flagText(flags, 'channel'),
+          fromBeginning: flagOn(flags, 'from-beginning'),
+          reuse: flagOn(flags, 'reuse'),
         });
         if (ctx.json) return json({ session });
         if (ctx.quiet) return line(session.key);
@@ -232,7 +260,7 @@ Serving
       case 'ls': {
         const sessions = await ws.agents.list({
           agentId: agentId(ctx),
-          includeEnded: Boolean(flags.all),
+          includeEnded: flagOn(flags, 'all'),
         });
         if (ctx.json) return json({ sessions });
         if (sessions.length === 0) {
@@ -248,9 +276,9 @@ Serving
             seen: ago(s.lastSeenAt),
             // The app hides sessions nobody answers for, so this table is
             // where they stay findable — and where you see why they are gone.
-            serve: s.serve?.live
+            serve: s.serve.live
               ? style.green('watching')
-              : s.serve?.served
+              : s.serve.served
                 ? style.yellow('idle')
                 : style.dim('posts only'),
             status: s.status === 'active' ? style.dim('active') : style.yellow(s.status),
@@ -275,9 +303,9 @@ Serving
         const ref = sessionRef(ctx, rest[0]);
         const result = await ws.agents.resume(ref, {
           ...readOptions(ctx),
-          contextLimit: flags.context ? Number(flags.context) : undefined,
-          create: Boolean(flags.create),
-          title: flags.title,
+          contextLimit: flagNumber(flags, 'context'),
+          create: flagOn(flags, 'create'),
+          title: flagText(flags, 'title'),
         });
         if (ctx.json) return json(result);
 
@@ -311,7 +339,7 @@ Serving
       case 'pull':
       case 'next': {
         const ref = sessionRef(ctx, rest[0]);
-        const result = await ws.agents.pull(ref, { ...readOptions(ctx), peek: Boolean(flags.peek) });
+        const result = await ws.agents.pull(ref, { ...readOptions(ctx), peek: flagOn(flags, 'peek') });
         if (ctx.json) return json(result);
         if (result.events.length === 0) {
           return note(`Nothing new. Cursor at ${result.cursor}.`);
@@ -320,7 +348,7 @@ Serving
         note(
           `  ${result.events.length} event(s) · cursor ${result.previousCursor} → ${result.cursor}` +
             (result.pending > 0 ? ` · ${result.pending} still pending` : '') +
-            (flags.peek ? style.yellow(' · peeked, cursor unchanged') : '')
+            (flagOn(flags, 'peek') ? style.yellow(' · peeked, cursor unchanged') : '')
         );
         return;
       }
@@ -329,13 +357,14 @@ Serving
       case 'post':
       case 'say': {
         const ref = sessionRef(ctx, rest[0]);
-        const words = looksLikeHistoryKey(rest[0]) || rest[0] === ctx.flags.name ? rest.slice(1) : rest;
+        const words =
+          looksLikeHistoryKey(rest[0]) || rest[0] === flagText(flags, 'name') ? rest.slice(1) : rest;
         const result = await ws.agents.post(ref, {
           agentId: agentId(ctx),
-          channel: flags.channel,
-          threadId: flags.thread ?? null,
+          channel: flagText(flags, 'channel'),
+          threadId: flagText(flags, 'thread') ?? null,
           text: await resolveText(words),
-          metadata: parseJsonFlag(flags.meta, 'meta') ?? null,
+          metadata: metadataFlag(ctx),
         });
         if (ctx.json) return json(result);
         if (ctx.quiet) return line(result.message.id);
@@ -351,12 +380,13 @@ Serving
       case 'reply': {
         const ref = sessionRef(ctx, rest[0]);
         const args = looksLikeHistoryKey(rest[0]) ? rest.slice(1) : rest;
-        const rootId = requireRef(flags.thread ?? args[0], 'message id');
-        const words = flags.thread ? args : args.slice(1);
+        const threadFlag = flagText(flags, 'thread');
+        const rootId = requireRef(threadFlag ?? args[0], 'message id');
+        const words = threadFlag ? args : args.slice(1);
         const result = await ws.agents.reply(ref, rootId, {
           agentId: agentId(ctx),
           text: await resolveText(words),
-          metadata: parseJsonFlag(flags.meta, 'meta') ?? null,
+          metadata: metadataFlag(ctx),
         });
         if (ctx.json) return json(result);
         if (ctx.quiet) return line(result.message.id);
@@ -382,10 +412,10 @@ Serving
           const value = parseStateArgs(pairs);
           const session = await ws.agents.setState(ref, value, {
             agentId: agentId(ctx),
-            merge: !flags.replace,
+            merge: !flagOn(flags, 'replace'),
           });
           if (ctx.json) return json({ session });
-          ok(flags.replace ? 'State replaced.' : 'State saved.');
+          ok(flagOn(flags, 'replace') ? 'State replaced.' : 'State saved.');
           return json(session.state);
         }
         if (action === 'clear') {
@@ -404,13 +434,14 @@ Serving
       // with no restart and without disturbing any thread's conversation.
       case 'model': {
         const first = rest[0];
-        const named = looksLikeHistoryKey(first) || (first !== undefined && first === flags.name);
+        const named =
+          looksLikeHistoryKey(first) || (first !== undefined && first === flagText(flags, 'name'));
         const ref = sessionRef(ctx, named ? first : undefined);
         const wanted = (named ? rest.slice(1) : rest).join(' ').trim();
 
         // What can this agent run? `serve` asks the binary itself
         // (`<cmd> --list-models`) and leaves the answer on the session.
-        if (flags.list) {
+        if (flagOn(flags, 'list')) {
           const session = await ws.agents.get(ref, { agentId: agentId(ctx) });
           const choices = readServeModelChoices(session.state);
           const model = readServeModel(session.state);
@@ -418,27 +449,30 @@ Serving
           if (choices.length === 0) {
             return note('No list — this agent has not told `serve` what it can run. Any name still works.');
           }
-          let group = null;
+          let group: string | null = null;
           for (const choice of choices) {
             if (choice.group !== group) {
               group = choice.group;
               if (group) line(style.dim(group));
             }
-            line(`  ${choice.id === model ? style.green('●') : ' '} ${choice.label}${style.dim(`  ${choice.id}`)}`);
+            line(
+              `  ${choice.id === model ? style.green('●') : ' '} ${choice.label}${style.dim(`  ${choice.id}`)}`
+            );
           }
           return;
         }
 
-        if (!wanted && !flags.clear) {
+        if (!wanted && !flagOn(flags, 'clear')) {
           const session = await ws.agents.get(ref, { agentId: agentId(ctx) });
           const model = readServeModel(session.state);
           if (ctx.json) return json({ model, choices: readServeModelChoices(session.state), session });
           if (ctx.quiet) return line(model ?? '');
-          if (!model) return note('No override — `serve` uses its own --model, or whatever the agent defaults to.');
+          if (!model)
+            return note('No override — `serve` uses its own --model, or whatever the agent defaults to.');
           return line(model);
         }
 
-        const session = await ws.agents.setModel(ref, flags.clear ? null : wanted, {
+        const session = await ws.agents.setModel(ref, flagOn(flags, 'clear') ? null : wanted, {
           agentId: agentId(ctx),
         });
         const model = readServeModel(session.state);
@@ -461,7 +495,7 @@ Serving
       case 'watch':
       case 'follow': {
         const ref = sessionRef(ctx, rest[0]);
-        const interval = Math.max(Number(flags.interval ?? 1000), 200);
+        const interval = Math.max(flagNumber(flags, 'interval') ?? 1000, 200);
         const options = readOptions(ctx);
         const asJson = ctx.json || !process.stdout.isTTY;
         if (!asJson) {
@@ -470,13 +504,13 @@ Serving
           line();
         }
         for (;;) {
-          const result = await ws.agents.pull(ref, { ...options, peek: Boolean(flags.peek) });
+          const result = await ws.agents.pull(ref, { ...options, peek: flagOn(flags, 'peek') });
           for (const event of result.events) {
             if (asJson) ndjson(event);
             else if (event.message) line(`${renderMessage(event.message)}\n`);
             else line(`${style.dim('·')} ${style.magenta(event.type)}`);
           }
-          if (flags.once) return;
+          if (flagOn(flags, 'once')) return;
           await sleep(interval);
         }
       }
@@ -495,11 +529,12 @@ Serving
       case 'effort':
       case 'reasoning': {
         const first = rest[0];
-        const named = looksLikeHistoryKey(first) || (first !== undefined && first === flags.name);
+        const named =
+          looksLikeHistoryKey(first) || (first !== undefined && first === flagText(flags, 'name'));
         const ref = sessionRef(ctx, named ? first : undefined);
         const wanted = (named ? rest.slice(1) : rest).join(' ').trim();
 
-        if (!wanted && !flags.clear) {
+        if (!wanted && !flagOn(flags, 'clear')) {
           const session = await ws.agents.get(ref, { agentId: agentId(ctx) });
           const effort = readServeEffort(session.state);
           if (ctx.json) return json({ effort, session });
@@ -508,7 +543,7 @@ Serving
           return line(effort);
         }
 
-        const session = await ws.agents.setEffort(ref, flags.clear ? null : wanted, {
+        const session = await ws.agents.setEffort(ref, flagOn(flags, 'clear') ? null : wanted, {
           agentId: agentId(ctx),
         });
         const effort = readServeEffort(session.state);
@@ -546,7 +581,8 @@ Serving
             models: a.listsModels ? 'asks' : style.dim('—'),
             limit: a.maxMessageLength ? String(a.maxMessageLength) : style.dim('—'),
             // The directory is on the footer line; the file name is the news.
-            source: a.source === 'built-in' ? style.dim('built-in') : a.source.split('/').at(-1),
+            source:
+              a.source === 'built-in' ? style.dim('built-in') : (a.source.split('/').at(-1) ?? a.source),
           })),
           [
             { key: 'name', label: 'adapter' },
@@ -588,15 +624,19 @@ Serving
 };
 
 /** Accepts `'{"a":1}'` or a list of `key=value` pairs. */
-function parseStateArgs(args) {
+function parseStateArgs(args: string[]): JsonObject {
   if (args.length === 0) {
     throw new ValidationError('Nothing to save.', {
       hint: 'slick agent state set step=verifying   or   slick agent state set \'{"step":"verifying"}\'',
     });
   }
   const joined = args.join(' ').trim();
-  if (joined.startsWith('{')) return parseJsonFlag(joined, 'state');
-  const out = {};
+  if (joined.startsWith('{')) {
+    const parsed = parseJsonFlag(joined, 'state');
+    if (!isRecord(parsed)) throw new ValidationError('State must be a JSON object.');
+    return parsed;
+  }
+  const out: JsonObject = {};
   for (const arg of args) {
     const eq = arg.indexOf('=');
     if (eq === -1) {
