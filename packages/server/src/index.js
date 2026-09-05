@@ -18,7 +18,7 @@ import { createPushService } from './push.js';
 import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot, serviceWorkerWithBuild } from './static.js';
 import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.js';
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.5.0';
 const COOKIE = 'slick_token';
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -31,6 +31,7 @@ export function newToken() {
  *   workspace?: Workspace, home?: string, file?: string,
  *   token?: string|null, webRoot?: string|null, host?: string,
  *   trustedHosts?: string[], push?: ReturnType<typeof createPushService>,
+ *   hermesEnv?: Record<string, string|undefined>,
  * }} [opts]
  */
 export function createServer(opts = {}) {
@@ -42,7 +43,17 @@ export function createServer(opts = {}) {
   const webRoot = opts.webRoot === null ? null : resolveWebRoot(opts.webRoot);
   const push = opts.push ?? createPushService(ws);
   const hub = createHub(ws, { push });
-  const router = createRoutes({ ws, hub, push, version: VERSION, build: () => buildStamp(webRoot) });
+  const router = createRoutes({
+    ws,
+    hub,
+    push,
+    version: VERSION,
+    build: () => buildStamp(webRoot),
+    // Which Hermes the profile panel edits. One knob, and it is the same one
+    // Hermes itself reads, so a daemon started under a profile describes that
+    // installation — and a test can hand over a throwaway one.
+    hermesEnv: opts.hermesEnv ?? process.env,
+  });
   const serveStatic = createStaticHandler(webRoot);
 
   function authenticate(req, url) {

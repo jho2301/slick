@@ -201,6 +201,50 @@ export class Api {
     return this.put(`/api/agents/sessions/${encodeURIComponent(ref)}/model`, { model }).then((r) => r.model);
   }
 
+  // ------------------------------------------------------------- hermes ---
+
+  /** The Hermes profiles this installation has. */
+  hermesProfiles() {
+    return this.get('/api/hermes/profiles').then((r) => r.profiles ?? []);
+  }
+
+  /**
+   * One profile's global provider/model default, and the catalog to change it
+   * with. Never throws for an unreadable Hermes: `error`/`code` come back in
+   * the payload so the panel can say why instead of showing an empty menu.
+   */
+  hermesProfileModel(name) {
+    return this.get(`/api/hermes/profiles/${encodeURIComponent(name)}/model`);
+  }
+
+  /**
+   * Set that default. Both fields go together — a provider without a model
+   * leaves the profile pointing at a model that provider does not serve — and
+   * what comes back is the config read again, not the request echoed.
+   */
+  setHermesProfileModel(name, { provider, model, effort }) {
+    return this.put(`/api/hermes/profiles/${encodeURIComponent(name)}/model`, { provider, model, effort });
+  }
+
+  /**
+   * What the account behind this profile has left — percentages, reset times,
+   * banked resets.
+   *
+   * Only a provider with an account-limits API answers with numbers; the rest
+   * come back `supported: false`, which is a fact about the provider and not a
+   * failure to fetch. Never throws for what the account itself reports:
+   * `error`/`code` ride in the payload so the panel can tell "not signed in"
+   * from "could not ask".
+   *
+   * `refresh` skips the daemon's minute-long cache. The daemon still floors how
+   * often a refresh actually reaches the provider, so clicking twice is one
+   * request — the rate limit that matters is upstream's.
+   */
+  hermesProfileUsage(name, { refresh = false } = {}) {
+    const path = `/api/hermes/profiles/${encodeURIComponent(name)}/usage`;
+    return this.get(refresh ? `${path}?refresh=1` : path);
+  }
+
   pushVapidKey() {
     return this.get('/api/push/vapid-public-key').then((r) => r.publicKey);
   }

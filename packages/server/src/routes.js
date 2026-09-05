@@ -17,6 +17,7 @@ import {
 } from '@slick/core';
 
 import { listCommands, runCommand } from './commands.js';
+import { hermesRoot, listProfiles, readProfileModel, readProfileUsage, writeProfileModel } from './hermes.js';
 import { createRouter, query } from './http.js';
 
 /** Returned by handlers that wrote the response themselves. */
@@ -43,7 +44,46 @@ const AGENT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
  */
 const MAX_DELTA_TEXT = 4096;
 
-export function createRoutes({ ws, hub, push, version, build }) {
+/**
+ * A thinking level as it may arrive from a browser — one short word.
+ *
+ * The same shape `setEffort` in @slick/core accepts and `EFFORT_VALUE` in the
+ * bridge enforces, checked a third time here for a different job: the bridge
+ * is what must never write rubbish into a config file, and this is what turns
+ * "high\nagent: {}" into a 422 with a sentence rather than a JSON `ok: false`
+ * the panel would have to read as a save that quietly did nothing.
+ */
+const EFFORT_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/i;
+
+/**
+ * What a model write is asking about `agent.reasoning_effort`, tri-state.
+ *
+ * `undefined` when the body says nothing — the picker saving a provider and a
+ * model has no opinion on the level and must not clear one someone else set.
+ * `null` when the body says `null` — also no change, for a caller that spells
+ * "no opinion" out. `''` when the body says `''` — clear the setting, back to
+ * whatever Hermes defaults to. A level otherwise.
+ */
+function hermesEffort(body) {
+  if (body == null || !Object.hasOwn(body, 'effort')) return undefined;
+  const wanted = body.effort;
+  if (wanted === null) return null;
+  if (typeof wanted !== 'string') {
+    throw new ValidationError('A thinking level is a word, or null to leave it to Hermes.', {
+      details: { received: typeof wanted },
+    });
+  }
+  const level = wanted.trim();
+  if (!level) return '';
+  if (!EFFORT_RE.test(level)) {
+    throw new ValidationError(`"${level.slice(0, 40)}" is not a thinking level.`, {
+      hint: 'Use one of the levels Hermes offers — minimal, low, medium, high, xhigh, max, ultra — or none to turn it off.',
+    });
+  }
+  return level;
+}
+
+export function createRoutes({ ws, hub, push, version, build, hermesEnv = process.env }) {
   const router = createRouter();
   const r = router.add;
 
@@ -344,6 +384,66 @@ export function createRoutes({ ws, hub, push, version, build }) {
   );
 
   r('POST /api/agents/sessions/:ref/end', ({ params }) => ({ session: ws.agents.end(params.ref) }));
+
+  // ------------------------------------------------------------ hermes ---
+
+  // Hermes' *global* defaults, one profile at a time.
+  //
+  // A different scope from everything above it, and the difference is the
+  // whole point: `/api/agents/sessions/:ref/model` sets what one conversation
+  // runs on, and these set what the profile hands out when no conversation has
+  // said otherwise. Writing one never touches the other, which is what the
+  // panel promises and what the tests hold it to.
+  //
+  // Nothing here activates a profile, and nothing restarts a gateway. Editing
+  // a profile Hermes is not currently running under is a legitimate thing to
+  // want, and pretending the change reached a live process would be a lie the
+  // next answer would expose.
+
+  r('GET /api/hermes/profiles', () => {
+    const root = hermesRoot(hermesEnv);
+    return {
+      // Deliberately not the directory: the app has no use for a path, and a
+      // path in a payload is one screenshot away from being public.
+      profiles: listProfiles(root).map(({ name, isDefault, configured }) => ({ name, isDefault, configured })),
+    };
+  });
+
+  r('GET /api/hermes/profiles/:name/model', async ({ params }) => {
+    const { dir, ...rest } = await readProfileModel(params.name, hermesRoot(hermesEnv), hermesEnv);
+    return rest;
+  });
+
+  // What the account behind this profile has left, from the provider itself.
+  //
+  // The one Hermes route that goes over the network, so it is the one with a
+  // cache in front of it: `readProfileUsage` reuses an answer for a minute and
+  // collapses concurrent asks into one request. `?refresh=1` is the human
+  // saying they do not believe it, and is itself floored at ten seconds — the
+  // rate limit that matters belongs to the provider, not to this process.
+  r('GET /api/hermes/profiles/:name/usage', async ({ params, q }) => {
+    return readProfileUsage(params.name, hermesRoot(hermesEnv), hermesEnv, { refresh: q.bool('refresh') });
+  });
+
+  r('PUT /api/hermes/profiles/:name/model', async ({ params, body }) => {
+    // Checked here as well as in the bridge. The bridge is the one that must
+    // never write rubbish into a config file; this is the one that gives a
+    // browser a 400 with a sentence in it rather than a 200 saying "no".
+    const provider = String(body?.provider ?? '').trim();
+    const model = String(body?.model ?? '').trim();
+    if (!provider || !model) {
+      throw new ValidationError('A Hermes default needs both a provider and a model.', {
+        hint: 'They are one setting: a provider without a model leaves the profile pointing at a model it does not serve.',
+      });
+    }
+    const { dir, ...rest } = await writeProfileModel(
+      params.name,
+      { provider, model, effort: hermesEffort(body) },
+      hermesRoot(hermesEnv),
+      hermesEnv
+    );
+    return rest;
+  });
 
   // -------------------------------------------------------------- push ---
 

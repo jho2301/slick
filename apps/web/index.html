@@ -64,14 +64,32 @@
           </section>
         </nav>
 
-        <!-- Pinned under the scroller: the agents are for looking up a history
-             key, so they stay put rather than scrolling away with the channels.
-             Folded by default — not something to keep an eye on. -->
-        <section class="rail__section rail__pinned" id="agents-section">
-          <button class="rail__heading" id="toggle-agents" aria-expanded="false">
-            <span class="rail__chev">▸</span> Agents
+        <!-- Pinned under the scroller so it stays put rather than scrolling
+             away with the channels. Folded by default — a default you have
+             already set is not something to keep an eye on.
+
+             This is Hermes' own configuration, not Slick's: the provider and
+             model a profile hands out when no conversation has said otherwise.
+             A single chat's model is a different setting with a different
+             editor (`/model`), and the panel says so. -->
+        <section class="rail__section rail__pinned" id="hermes-section">
+          <button class="rail__heading" id="toggle-hermes" aria-expanded="false">
+            <span class="rail__chev">▸</span> Hermes
           </button>
-          <ul class="agent-list" id="agent-list" hidden></ul>
+          <div class="hermes" id="hermes-panel" hidden></div>
+        </section>
+
+        <!-- The account's own limits, deliberately *not* inside the folded
+             panel above. Those are settings, kept out of the way because they
+             are already decided; this is a number that moves on its own and is
+             worth seeing without opening anything. Hidden entirely for a
+             provider that has no limits to report. -->
+        <section class="rail__section rail__pinned rail__pinned--limits" id="hermes-limits-section" hidden>
+          <h2 class="rail__heading rail__heading--static rail__heading--row" id="hermes-limits-heading">
+            <span class="rail__heading-text">OpenAI limits</span>
+            <span class="hermes__usage-head" id="hermes-limits-head"></span>
+          </h2>
+          <div class="hermes" id="hermes-limits"></div>
         </section>
 
         <footer class="rail__foot">
@@ -170,6 +188,8 @@
         <div class="thread__scroll" id="thread-body"></div>
         <form class="composer composer--thread" id="thread-composer">
           <div class="composer__box">
+            <div class="composer__out" id="thread-composer-out" hidden></div>
+            <ul class="command-menu" id="command-menu-thread" hidden></ul>
             <ul class="mention-menu" id="mention-menu-thread" hidden></ul>
             <textarea id="thread-input" class="composer__input" rows="3" placeholder="Reply…"></textarea>
             <button type="submit" class="send-btn" id="btn-thread-send" disabled aria-label="Send reply">

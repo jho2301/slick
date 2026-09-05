@@ -104,6 +104,10 @@ function normalizeEntry(raw) {
     summary: String(raw.summary ?? raw.description ?? '').slice(0, 200),
     args: String(raw.args ?? raw.args_hint ?? '').slice(0, 120),
     aliases: Array.isArray(raw.aliases) ? raw.aliases.map(String).slice(0, 8) : [],
+    // A picker is a Slick-side adapter affordance. It may be available even
+    // when the underlying Hermes command is session-only, because Slick routes
+    // the selection through its authorized model endpoint.
+    picker: String(raw.picker ?? '').slice(0, 32) || null,
     // What the agent says about running this one here. Anything other than
     // "run" is shown but not offered — the menu tells the truth about it.
     where: String(raw.where ?? 'run').slice(0, 32),

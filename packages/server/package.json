@@ -1,6 +1,6 @@
 {
   "name": "@slick/server",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Local daemon: REST + live event stream over the Slick workspace",

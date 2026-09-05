@@ -18,6 +18,7 @@ import {
   highlight,
   initials,
   renderText,
+  trimModelName,
 } from './format.js';
 import {
   $,
@@ -27,17 +28,45 @@ import {
   copyToClipboard,
   el,
   initModal,
+  mount,
   openModal,
   toast,
 } from './ui.js';
 import { isGrouped } from './grouping.js';
 import { applyChunk, emptyThink, readThinking, settle, stepStatusLabel } from './thinking.js';
 import { createCommandMenu } from './commands.js';
+import { readSections, SECTION_CARDS } from './response-sections.js';
+import {
+  findModelChoice,
+  groupModelChoices,
+  modelCommandPreview,
+  modelPickerDefaults,
+  modelsForProvider,
+  parseModelCommandArgs,
+} from './model-picker.js';
+import {
+  bankedResetLine,
+  hermesEfforts,
+  hermesModels,
+  shouldRefreshUsageAfter,
+  usageDetailLines,
+  usageLimitRows,
+  usageLimitText,
+  usageStatus,
+  withConfigured,
+} from './hermes-panel.js';
+import { createHermesStore } from './hermes-store.js';
 import { createMentionMenu } from './mentions.js';
 import { initPaneResizer, reflowPanes } from './panes.js';
 import { currentSubscription, disablePush, enablePush, pushSupported } from './push.js';
 
 const api = new Api();
+/**
+ * The Hermes rail panel. It owns its own state — including the ordering rules
+ * that keep one profile's answer off another profile's panel — and asks for a
+ * re-draw when any of it moves.
+ */
+const hermes = createHermesStore({ api, onChange: () => renderHermes() });
 const LAST_CHANNEL_KEY = 'slick.channel';
 // A stuck "on" with no matching "off" (the agent process died mid-call)
 // should not leave the indicator spinning forever.
@@ -72,6 +101,13 @@ const state = {
    * @type {Map<string, {text: string, think: object, agentId: string, at: number, timer: any}>}
    */
   drafts: new Map(),
+  /**
+   * The Hermes rail panel, straight off the store above. `saved` is what the
+   * profile's config.yaml said the last time it was read; `draft` is what the
+   * two selects are showing. They differ only while someone is mid-decision,
+   * which is exactly when the save button has something to do.
+   */
+  hermes: hermes.state,
   seq: 0,
 };
 
@@ -446,6 +482,11 @@ function thinkingView(think, key, surface = 'timeline') {
  * answer reads like a second agent. The body keeps the typing dots only while
  * there is no text yet, so a draft that is all thinking still looks alive.
  */
+// A draft is deliberately not cut into sections. Its text arrives a chunk at
+// a time and is appended into `.msg__body` by `innerHTML` on every chunk, so a
+// label half-typed as `## Assum` would open a box that closes again a keypress
+// later, and a body that is re-parsed per chunk cannot be appended to. The cut
+// happens once, when the finished message replaces the draft.
 function draftBubble(threadId, surface) {
   const draft = state.drafts.get(threadId);
   if (!draft) return null;
@@ -496,6 +537,12 @@ function messageModel(message) {
   if (message.author?.kind !== 'agent') return null;
   // What actually answered, as `serve` recorded it when the reply was posted.
   // That is history and stays true; everything below is only today's setting.
+  // Deliberately the untrimmed name: this is the identity, and `badgeLabel`
+  // hands it to the grouping rule. `llama-3-70b.gguf` and
+  // `llama-3-70b.safetensors` are one architecture in two builds, and letting
+  // them shorten to the same string here would tuck them under one header
+  // whose single badge then claims one model answered both. `modelChip` is
+  // where the name gets shortened, because that is where it is only a label.
   const answered = message.metadata?._model;
   if (typeof answered === 'string' && answered.trim()) return answered.trim();
   const session = sessionForMessage(message);
@@ -565,8 +612,11 @@ function modelChip(badge) {
   if (!badge) return null;
   return el(
     'span',
+    // `badge.title` keeps the untrimmed name on purpose: the chip is short
+    // enough to scan a thread with, and the hover is where you go when you
+    // need to know exactly which weights answered.
     { class: 'msg__badges', title: badge.title },
-    badge.model ? el('span', { class: 'msg__badge msg__model' }, badge.model) : null,
+    badge.model ? el('span', { class: 'msg__badge msg__model' }, trimModelName(badge.model)) : null,
     badge.effort ? el('span', { class: 'msg__badge msg__effort' }, badge.effort) : null
   );
 }
@@ -610,9 +660,34 @@ function syncModelChips() {
 function modelFingerprint() {
   // The effort belongs in here too: it is half of what the badge says, and
   // the chips only get repaired when this string changes.
+  //
+  // Raw names, not trimmed ones. This is asking what each session is set to,
+  // not what the chip reads, and two settings that only look alike after
+  // trimming are still a change worth redrawing for.
   return state.sessions
     .map((session) => `${session.key}:${serveModel(session) ?? ''}:${serveEffort(session) ?? ''}`)
     .join('|');
+}
+
+/**
+ * The collapsible boxes under an answer — reasoning, process, assumptions.
+ *
+ * Real `<details>` rather than a scripted box: closed is the default state of
+ * the element itself, the summary is already a button to a screen reader, and
+ * find-in-page opens the one it matched. Nothing here carries `.msg__body`,
+ * for `startEdit`'s reason above.
+ */
+function sectionCards(sections) {
+  return SECTION_CARDS.map(({ key, label }) =>
+    sections[key]
+      ? el(
+          'details',
+          { class: 'rsec', dataset: { section: key } },
+          el('summary', { class: 'rsec__head' }, el('span', { class: 'rsec__title' }, label)),
+          el('div', { class: 'rsec__body', html: renderText(sections[key]) })
+        )
+      : null
+  );
 }
 
 /**
@@ -658,7 +733,9 @@ function messageRow(message, previous, opts = {}) {
     // above the real body would hand the editor the wrong node.
     const think = thinkingBox(message, opts.inThread ? 'thread' : 'timeline');
     if (think) main.append(think);
-    main.append(el('div', { class: 'msg__body', html: renderText(message.text) }));
+    const sections = readSections(message);
+    main.append(el('div', { class: 'msg__body', html: renderText(sections.answer) }));
+    mount(main, sectionCards(sections));
     if (message.editedAt) main.append(el('span', { class: 'msg__edited' }, '(edited)'));
     const meta = visibleMetadata(message.metadata);
     if (meta) main.append(el('div', { class: 'msg__meta' }, JSON.stringify(meta)));
@@ -891,7 +968,6 @@ function renderRail() {
   const archivedList = clear($('#archived-list'));
   for (const channel of archived) archivedList.append(channelRow(channel));
 
-  renderAgents();
   renderUnreadTitle();
 }
 
@@ -1012,92 +1088,293 @@ function callableSessions() {
   return state.sessions.filter((session) => session.callable);
 }
 
-function renderAgents() {
-  const list = clear($('#agent-list'));
-  const sessions = callableSessions();
-  if (sessions.length === 0) {
-    const posting = state.sessions.length;
-    list.append(
-      posting > 0
-        ? el(
-            'li',
-            { class: 'rail__empty' },
-            `Nothing is listening. ${posting} session${posting === 1 ? '' : 's'} post here, but no watcher is attached — start one:`,
-            el('br'),
-            el('code', {}, 'slick agent serve --key <history key>')
-          )
-        : el(
-            'li',
-            { class: 'rail__empty' },
-            'No agents yet. Give one a history key:',
-            el('br'),
-            el('code', {}, 'slick agent start --agent claude')
-          )
+/**
+ * The Hermes panel, in the rail.
+ *
+ * Three selects and a save button, for one setting: the provider and model a
+ * Hermes profile hands out by default. That is a *global* — `model.provider`
+ * and `model.default` in the profile's own `config.yaml` — and the panel says
+ * so, because the rail used to hold the other kind of model setting entirely
+ * and the two are easy to confuse.
+ *
+ * Draft and saved are kept apart: nothing is written until the button is
+ * pressed, so backing out is closing the panel, and a provider change that
+ * leaves no valid model to pair with disables the save rather than guessing.
+ */
+function renderHermes() {
+  renderHermesPanel();
+  renderHermesLimits();
+}
+
+/**
+ * The folded half: the settings, and only the settings.
+ */
+function renderHermesPanel() {
+  const panel = clear($('#hermes-panel'));
+  const h = state.hermes;
+  // A read or a write is out: the selects are answers about a profile that is
+  // still being settled, so they are not something to move meanwhile.
+  const busy = hermes.isBusy();
+
+  if (h.loading && !h.loaded) return void mount(panel, el('div', { class: 'hermes__note' }, 'Asking Hermes…'));
+
+  // Which profile is being edited, and — said plainly, because it is the one
+  // thing about this panel that surprises people — what that does and does not
+  // reach.
+  mount(
+    panel,
+    hermesRow(
+      'Profile',
+      'hermes-profile',
+      h.profiles.map((p) => ({ value: p.name, label: p.isDefault ? `${p.name} (HERMES_HOME)` : p.name })),
+      h.profile ?? '',
+      (event) => hermes.selectProfile(event.target.value),
+      { disabled: busy }
+    )
+  );
+
+  if (h.error) mount(panel, hermesProblem(h.error, busy));
+  else {
+    const providers = withConfigured(h.providers, h.saved);
+    const models = hermesModels(providers, h.draft.provider);
+    mount(
+      panel,
+      hermesRow(
+        'Provider',
+        'hermes-provider',
+        providers.map((p) => ({ value: p.value, label: hermesLabel(p) })),
+        h.draft.provider,
+        (event) => hermes.setDraft({ provider: event.target.value, model: h.draft.model }),
+        { disabled: busy }
+      ),
+      hermesRow(
+        'Model',
+        'hermes-model',
+        models.map((m) => ({ value: m.value, label: hermesLabel(m) })),
+        h.draft.model,
+        (event) => hermes.setDraft({ provider: h.draft.provider, model: event.target.value }),
+        { help: models.length === 0 ? 'This provider reports no models.' : null, disabled: busy }
+      ),
+      hermesRow(
+        'Reasoning effort',
+        'hermes-effort',
+        hermesEfforts(h.efforts, h.draftEffort).map((e) => ({ value: e.value, label: hermesLabel(e) })),
+        h.draftEffort,
+        (event) => hermes.setEffort(event.target.value),
+        {
+          help: 'How hard this profile thinks by default. Leave it on “Hermes default” for no opinion.',
+          disabled: busy,
+        }
+      ),
+      h.catalogError
+        ? el('div', { class: 'hermes__note is-warn' }, 'Catalog unavailable — only what is configured is listed.')
+        : null
     );
-    return;
   }
-  for (const session of sessions) {
-    // Green means a watcher holds this session right now; the timestamp is
-    // only how long ago it last did anything.
-    const live = session.serve?.live ?? false;
-    const model = serveModel(session);
-    const effort = serveEffort(session);
-    list.append(
+
+  // What the profile is on right now, straight from its config, so the rail
+  // answers the question without anyone opening a menu. It stays put through a
+  // failed re-read: the last thing Hermes said is still the last thing it said.
+  mount(
+    panel,
+    el(
+      'div',
+      { class: 'hermes__current', title: 'The profile default, as its config.yaml reads now' },
+      h.saved.model
+        ? [el('span', { class: 'hermes__model' }, trimModelName(h.saved.model)), h.saved.provider ? el('span', { class: 'hermes__prov' }, h.saved.provider) : null]
+        : // "Could not be read" and "is not set" look identical from here and
+          // are not the same fact, so the panel says which one it is.
+          el('span', { class: 'hermes__prov' }, h.error ? 'default unknown — Hermes could not be read' : 'no default set')
+    ),
+    el(
+      'div',
+      { class: 'hermes__acts' },
       el(
-        'li',
-        { class: 'agent' },
-        el('span', {
-          class: `agent__dot${live ? '' : ' is-idle'}`,
-          title: live ? `watching · last seen ${ago(session.lastSeenAt)}` : `no watcher · last seen ${ago(session.lastSeenAt)}`,
-        }),
+        'button',
+        { class: 'hermes__save', disabled: !hermes.canSave(), onclick: () => hermes.save() },
+        h.saving ? 'Saving…' : 'Save default'
+      ),
+      hermes.dirty() && !busy
+        ? el('button', { class: 'hermes__undo', onclick: () => hermes.revert() }, 'Cancel')
+        : null
+    ),
+    el(
+      'div',
+      { class: 'hermes__scope' },
+      'Profile-wide default for new Hermes conversations. It does not change a chat that already has its own model (',
+      el('code', {}, '/model'),
+      '), and a running gateway keeps its model until it is restarted.'
+    ),
+    // `null` here is nothing to say. It reaches the panel through `mount`
+    // rather than `append` because the DOM's own `append` would draw it as the
+    // word "null".
+    h.note ? el('div', { class: `hermes__note is-${h.note.kind}` }, h.note.text) : null
+  );
+}
+
+/**
+ * The limits, in a rail section of their own directly under the Hermes one.
+ *
+ * They used to hang off the bottom of the panel above, which meant they were
+ * only ever on screen while somebody was editing a setting — the one moment
+ * they are least interesting. A number the provider owns and moves on its own
+ * belongs where it can be glanced at, so the section is its own and is not
+ * foldable; what folds is the settings, which stay decided.
+ *
+ * The section is hidden outright until the profile has been read and its
+ * provider turns out to have limits at all. Loading and error states are
+ * shown — once applicability is known, silence would read as "nothing left".
+ */
+function renderHermesLimits() {
+  const usage = state.hermes.usage;
+  const section = $('#hermes-limits-section');
+  section.hidden = !usage?.applicable;
+  const panel = clear($('#hermes-limits'));
+  const head = clear($('#hermes-limits-head'));
+  if (section.hidden) return;
+  mount(head, hermesUsageHead(usage));
+  mount(panel, hermesUsage(usage));
+}
+
+/**
+ * The plan and the one control, drawn into the section's own heading row.
+ *
+ * The heading already says what the block is, so the head carries no title of
+ * its own: just which plan the account is on and the button that costs a
+ * request.
+ */
+function hermesUsageHead(usage) {
+  if (!usage?.applicable) return null;
+  const plan = usage.answer?.usage?.plan ?? null;
+  const label = usage.loading ? 'Checking usage…' : 'Refresh usage';
+  return [
+    plan ? el('span', { class: 'hermes__usage-plan' }, plan) : null,
+    el('button', {
+      class: 'hermes__usage-refresh',
+      disabled: usage.loading,
+      'aria-label': label,
+      // Said out loud, because a button that looks like it did nothing is
+      // worse than one that says why: the daemon floors how often a refresh
+      // reaches the provider.
+      title: `${label}. Refreshes are limited to one every few seconds.`,
+      onclick: () => hermes.refreshUsage(),
+      html: REFRESH_ICON,
+    }),
+  ];
+}
+
+/** An icon rather than a word, because the heading row has no room for one. */
+const REFRESH_ICON =
+  '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true" focusable="false" fill="none" ' +
+  'stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">' +
+  '<path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2v3.2h-3.2"/></svg>';
+
+/**
+ * What this profile's account has left, when its provider reports such a thing.
+ *
+ * One row per window and nothing else: how much is left and how long it lasts.
+ * Relative, not a date — "for 3d 2h" is the thing being asked, and a calendar
+ * stamp makes the reader do the subtraction. Absent entirely for a provider with no limits API — an empty
+ * block would read as a failure to fetch something that was never there.
+ */
+function hermesUsage(usage) {
+  if (!usage?.applicable) return null;
+  const answer = usage.answer;
+  const status = usageStatus(answer);
+  const rows = usageLimitRows(answer?.usage);
+  const banked = bankedResetLine(answer?.usage?.bankedResets ?? null);
+
+  if (usage.loading && !usage.loaded) {
+    return el('div', { class: 'hermes__usage' }, el('div', { class: 'hermes__note' }, 'Asking the provider…'));
+  }
+
+  return el(
+    'div',
+    { class: 'hermes__usage' },
+    status.kind === 'ok'
+      ? // Both windows on one line, split by a visible slash: they are read as a
+        // pair — "how much is left now" against "how much is left this week" —
+        // and stacking them made the rail scroll for two short sentences.
         el(
           'div',
-          { class: 'agent__body', onclick: () => session.channelSlug && selectChannel(session.channelSlug) },
-          el('div', { class: 'agent__name' }, session.name ? `${session.agentId} · ${session.name}` : session.agentId),
-          el('div', { class: 'agent__key', title: session.key }, session.key),
-          el(
-            'button',
-            {
-              class: `agent__model${model ? ' is-set' : ''}`,
-              title: model ? `Running ${model} — click to change` : 'Choose the model this agent runs',
-              onclick: (event) => {
-                event.stopPropagation(); // the row itself opens the channel
-                editAgentModel(session);
-              },
-            },
-            modelLabel(session, model)
-          ),
-          // How hard it thinks, beside what it runs. Only an agent that has
-          // been told sits on a level, so the button stays blank until then
-          // rather than claiming a default it cannot know.
-          el(
-            'button',
-            {
-              class: `agent__effort${effort ? ' is-set' : ''}`,
-              title: effort ? `Thinking ${effort} — click to change` : 'Set how hard this agent thinks',
-              onclick: (event) => {
-                event.stopPropagation();
-                editAgentEffort(session);
-              },
-            },
-            effort ?? 'effort'
-          )
-        ),
-        el(
-          'button',
-          {
-            class: 'agent__copy',
-            title: 'Copy history key',
-            onclick: async () => {
-              await copyToClipboard(session.key);
-              toast('History key copied');
-            },
-          },
-          'copy'
+          { class: 'hermes__limits-line' },
+          rows.map((row, i) => [
+            i ? el('span', { class: 'hermes__limit-sep', 'aria-hidden': 'true' }, '/') : null,
+            el(
+              'div',
+              { class: 'hermes__limit' },
+              el('span', { class: 'hermes__limit-label' }, `${row.label}:`),
+              el('span', { class: 'hermes__limit-value' }, usageLimitText(row))
+            ),
+          ])
         )
-      )
-    );
-  }
+      : // Not a meter, and not silence: "not signed in", "this provider has no
+        // limits API" and "it did not answer" are three different situations
+        // and only one of them is worth a retry.
+        el(
+          'div',
+          { class: `hermes__note ${status.kind === 'unsupported' ? '' : 'is-warn'}`.trim() },
+          el('span', {}, status.text),
+          status.retryable
+            ? el(
+                'button',
+                { class: 'hermes__retry', disabled: usage.loading, onclick: () => hermes.refreshUsage() },
+                usage.loading ? 'Checking…' : 'Try again'
+              )
+            : null
+        ),
+    banked ? el('div', { class: 'hermes__usage-banked' }, banked) : null,
+    // Whatever else Hermes had to say — a credits balance, say. Passed through
+    // rather than parsed: it is the provider's sentence and the panel is not
+    // the place to second-guess it. Its own two phrasings of the banked resets
+    // are the one exception, because the line above already says that.
+    usageDetailLines(answer?.usage?.details).map((line) =>
+      el('div', { class: 'hermes__usage-detail' }, line)
+    ),
+    answer?.note ? el('div', { class: 'hermes__note is-warn' }, answer.note) : null
+  );
+}
+
+/** A label that admits when a value is only here because the config names it. */
+const hermesLabel = (entry) => (entry.unlisted ? `${entry.label} (not in catalog)` : entry.label);
+
+/**
+ * A read that failed, and the one thing worth offering: ask again.
+ *
+ * Reading is the only thing it does — nothing about a profile is written by a
+ * retry — so a Hermes that was busy, restarting, or briefly unreadable stops
+ * being a panel someone has to close and reopen to get out of.
+ */
+const hermesProblem = (text, busy) =>
+  el(
+    'div',
+    { class: 'hermes__note is-warn' },
+    el('span', {}, text),
+    el(
+      'button',
+      { class: 'hermes__retry', disabled: busy, title: 'Read this profile again', onclick: () => hermes.retry() },
+      busy ? 'Retrying…' : 'Retry'
+    )
+  );
+
+function hermesRow(label, id, options, value, onchange, { help = null, disabled = false } = {}) {
+  const select = el(
+    'select',
+    { id, class: 'hermes__select', onchange },
+    options.map((option) => el('option', { value: option.value }, option.label))
+  );
+  // Set after the options exist, and left blank rather than snapped to the
+  // first entry when the value is not among them — a select that silently
+  // reads as something else is how the wrong thing gets saved.
+  select.value = value ?? '';
+  if (options.length === 0 || disabled) select.disabled = true;
+  return el(
+    'label',
+    { class: 'hermes__field' },
+    el('span', { class: 'hermes__label' }, label),
+    select,
+    help ? el('span', { class: 'hermes__help' }, help) : null
+  );
 }
 
 /**
@@ -1133,7 +1410,13 @@ function modelChoices(session) {
     .map((entry) => ({ id: entry.id, label: entry.label || entry.id, group: entry.group ?? null }));
 }
 
-/** What the rail calls the current model: the agent's own name for it. */
+/**
+ * What the rail calls the current model: the agent's own name for it.
+ *
+ * Untrimmed, because `messageModel` reads this too and there it is an
+ * identity rather than a label. Its two callers shorten it themselves where
+ * they paint it.
+ */
 function modelLabel(session, model) {
   if (!model) return 'default model';
   return modelChoices(session).find((choice) => choice.id === model)?.label ?? model;
@@ -1242,6 +1525,112 @@ async function typeModel(current) {
     ],
   });
   return values ? (values.model ?? '').trim() : null;
+}
+
+function modelPickerProviders(session) {
+  return groupModelChoices(modelChoices(session));
+}
+
+/**
+ * The Slick-side `/model` picker. Hermes' detached command bridge cannot mutate
+ * a live session, so the final selection goes through the same authorized model
+ * endpoint as the agent-rail model button.
+ */
+async function runModelPicker(args, outputId, session) {
+  const parsed = parseModelCommandArgs(args);
+  const current = serveModel(session);
+  const providers = modelPickerProviders(session);
+
+  if (providers.length === 0) {
+    const wanted = await typeModel(current);
+    await applyCommandModel(session, wanted, '', null, outputId);
+    return;
+  }
+
+  const defaults = modelPickerDefaults(providers, {
+    provider: parsed.provider,
+    name: parsed.name,
+    current,
+  });
+  const modelOptions = (provider) => [
+    ...modelsForProvider(providers, provider).map((model) => ({
+      value: model.value,
+      label: model.label,
+    })),
+    { value: CUSTOM_MODEL, label: 'Something else…' },
+  ];
+  const providerOptions = providers.map((entry) => ({
+    value: entry.value,
+    label: `${entry.label} · ${entry.models.length} model${entry.models.length === 1 ? '' : 's'}`,
+  }));
+
+  const values = await openModal({
+    title: 'Hermes model',
+    body: 'Choose the provider and model. Both selections are sent as <code>--provider</code> and <code>--name</code>.',
+    okLabel: 'Switch model',
+    fields: [
+      {
+        name: 'provider',
+        label: 'Provider (--provider)',
+        type: 'select',
+        value: defaults.provider,
+        options: providerOptions,
+        required: true,
+        onchange: (event) => {
+          const modelInput = $('#field-name');
+          if (!modelInput) return;
+          const nextProvider = event.target.value;
+          const nextModels = modelsForProvider(providers, nextProvider);
+          modelInput.replaceChildren(
+            ...modelOptions(nextProvider).map((option) => el('option', { value: option.value }, option.label))
+          );
+          modelInput.value = nextModels[0]?.value ?? CUSTOM_MODEL;
+        },
+      },
+      {
+        name: 'name',
+        label: 'Model (--name)',
+        type: 'select',
+        value: defaults.name || CUSTOM_MODEL,
+        options: modelOptions(defaults.provider),
+        required: true,
+        help: 'The model list comes from the running agent. Choose “Something else…” to enter a name manually.',
+      },
+    ],
+  });
+  if (!values) return;
+
+  const provider = values.provider;
+  let choice = findModelChoice(providers, provider, values.name);
+  let wanted = choice?.value ?? null;
+  if (values.name === CUSTOM_MODEL) wanted = await typeModel(current);
+  if (!choice && values.name !== CUSTOM_MODEL) {
+    showEphemeral(outputId, '/model', 'That model is not in the selected provider catalog.', 'warn');
+    return;
+  }
+  await applyCommandModel(session, wanted, provider, choice, outputId);
+}
+
+async function applyCommandModel(session, wanted, provider, choice, outputId) {
+  if (wanted === null || wanted === undefined) return;
+  const normalized = String(wanted).trim();
+  if (normalized === (serveModel(session) ?? '')) return;
+
+  showEphemeral(outputId, '/model', 'Switching model…');
+  try {
+    const model = await api.setAgentModel(session.key, normalized || null);
+    await refreshSessions();
+    if (!model) {
+      showEphemeral(outputId, '/model', 'Hermes is back on its configured default model.');
+      return;
+    }
+    const label = choice?.label ?? model;
+    const via = provider ? ` via ${provider}` : '';
+    const preview = choice ? `\n\n\`${modelCommandPreview(provider, choice)}\`` : '';
+    showEphemeral(outputId, '/model', `Hermes will use **${label}**${via}.${preview}`);
+  } catch (err) {
+    showEphemeral(outputId, '/model', err.message ?? String(err), 'warn');
+  }
 }
 
 /**
@@ -1797,7 +2186,6 @@ async function refreshSessions() {
   try {
     const before = modelFingerprint();
     state.sessions = await api.agentSessions();
-    renderAgents();
     // Messages usually render before the sessions behind them are known, and a
     // human can switch a model mid-conversation — either way the chips already
     // on screen are stale until we say otherwise.
@@ -2039,6 +2427,11 @@ async function handleEvent(event) {
         bumpUnread(message.channelId);
       }
       if (message.author.kind === 'agent') refreshSessions();
+      // A finished agent turn is the one thing in the app that spends the
+      // account, so the limits in the rail go stale exactly here. Past the
+      // daemon's cache, because the whole point is the number it holds is now
+      // one turn old.
+      if (shouldRefreshUsageAfter(message, state.hermes.saved.provider)) void hermes.refreshUsage();
       return;
     }
 
@@ -2278,8 +2671,8 @@ async function loadCommands() {
 }
 
 /** Show a line only this person sees, above the composer. Not a message. */
-function showEphemeral(title, body, kind = '') {
-  const host = $('#composer-out');
+function showEphemeral(outputId, title, body, kind = '') {
+  const host = $(outputId);
   clear(host);
   host.hidden = false;
   host.className = `composer__out${kind ? ` is-${kind}` : ''}`;
@@ -2307,25 +2700,29 @@ function showEphemeral(title, body, kind = '') {
  * The output goes nowhere near the channel: it comes back in the response to
  * this one request and is drawn above the composer for the person who asked.
  */
-async function runSlashCommand(line) {
+async function runSlashCommand(line, outputId = '#composer-out') {
   const [word, ...rest] = line.slice(1).split(/\s+/);
   const args = line.slice(1 + word.length).trim();
   const session = commandSession();
   if (!session) {
-    showEphemeral(`/${word}`, 'No agent is listening in this workspace, so there is nobody to ask.', 'warn');
+    showEphemeral(outputId, `/${word}`, 'No agent is listening in this workspace, so there is nobody to ask.', 'warn');
     return;
   }
-  showEphemeral(`/${word}`, '…', '');
+  if (word.toLowerCase() === 'model') {
+    await runModelPicker(args, outputId, session);
+    return;
+  }
+  showEphemeral(outputId, `/${word}`, '…', '');
   try {
     const answer = await api.runAgentCommand(session.key, word, args);
-    if (answer.error) showEphemeral(`/${answer.command || word}`, answer.error, 'warn');
-    else showEphemeral(`/${answer.command || word}`, answer.output || '(nothing to show)');
+    if (answer.error) showEphemeral(outputId, `/${answer.command || word}`, answer.error, 'warn');
+    else showEphemeral(outputId, `/${answer.command || word}`, answer.output || '(nothing to show)');
   } catch (err) {
-    showEphemeral(`/${word}`, err.message ?? String(err), 'warn');
+    showEphemeral(outputId, `/${word}`, err.message ?? String(err), 'warn');
   }
 }
 
-function wireComposer(inputId, formId, buttonId, submit, menuId, commandMenuId) {
+function wireComposer(inputId, formId, buttonId, submit, menuId, commandMenuId, outputId = '#composer-out') {
   const input = $(inputId);
   const button = $(buttonId);
   const resize = autosize(input);
@@ -2359,7 +2756,7 @@ function wireComposer(inputId, formId, buttonId, submit, menuId, commandMenuId) 
     // A line that is only a slash command is a question for the agent's
     // console, not a message for the channel. It leaves nothing behind.
     if (commands && /^\/[a-z0-9._:-]+/i.test(text.trim())) {
-      await runSlashCommand(text.trim());
+      await runSlashCommand(text.trim(), outputId);
       return;
     }
     await submit(text);
@@ -2388,7 +2785,15 @@ function wire() {
     '#mention-menu-main',
     '#command-menu-main'
   );
-  wireComposer('#thread-input', '#thread-composer', '#btn-thread-send', sendThreadReply, '#mention-menu-thread');
+  wireComposer(
+    '#thread-input',
+    '#thread-composer',
+    '#btn-thread-send',
+    sendThreadReply,
+    '#mention-menu-thread',
+    '#command-menu-thread',
+    '#thread-composer-out'
+  );
 
   // The uncategorised bucket outlives every re-render, so it is wired once.
   dropTarget($('#channels-section'), null);
@@ -2417,7 +2822,7 @@ function wire() {
 
   for (const [button, list] of [
     ['#toggle-channels', '#channel-list'],
-    ['#toggle-agents', '#agent-list'],
+    ['#toggle-hermes', '#hermes-panel'],
     ['#toggle-archived', '#archived-list'],
   ]) {
     $(button).addEventListener('click', () => {
@@ -2425,6 +2830,10 @@ function wire() {
       target.hidden = !target.hidden;
       $(button).setAttribute('aria-expanded', String(!target.hidden));
       $(button).querySelector('.rail__chev').textContent = target.hidden ? '▸' : '▾';
+      // Asked for the first time it is actually looked at. Reading a profile
+      // spawns an interpreter, and a panel nobody has unfolded has no reason
+      // to have done that on every boot.
+      if (list === '#hermes-panel' && !target.hidden && !state.hermes.loaded) hermes.load();
     });
   }
 
@@ -2707,6 +3116,12 @@ async function boot() {
   await refreshSessions();
   renderRail();
 
+  // The limits block below the Hermes section is only allowed to appear once
+  // the profile has been read — that read is what says which provider, and so
+  // whether there are limits at all. Not awaited: it spawns an interpreter and
+  // takes seconds, and nothing on the way to the first channel depends on it.
+  if (!state.hermes.loaded && !state.hermes.loading) void hermes.load();
+
   const deepLink = takeDeepLink();
   const preferred = deepLink?.channel ?? localStorage.getItem(LAST_CHANNEL_KEY);
   const target =
@@ -2792,14 +3207,26 @@ if ('serviceWorker' in navigator) {
     if (document.visibilityState === 'visible') checkForUpdate();
   });
 
-  window.addEventListener('load', async () => {
-    const registration = await navigator.serviceWorker.register('./sw.js');
-    // An installed app is launched, not reloaded, and can sit open for days;
-    // asking on the way in is what makes a new worker land the same day.
-    registration.update().catch(() => {
-      /* offline, or the daemon is down — the worker we have still serves */
-    });
-  });
+  // Registration is a promise, and the document it belongs to can stop being a
+  // valid one while it is still in flight: the handover below reloads the page,
+  // and under Electron `register` then rejects with an InvalidStateError rather
+  // than never settling. Nothing was catching it, so a reload that arrived at
+  // the wrong moment surfaced as an unhandled rejection. Skip the call once a
+  // reload is on the way, and treat a rejection the same as any other — there
+  // is no page left to serve.
+  const registerWorker = async () => {
+    if (reloading) return;
+    try {
+      const registration = await navigator.serviceWorker.register('./sw.js');
+      // An installed app is launched, not reloaded, and can sit open for days;
+      // asking on the way in is what makes a new worker land the same day.
+      await registration.update();
+    } catch {
+      /* offline, the daemon is down, or this document is on its way out */
+    }
+  };
+
+  window.addEventListener('load', registerWorker);
 
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     // A worker that skipped waiting now owns a page built against the last one.

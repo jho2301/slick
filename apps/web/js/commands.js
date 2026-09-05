@@ -38,29 +38,41 @@ const NOTE = {
 /**
  * @param {HTMLTextAreaElement} textarea
  * @param {HTMLElement} menuEl
- * @param {() => Array<{name: string, summary?: string, args?: string, aliases?: string[], where?: string}>} getCommands
- * @param {() => void} [onOpen] called the first time a `/` menu is wanted, to go and fetch the list
+ * @param {() => Array<{name: string, summary?: string, args?: string, aliases?: string[], where?: string, picker?: string}>} getCommands
+ * @param {() => void|Promise<void>} [onOpen] called the first time a `/` menu is wanted, to go and fetch the list
  */
 export function createCommandMenu(textarea, menuEl, getCommands, onOpen) {
   let items = [];
   let index = 0;
   let open = false;
+  let loading = false;
+  let loadToken = 0;
 
   function close() {
     open = false;
+    loading = false;
+    loadToken += 1;
     items = [];
     menuEl.hidden = true;
   }
 
   function render() {
     clear(menuEl);
+    if (loading && items.length === 0) {
+      menuEl.append(el('li', { class: 'is-loading', role: 'status' }, 'Loading commands…'));
+    }
     items.forEach((item, i) => {
-      const note = NOTE[item.where ?? 'run'] ?? item.where;
+      const interactive = item.picker === 'model';
+      const unavailable = item.where && item.where !== 'run' && !interactive;
+      const note = interactive ? 'choose provider and model' : NOTE[item.where ?? 'run'] ?? item.where;
       menuEl.append(
         el(
           'li',
           {
-            class: `${i === index ? 'is-sel' : ''}${item.where && item.where !== 'run' ? ' is-off' : ''}`,
+            class: `${i === index ? 'is-sel' : ''}${unavailable ? ' is-off' : ''}`,
+            role: 'option',
+            'aria-selected': i === index ? 'true' : 'false',
+            'aria-disabled': unavailable ? 'true' : null,
             onmousedown: (event) => {
               event.preventDefault();
               choose(i);
@@ -77,12 +89,13 @@ export function createCommandMenu(textarea, menuEl, getCommands, onOpen) {
         )
       );
     });
-    menuEl.hidden = items.length === 0;
+    menuEl.hidden = !loading && items.length === 0;
   }
 
   function choose(i = index) {
     const item = items[i];
-    if (!item) return;
+    const interactive = item?.picker === 'model';
+    if (!item || (item.where && item.where !== 'run' && !interactive)) return;
     // Just the name and a space: what follows is the command's own arguments,
     // and the hint in the menu already said what they look like.
     const insert = `/${item.name} `;
@@ -99,7 +112,25 @@ export function createCommandMenu(textarea, menuEl, getCommands, onOpen) {
     if (!found) return close();
     if (!open) {
       open = true;
-      onOpen?.();
+      const pending = onOpen?.();
+      if (pending && typeof pending.then === 'function') {
+        const token = ++loadToken;
+        loading = true;
+        Promise.resolve(pending).then(
+          () => {
+            if (open && token === loadToken) {
+              loading = false;
+              sync();
+            }
+          },
+          () => {
+            if (open && token === loadToken) {
+              loading = false;
+              sync();
+            }
+          }
+        );
+      }
     }
     index = 0;
     const query = found.query.toLowerCase();

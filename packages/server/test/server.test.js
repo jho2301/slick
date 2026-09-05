@@ -481,6 +481,7 @@ describe('the agent’s own slash commands', () => {
     if (first === 'list') {
       process.stdout.write(JSON.stringify([
         { name: 'ping', description: 'say hello', args_hint: '[times]', aliases: ['p'] },
+        { name: 'model', description: 'switch model', args_hint: '[model]', picker: 'model', where: 'session' },
         { name: 'nope', description: 'cannot run here', where: 'session' },
       ]));
     } else if (first === 'ping' || first === 'p') {
@@ -511,12 +512,14 @@ describe('the agent’s own slash commands', () => {
     assert.equal(listed.body.error, null);
     assert.deepEqual(
       listed.body.commands.map((c) => c.name),
-      ['ping', 'nope']
+      ['ping', 'model', 'nope']
     );
     assert.equal(listed.body.commands[0].summary, 'say hello');
     assert.equal(listed.body.commands[0].args, '[times]');
     assert.deepEqual(listed.body.commands[0].aliases, ['p']);
-    assert.equal(listed.body.commands[1].where, 'session', 'listed, but the agent says not from here');
+    assert.equal(listed.body.commands[1].picker, 'model');
+    assert.equal(listed.body.commands[1].where, 'session');
+    assert.equal(listed.body.commands[2].where, 'session', 'listed, but the agent says not from here');
   });
 
   test('running one answers the caller and leaves nothing behind', async () => {

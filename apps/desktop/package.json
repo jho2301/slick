@@ -1,6 +1,6 @@
 {
   "name": "@slick/desktop",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Slick desktop app (Electron shell around the local workspace)",

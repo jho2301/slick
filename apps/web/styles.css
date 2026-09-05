@@ -301,6 +301,12 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   text-align: left;
 }
 .rail__heading:hover { background: var(--rail-bg-hi); color: var(--rail-fg); }
+/* The same heading, for a section that does not fold: no chevron, no hover
+   affordance, because there is nothing to click. */
+.rail__heading--static { margin: 0; cursor: default; }
+.rail__heading--row { display: flex; align-items: center; gap: 6px; }
+.rail__heading--row .rail__heading-text { min-width: 0; }
+.rail__heading--static:hover { background: none; color: var(--rail-fg-dim); }
 .rail__chev { font-size: 10px; width: 10px; flex: none; }
 .rail__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -473,12 +479,138 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
 }
 /* Expanded, it takes only as much of the rail as it needs and scrolls past
    that — the channels above stay visible either way. */
-.rail__pinned .agent-list {
+.rail__pinned .agent-list,
+.rail__pinned .hermes {
   max-height: min(38vh, 260px);
   overflow-y: auto;
   scrollbar-width: thin;
   scrollbar-color: var(--rail-bg-hi) transparent;
 }
+
+/* ----------------------------------------------------------------- hermes */
+
+/* Three selects in a sidebar column. Label above field rather than beside it:
+   the rail is ~220px and "Provider" alongside a menu of provider names leaves
+   the names in about nine characters. */
+.hermes { padding: 2px 2px 4px; }
+.hermes__field { display: block; margin-bottom: 7px; }
+.hermes__label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--rail-fg-dim);
+}
+.hermes__select {
+  width: 100%;
+  padding: 3px 5px;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 5px;
+  background: var(--rail-bg-hi);
+  color: var(--rail-fg);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.hermes__select:disabled { opacity: 0.5; }
+.hermes__help, .hermes__note, .hermes__scope {
+  display: block;
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--rail-fg-dim);
+}
+.hermes__note.is-warn { color: #fca5a5; }
+.hermes__note.is-ok { color: #86efac; }
+.hermes__scope { margin-top: 7px; opacity: 0.75; }
+.hermes__scope code { font-family: var(--mono); color: var(--rail-fg); }
+
+/* The answer to "what is it on?", without opening a menu. */
+.hermes__current {
+  display: flex; align-items: baseline; gap: 6px;
+  margin-top: 6px; padding-top: 6px;
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+  min-width: 0;
+}
+.hermes__model {
+  font-family: var(--mono); font-size: 11px; color: var(--rail-fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.hermes__prov { font-size: 10px; color: var(--rail-fg-dim); flex: none; }
+
+.hermes__acts { display: flex; gap: 6px; margin-top: 7px; }
+.hermes__save, .hermes__undo {
+  border: 0; border-radius: 5px; padding: 3px 8px; font-size: 11px; font-weight: 600;
+  background: var(--rail-active); color: #fff;
+}
+.hermes__save[disabled] { opacity: 0.4; }
+.hermes__undo { background: none; color: var(--rail-fg-dim); font-weight: 400; }
+.hermes__undo:hover { background: var(--rail-bg-hi); color: var(--rail-fg); }
+
+/* Inline with the error it answers: a read that failed is a read worth trying
+   again, and closing the panel to get one is not an affordance. */
+.hermes__retry {
+  margin-left: 6px;
+  border: 1px solid rgb(255 255 255 / 0.18); border-radius: 5px;
+  padding: 1px 6px; font-size: 10.5px;
+  background: none; color: var(--rail-fg);
+}
+.hermes__retry:hover:not([disabled]) { background: var(--rail-bg-hi); }
+.hermes__retry[disabled] { opacity: 0.5; }
+
+/* What the account has left. A second block under the settings, separated by a
+   rule, because it is not a setting: nothing in here is something to change. */
+.hermes__usage {
+  margin-top: 9px; padding-top: 8px;
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+}
+/* In its own rail section the heading above is already the separator, so the
+   block does not draw a second rule of its own. */
+.rail__pinned--limits .hermes__usage { margin-top: 0; padding-top: 0; border-top: 0; }
+.hermes__usage-head { display: flex; align-items: center; gap: 5px; margin-left: auto; }
+.hermes__usage-plan {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 1px 5px; border-radius: 999px;
+  background: var(--rail-bg-hi); color: var(--rail-fg-dim);
+}
+/* Pushed to the right so the block has one obvious control and it is the one
+   that costs a request. */
+.hermes__usage-refresh {
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid rgb(255 255 255 / 0.18); border-radius: 5px;
+  padding: 2px; line-height: 0;
+  background: none; color: var(--rail-fg);
+}
+.hermes__usage-refresh:hover:not([disabled]) { background: var(--rail-bg-hi); }
+.hermes__usage-refresh[disabled] { opacity: 0.5; }
+
+/* Both windows on one line, split by a slash. Kept on a single line on purpose
+   — a row that wraps makes the pair of them stop scanning as a pair — so
+   nothing here is allowed to break, and the line shrinks its own type rather
+   than folding when the rail is narrow. */
+.hermes__limits-line {
+  display: flex; align-items: baseline; gap: 6px;
+  margin-top: 5px; white-space: nowrap;
+  min-width: 0; overflow: hidden;
+}
+.hermes__limit {
+  display: flex; align-items: baseline; gap: 4px;
+  white-space: nowrap; flex: 0 0 auto;
+}
+.hermes__limit-sep { font-size: 10.5px; color: var(--rail-fg-dim); flex: 0 0 auto; }
+.hermes__limit-label { font-size: 10.5px; color: var(--rail-fg); }
+.hermes__limit-value {
+  font-family: var(--mono); font-size: 11px; color: var(--rail-fg);
+}
+.hermes__limit-reset { font-size: 10px; color: var(--rail-fg); }
+
+/* The same muted grey as the rest of the rail's small print: a spare reset is
+   a fact about the account, not good news worth colouring. */
+.hermes__usage-banked {
+  margin-top: 7px; font-size: 10.5px; color: var(--rail-fg-dim); text-align: right;
+}
+.hermes__usage-detail { margin-top: 3px; font-size: 10px; color: var(--rail-fg-dim); }
 
 .rail__foot {
   display: flex; align-items: center; gap: 7px;
@@ -1295,6 +1427,7 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   justify-content: space-between;
 }
 .command-menu li.is-sel { background: var(--accent-soft); }
+.command-menu li.is-loading { color: var(--fg-faint); cursor: default; justify-content: flex-start; }
 /* Listed, but the agent said it cannot answer it from here. */
 .command-menu li.is-off { opacity: 0.55; }
 .command-menu .what { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
@@ -1388,6 +1521,20 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
   /* Cancels the 12px above, so a docked .msg__actions meets the head border. */
   --dock-top: -12px;
 }
+
+/* A thread pane is one conversation held open, and every row in it belongs to
+   that conversation: the avatar column repeats an identity the header beside it
+   already spells out, and it pushes the words most of a column in from the edge
+   the title and the divider sit on. So the pane drops the gutter and runs the
+   body out to its own content edge. Thread pane only — the channel timeline,
+   the rail and the thread-summary pill keep their avatars.
+
+   The second selector carries one class more than it needs so it ties
+   `.msg.is-typing .msg__gutter` above and wins on order: the transient typing
+   and draft rows are rows in this pane like any other. */
+.thread__scroll .msg { grid-template-columns: minmax(0, 1fr); padding-left: 16px; }
+.thread__scroll .msg .msg__gutter { display: none; }
+
 .thread__divider {
   display: flex; align-items: center; gap: 10px;
   margin: 10px 16px;
@@ -1653,4 +1800,101 @@ body.is-resizing .thread__head { -webkit-app-region: no-drag; }
      just crowd the header. */
   #btn-close-thread { display: none; }
   .chan-head__actions .chip:not(:first-child) { display: none; }
+}
+
+/* ------------------------------------------------- response sections */
+
+/* The three boxes an agent's reply can carry under its answer. Native
+   `<details>`, so closed is the element's own default and no script is
+   involved — the accent stripe and the mask icon are the only things the
+   stylesheet adds, and both are set per section by `data-section`. Colour is
+   never the only difference: each card has its own glyph and its own written
+   label. */
+.rsec {
+  /* `.think`'s reason: an aside about the answer, not the answer. */
+  max-width: 620px;
+  margin: 4px 0;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--rsec-accent, var(--line));
+  border-radius: 8px;
+  overflow: hidden;
+}
+.rsec[data-section="reasoning"] {
+  --rsec-accent: var(--agent, #7c6cf5);
+  --rsec-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5a4.5 4.5 0 00-2.6 8.2v1.6h5.2V9.7A4.5 4.5 0 008 1.5z' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M6.2 13.4h3.6M6.8 15h2.4' stroke='%23000' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.rsec[data-section="process"] {
+  --rsec-accent: #0ea5a5;
+  --rsec-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 4h8M6 8h8M6 12h8M2.5 4h.01M2.5 8h.01M2.5 12h.01' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.rsec[data-section="assumptions"] {
+  --rsec-accent: #d97706;
+  --rsec-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.2' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M6.2 6.1a1.9 1.9 0 113 1.6c-.5.4-.8.7-.8 1.4' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='11.6' r='.95' fill='%23000'/%3E%3C/svg%3E");
+}
+
+.rsec__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  /* The default triangle sits where the icon goes; the chevron below replaces
+     it so both marks cannot disagree about the open state. */
+  list-style: none;
+}
+.rsec__head::-webkit-details-marker { display: none; }
+.rsec__head:hover { background: var(--bg-hover); }
+.rsec__head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* Chevron first, then the section's own glyph, then the label. */
+.rsec__head::before,
+.rsec__title::before {
+  content: '';
+  flex: none;
+  width: 13px;
+  height: 13px;
+  background: currentColor;
+}
+.rsec__head::before {
+  -webkit-mask: var(--think-chevron) center / contain no-repeat;
+  mask: var(--think-chevron) center / contain no-repeat;
+  transition: transform 0.15s ease;
+}
+.rsec[open] > .rsec__head::before { transform: rotate(90deg); }
+
+.rsec__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--rsec-accent, var(--fg-dim));
+}
+.rsec__title::before {
+  -webkit-mask: var(--rsec-icon) center / contain no-repeat;
+  mask: var(--rsec-icon) center / contain no-repeat;
+}
+
+.rsec__body {
+  padding: 2px 11px 9px 27px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--fg);
+}
+.rsec__body > :first-child { margin-top: 0; }
+.rsec__body > :last-child { margin-bottom: 0; }
+.rsec__body ul,
+.rsec__body ol { padding-left: 20px; margin: 4px 0; }
+.rsec__body li { margin: 2px 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .rsec__head::before { transition: none; }
+}
+
+@media (max-width: 720px) {
+  .rsec { max-width: none; }
+  .rsec__body { padding-left: 13px; }
 }

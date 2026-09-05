@@ -296,6 +296,101 @@ async function main() {
       (await js('document.querySelector("#messages .think__head").getAttribute("aria-expanded")')) === 'true'
     );
 
+    console.log('\nresponse sections');
+    // Posted the way an agent writes a structured reply: one message whose
+    // text carries the four labels. Everything below is read off that row
+    // alone — earlier smoke messages are still on screen and would answer for
+    // it if the selectors were loose.
+    const sectioned = server.ws.messages.post({
+      channel: 'deploys',
+      text: [
+        '## Answer',
+        'The canary is stable on parrot-anchor-9471.',
+        '',
+        '## Reasoning summary',
+        'The rollback pinned a digest that was already known good.',
+        '',
+        '## Process',
+        '- Pulled the last two image digests',
+        '- Diffed the running config',
+        '',
+        '## Assumptions',
+        'The registry mirror is in sync.',
+      ].join('\n'),
+      author: { id: 'claude', kind: 'agent', label: 'claude' },
+    });
+    await sleep(1000);
+    const ROW = `#messages .msg[data-id="${sectioned.id}"]`;
+    check('the sectioned reply rendered', await js(`!!document.querySelector('${ROW}')`));
+    const cards = await js(`
+      (() => {
+        const row = document.querySelector('${ROW}');
+        if (!row) return null;
+        return [...row.querySelectorAll('.rsec')].map(d => ({
+          section: d.dataset.section,
+          open: d.hasAttribute('open'),
+          title: d.querySelector('.rsec__title').textContent,
+        }));
+      })()
+    `);
+    check('exactly three section cards are drawn', cards && cards.length === 3, `${cards ? cards.length : 'no row'} cards`);
+    check(
+      'reasoning, process and assumptions, in that order',
+      cards && cards.map((c) => c.section).join(',') === 'reasoning,process,assumptions',
+      cards ? cards.map((c) => c.section).join(',') : ''
+    );
+    check('and every one of them is born closed', cards && cards.every((c) => !c.open));
+    // The answer keeps the row's one editable body, and the labels the parser
+    // consumed must not have leaked back into it.
+    const body = await js(`
+      (() => {
+        const row = document.querySelector('${ROW}');
+        const bodies = row.querySelectorAll('.msg__body');
+        return { count: bodies.length, text: bodies[0] ? bodies[0].textContent : '' };
+      })()
+    `);
+    check('the row still has exactly one editable body', body.count === 1, `${body.count}`);
+    check('which holds the answer', body.text.includes('parrot-anchor-9471'));
+    check(
+      'and none of the section text or labels',
+      !/Reasoning summary|Process|Assumptions|registry mirror|image digests/.test(body.text),
+      JSON.stringify(body.text.slice(0, 80))
+    );
+    check(
+      'a closed card has no open attribute',
+      await js(`(() => {
+        const d = document.querySelector('${ROW} .rsec[data-section="process"]');
+        return !!d && !d.open && !d.hasAttribute('open');
+      })()`)
+    );
+    await shoot('02d-sections');
+    await js(`document.querySelector('${ROW} .rsec[data-section="process"] .rsec__head').click()`);
+    await sleep(400);
+    check(
+      'clicking the process summary opens that card',
+      await js(`document.querySelector('${ROW} .rsec[data-section="process"]').hasAttribute('open')`)
+    );
+    check(
+      'and its list is on screen',
+      await js(`
+        (() => {
+          const items = [...document.querySelectorAll('${ROW} .rsec[data-section="process"] .rsec__body li')];
+          if (items.length !== 2) return false;
+          return items.every(li => li.getBoundingClientRect().height > 0)
+            && items[0].textContent.includes('image digests');
+        })()
+      `)
+    );
+    check(
+      'while the other two stay closed',
+      await js(`
+        [...document.querySelectorAll('${ROW} .rsec')]
+          .filter(d => d.dataset.section !== 'process')
+          .every(d => !d.hasAttribute('open'))
+      `)
+    );
+    await shoot('02e-sections-open');
+
     console.log('\nsending');
     await js(`
       (() => {
@@ -502,106 +597,39 @@ async function main() {
     );
     await shoot('07-new-channel');
 
-    console.log('\nchanging an agent’s model');
-    // The agents live folded under the channels, so open that first — clicking
-    // a hidden button would pass here and be unreachable in the app.
-    await js('document.querySelector("#toggle-agents").click()');
-    await sleep(400);
-    const agentKey = await js('document.querySelector("#agent-list .agent .agent__key").textContent');
-    check('the rail says what each agent is running', await visible('#agent-list .agent__model'));
-    check(
-      'and starts on the agent’s own default',
-      (await js('document.querySelector("#agent-list .agent__model").textContent')) === 'default model'
-    );
-    // An agent that never advertised a list gets a box to type into.
-    await js('document.querySelector("#agent-list .agent__model").click()');
-    await sleep(400);
-    check('the model dialog opened', await js('document.querySelector("#modal").open'));
-    check('with a field to type one into', await js('!!document.querySelector("#field-model")'));
-    await js(`
-      (() => {
-        document.querySelector('#field-model').value = 'anthropic/claude-opus-4';
-        document.querySelector('#modal-form').requestSubmit();
-      })()
-    `);
-    await sleep(900);
-    check(
-      'the rail shows the new model',
-      await js('[...document.querySelectorAll("#agent-list .agent__model")].some(n => n.textContent === "anthropic/claude-opus-4")')
-    );
-    check(
-      'and it is where a running `serve` would read it',
-      server.ws.agents.get(agentKey).state._serveModel === 'anthropic/claude-opus-4'
-    );
-
-    // Once its `serve` has asked the binary what it can run, that same click is
-    // a menu instead — which is the whole point for an agent like Hermes, whose
-    // models are a list nobody remembers.
-    server.ws.agents.setModelChoices(agentKey, [
-      { id: 'north::big', label: 'big', group: 'north' },
-      { id: 'north::small', label: 'small', group: 'north' },
-      { id: 'south::quick', label: 'quick', group: 'south' },
-    ]);
+    console.log('\nthe Hermes panel in the rail');
+    // Folded by default, and it fetches on first unfold rather than on boot.
+    await js('document.querySelector("#toggle-hermes").click()');
     await sleep(1200);
-    await js(`
-      [...document.querySelectorAll('#agent-list .agent__model')]
-        .find(n => n.textContent === 'anthropic/claude-opus-4').click()
-    `);
-    await sleep(400);
-    check('the dialog offers a menu now', (await js('document.querySelector("#field-model").tagName')) === 'SELECT');
+    check('the rail has a Hermes section', await visible('#hermes-panel'));
+    check('with a profile picker', await js('!!document.querySelector("#hermes-profile")'));
     check(
-      'grouped by provider, as the agent grouped them',
-      (await js('[...document.querySelectorAll("#field-model optgroup")].map(g => g.label).join("|")')) ===
-        'north|south'
+      'and it says what it does and does not change',
+      (await js('document.querySelector("#hermes-panel .hermes__scope").textContent')).includes('/model')
     );
-    check(
-      'with the default, the hand-set model and a way out alongside them',
-      await js(`
-        (() => {
-          const values = [...document.querySelectorAll('#field-model option')].map(o => o.value);
-          return values[0] === '' && values.includes('anthropic/claude-opus-4') && values.length === 6;
-        })()
-      `)
-    );
-    check(
-      'and what it is running now is what is selected',
-      (await js('document.querySelector("#field-model").value')) === 'anthropic/claude-opus-4'
-    );
-    await shoot('07b-agent-model');
-    await js(`
+    // Whether the provider/model selects are populated depends on a Hermes
+    // being installed and importable beside this workspace, which a smoke run
+    // cannot assume — so the panel is only required to say why, not to have a
+    // catalog. Either way it must not claim a default it does not have.
+    const hermesState = await js(`
       (() => {
-        document.querySelector('#field-model').value = 'south::quick';
-        document.querySelector('#modal-form').requestSubmit();
+        const note = document.querySelector('#hermes-panel .hermes__note');
+        return JSON.stringify({
+          note: note ? note.textContent : null,
+          providers: !!document.querySelector('#hermes-provider'),
+          current: (document.querySelector('#hermes-panel .hermes__current') || {}).textContent || '',
+        });
       })()
     `);
-    await sleep(900);
-    check('picking one sets it', server.ws.agents.get(agentKey).state._serveModel === 'south::quick');
-    check(
-      'and the rail calls it what the agent calls it',
-      await js('[...document.querySelectorAll("#agent-list .agent__model")].some(n => n.textContent === "quick")'),
-      'not the routing id'
-    );
-
-    // The way back out is the half that is easy to ship broken: a setting you
-    // cannot unset.
-    await js(`[...document.querySelectorAll('#agent-list .agent__model')].find(n => n.textContent === 'quick').click()`);
-    await sleep(400);
-    await js(`
-      (() => {
-        document.querySelector('#field-model').value = '';
-        document.querySelector('#modal-form').requestSubmit();
-      })()
-    `);
-    await sleep(900);
-    check('and choosing the default clears it', server.ws.agents.get(agentKey).state._serveModel === null);
+    const hermes = JSON.parse(hermesState);
+    check('it either offers a catalog or says why not', hermes.providers || Boolean(hermes.note), hermesState);
+    await shoot('07b-hermes-panel');
 
     console.log('\nagents that cannot answer stay out of the way');
     // A cron automation: a real session with a real history key that nothing
     // watches. Mentioning it would be shouting into a log file.
-    const listed = await js('document.querySelectorAll("#agent-list .agent").length');
     server.ws.agents.start({ agentId: 'digest-bot', name: 'digest', channel: 'general' });
     await sleep(1200);
-    check('an automation does not join the rail', (await js('document.querySelectorAll("#agent-list .agent").length')) === listed);
 
     await js(`
       (() => {
@@ -615,6 +643,7 @@ async function main() {
     await sleep(300);
     const offered = await js('[...document.querySelectorAll("#mention-menu-main .what")].map(n => n.textContent).join(" ")');
     check('the mention picker offers the agents that answer', offered.includes('@claude'), offered);
+    check('an automation nothing watches is not offered', !offered.includes('@digest-bot'), offered);
     check('and not the ones that only post', !offered.includes('@digest-bot'));
     await js(`
       (() => {

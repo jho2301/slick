@@ -876,10 +876,33 @@ def config_effort(model: Any) -> str:
     return str(resolved.get("effort") or "").strip()
 
 
+_TURN_END_SAID: set = set()
+_EFFORT_SAID: set = set()
+
+
 def effort_for_turn(session_id: Any, model: Any) -> str:
-    """The level to badge one reply with: what was recorded, else what is set."""
+    """The level to badge one reply with: what was recorded, else what is set.
+
+    Says once, per distinct outcome, which of the two answered and what it
+    said. An absent badge has three indistinguishable causes from the outside
+    — no session row, a row that resolved flat, or a config lookup that threw
+    — and telling them apart afterwards means reading someone's chat history
+    against a database. One line the first time each combination occurs turns
+    that into a question the log answers.
+    """
     recorded, level = _session_reasoning(session_id)
-    return level if recorded else config_effort(model)
+    effort = level if recorded else config_effort(model)
+    outcome = "{}:{}".format("row" if recorded else "config", effort or "-")
+    if outcome not in _EFFORT_SAID:
+        _EFFORT_SAID.add(outcome)
+        logger.info(
+            "Slick: effort for a %s reply came from %s as %r (session=%s)",
+            str(model or "?"),
+            "the session row" if recorded else "config",
+            effort,
+            str(session_id or "")[:32] or "-",
+        )
+    return effort
 
 
 def memo_key(chat_id: Any, thread_id: Any) -> str:
@@ -1721,12 +1744,19 @@ class SlickAdapter(BasePlatformAdapter):
             return
         handlers = self._hook_handlers()
         if handlers is None:
-            logger.debug(
-                "Slick: no gateway hook registry — replies will carry no model badge"
+            # Loud, because it is silent everywhere else. `_model` reaches the
+            # message anyway — Hermes puts its own `model` in the send
+            # metadata and `json_safe_metadata` prefixes it — so a badge that
+            # is half there looks like a badge that works, and the missing
+            # half has no other symptom at all.
+            logger.warning(
+                "Slick: no gateway hook registry (%r) — replies will carry no effort badge",
+                type(getattr(getattr(self, "gateway_runner", None), "hooks", None)).__name__,
             )
             return
         handlers.setdefault(TURN_MODEL_EVENT, []).append(self._on_turn_end)
         self._turn_model_hooked = True
+        logger.info("Slick: subscribed to %s for the model and effort badges", TURN_MODEL_EVENT)
 
     def _unsubscribe_from_turn_model(self) -> None:
         """Drop the subscription so reconnects do not stack handlers."""
@@ -1746,7 +1776,16 @@ class SlickAdapter(BasePlatformAdapter):
         """
         if not isinstance(context, dict):
             return
-        if str(context.get("platform") or "").strip() != PLATFORM_NAME:
+        platform = str(context.get("platform") or "").strip()
+        if platform not in _TURN_END_SAID:
+            _TURN_END_SAID.add(platform)
+            logger.info(
+                "Slick: %s fired for platform=%r (ours is %r)",
+                TURN_MODEL_EVENT,
+                platform,
+                PLATFORM_NAME,
+            )
+        if platform != PLATFORM_NAME:
             return
         chat_id = str(context.get("chat_id") or "")
         thread_id = str(context.get("thread_id") or "")

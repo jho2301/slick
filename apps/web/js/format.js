@@ -158,3 +158,39 @@ export function initials(name) {
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[1][0]).toUpperCase();
 }
+
+// ---------------------------------------------------------------- models ---
+
+/** The suffixes a local weight file wears, and the only dots worth cutting. */
+// Case-insensitive on purpose. macOS and Windows filesystems are, so the same
+// weights legitimately arrive spelled `.gguf` or `.GGUF` depending on which
+// host stamped the name, and a normaliser that is fussy about the spelling of
+// a file extension has only done half its job.
+const WEIGHT_FILE = /\.(?:gguf|ggml|safetensors|bin|pt|pth)$/i;
+
+/**
+ * A model name, as a name rather than as a file. Adapters already trim these
+ * on the way in — that is what `reply.model`'s `pattern` is for — but a name
+ * can reach the badge without having passed one, so the same weights show up
+ * as both `Qwen3.8-27B-UD-IQ4_XS` and `Qwen3.8-27B-UD-IQ4_XS.gguf`.
+ *
+ * Only a known weight suffix goes. Hosted names are full of dots — `gpt-4.1`,
+ * `claude-3.5-sonnet` — and cutting at the last one would quietly eat the
+ * version. Directories are left alone too: nothing sends one, and stripping a
+ * path nobody uses is a guess this can do without.
+ *
+ * Purely cosmetic, and deliberately kept that way: what a model is *called*
+ * is not what a model *is*. Grouping and the hover both read the untrimmed
+ * name, so two builds of one architecture — `llama-3-70b.gguf` beside
+ * `llama-3-70b.safetensors` — stay two models everywhere it matters, and only
+ * the chip gets shorter.
+ */
+export function trimModelName(name) {
+  if (name == null) return '';
+  if (typeof name !== 'string') return String(name);
+  const trimmed = name.replace(WEIGHT_FILE, '');
+  // A name that is nothing but a suffix keeps it — an empty badge says less,
+  // and `.trim()` rather than a truthiness check because a name of one space
+  // renders as a pill with nothing in it just as surely as an empty one does.
+  return trimmed.trim() ? trimmed : name;
+}

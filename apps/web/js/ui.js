@@ -37,6 +37,21 @@ function append(node, children) {
   }
 }
 
+/**
+ * `el`'s child rules for a node that already exists.
+ *
+ * `node.append(cond ? kid : null)` is the DOM's own method, and it stringifies
+ * — an absent child arrives on screen as the word `null`. Anything filling a
+ * node it did not just create goes through here instead.
+ *
+ * @param {Node} node
+ * @param {...(Node|string|null|false|undefined|Array<any>)} children
+ */
+export function mount(node, ...children) {
+  append(node, children);
+  return node;
+}
+
 export function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
   return node;
@@ -99,6 +114,7 @@ function closeModal(value) {
  *   title: string,
  *   fields?: Array<{name: string, label?: string, value?: string, type?: string,
  *                   placeholder?: string, help?: string, required?: boolean, rows?: number,
+ *                   onchange?: (event: Event) => void,
  *                   options?: Array<{value: string, label: string}>}>,
  *   note?: string,
  *   body?: string,
@@ -136,6 +152,7 @@ export function openModal(config) {
               autocomplete: 'off',
             });
     input.value = field.value ?? '';
+    if (typeof field.onchange === 'function') input.addEventListener('change', field.onchange);
     if (field.required) input.required = true;
     body.append(
       el(
