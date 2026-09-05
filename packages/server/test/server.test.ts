@@ -1,40 +1,60 @@
-import { test, describe, before, after } from 'node:test';
+import { test, describe, beforeAll, afterAll } from 'vitest';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
-import { request } from 'node:http';
+import { cpSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { EventEmitter } from 'node:events';
 
 import { Workspace, serveLockPath } from '@slick/core';
-import { createServer } from '../src/index.js';
-import { createHub } from '../src/hub.js';
-import { createPushService } from '../src/push.js';
-import { buildStamp, resolveWebRoot } from '../src/static.js';
+import { createServer, type SlickServer } from '../src/index.ts';
+import { createHub } from '../src/hub.ts';
+import { createPushService, type PushSubscription } from '../src/push.ts';
+import { buildStamp } from '../src/static.ts';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const TOKEN = 'test-token-abc';
 
-let home;
-let app;
-let base;
+/**
+ * A stand-in for the built UI, copied per run so the tests that touch it
+ * never touch the repo. It has what the daemon looks for — an index, a
+ * stylesheet, a hashed bundle, a manifest and a worker — and nothing else.
+ */
+const WEB_FIXTURE = join(import.meta.dirname, 'fixtures', 'web-root');
 
-before(async () => {
+let home: string;
+let webRoot: string;
+let app: SlickServer;
+let base: string;
+
+beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), 'slick-server-'));
-  app = createServer({ home, token: TOKEN });
+  webRoot = join(home, 'web');
+  cpSync(WEB_FIXTURE, webRoot, { recursive: true });
+  app = createServer({ home, token: TOKEN, webRoot });
   const bound = await app.listen(0);
   base = bound.url;
 });
 
-after(async () => {
+afterAll(async () => {
   await app.close();
   rmSync(home, { recursive: true, force: true });
 });
 
-/** Authenticated request helper. */
-async function call(method, path, body, opts = {}) {
+interface CallOptions {
+  anonymous?: boolean;
+  headers?: Record<string, string>;
+}
+
+/** Authenticated request helper. The body is whatever JSON came back. */
+async function call(
+  method: string,
+  path: string,
+  body?: unknown,
+  opts: CallOptions = {}
+): Promise<{ status: number; headers: Headers; body: any }> {
   const res = await fetch(`${base}${path}`, {
     method,
     headers: {
@@ -80,7 +100,7 @@ describe('auth', () => {
   test('rejects a non-local Host header (DNS rebinding)', async () => {
     // fetch() refuses to set Host, so go through node:http to forge it.
     const { port } = new URL(base);
-    const status = await new Promise((resolve, reject) => {
+    const status = await new Promise<number | undefined>((resolve, reject) => {
       const req = request(
         {
           host: '127.0.0.1',
@@ -101,6 +121,22 @@ describe('auth', () => {
   });
 });
 
+describe('a request the daemon cannot decode', () => {
+  test('a malformed escape in a path is a 400, and the daemon is still up afterwards', async () => {
+    // These used to throw a URIError past the request handler, which the
+    // daemon treats as fatal — one bad URL from a browser tab shut the
+    // workspace down. Now they are answered, and nothing else notices.
+    assert.equal((await call('GET', '/api/channels/%zz')).status, 400);
+    const anonymous = await fetch(`${base}/%zz`);
+    assert.equal(anonymous.status, 401, 'auth still runs first');
+    await anonymous.text();
+    const res = await fetch(`${base}/%zz`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    assert.equal(res.status, 400);
+    await res.text();
+    assert.equal((await call('GET', '/api/health')).status, 200, 'the daemon answered the next request');
+  });
+});
+
 describe('channels over HTTP', () => {
   test('create, read, update, archive, delete', async () => {
     const created = await call('POST', '/api/channels', { slug: 'api-test', topic: 'from a test' });
@@ -108,7 +144,7 @@ describe('channels over HTTP', () => {
     assert.equal(created.body.channel.slug, 'api-test');
 
     const listed = await call('GET', '/api/channels');
-    assert.ok(listed.body.channels.some((c) => c.slug === 'api-test'));
+    assert.ok(listed.body.channels.some((c: { slug: string }) => c.slug === 'api-test'));
 
     const updated = await call('PATCH', '/api/channels/api-test', { topic: 'changed' });
     assert.equal(updated.body.channel.topic, 'changed');
@@ -116,7 +152,7 @@ describe('channels over HTTP', () => {
     const archived = await call('POST', '/api/channels/api-test/archive');
     assert.equal(archived.body.channel.archived, true);
     const visible = await call('GET', '/api/channels');
-    assert.ok(!visible.body.channels.some((c) => c.slug === 'api-test'));
+    assert.ok(!visible.body.channels.some((c: { slug: string }) => c.slug === 'api-test'));
 
     await call('POST', '/api/channels/api-test/unarchive');
     const removed = await call('DELETE', '/api/channels/api-test');
@@ -139,15 +175,20 @@ describe('categories over HTTP', () => {
 
     const second = await call('POST', '/api/categories', { name: 'Product' });
     assert.deepEqual(
-      (await call('GET', '/api/categories')).body.categories.map((c) => c.slug),
+      (await call('GET', '/api/categories')).body.categories.map((c: { slug: string }) => c.slug),
       ['engineering', 'product']
     );
 
     await call('POST', '/api/channels', { slug: 'http-deploys', category: 'engineering' });
     const grouped = await call('GET', '/api/categories/engineering/channels');
-    assert.deepEqual(grouped.body.channels.map((c) => c.slug), ['http-deploys']);
+    assert.deepEqual(
+      grouped.body.channels.map((c: { slug: string }) => c.slug),
+      ['http-deploys']
+    );
     assert.ok(
-      !(await call('GET', '/api/channels?category=')).body.channels.some((c) => c.slug === 'http-deploys'),
+      !(await call('GET', '/api/channels?category=')).body.channels.some(
+        (c: { slug: string }) => c.slug === 'http-deploys'
+      ),
       'an empty category filter means "the uncategorised ones"'
     );
 
@@ -158,7 +199,10 @@ describe('categories over HTTP', () => {
     assert.equal(collapsed.body.category.collapsed, true);
 
     const reordered = await call('POST', '/api/categories/reorder', { order: ['product'] });
-    assert.deepEqual(reordered.body.categories.map((c) => c.slug), ['product', 'engineering']);
+    assert.deepEqual(
+      reordered.body.categories.map((c: { slug: string }) => c.slug),
+      ['product', 'engineering']
+    );
 
     const removed = await call('DELETE', '/api/categories/product');
     assert.equal(removed.body.category.uncategorisedChannels, 1);
@@ -250,14 +294,25 @@ describe('agent sessions over HTTP', () => {
     const key = (await call('POST', '/api/agents/sessions', { agentId: 'modelbot', channel: 'general' })).body
       .session.key;
 
-    assert.equal((await call('GET', `/api/agents/sessions/${key}/model`)).body.model, null, 'none to begin with');
+    assert.equal(
+      (await call('GET', `/api/agents/sessions/${key}/model`)).body.model,
+      null,
+      'none to begin with'
+    );
 
-    const set = await call('PUT', `/api/agents/sessions/${key}/model`, { model: ' anthropic/claude-opus-4 ' });
+    const set = await call('PUT', `/api/agents/sessions/${key}/model`, {
+      model: ' anthropic/claude-opus-4 ',
+    });
     assert.equal(set.body.model, 'anthropic/claude-opus-4', 'trimmed on the way in');
-    assert.equal((await call('GET', `/api/agents/sessions/${key}/model`)).body.model, 'anthropic/claude-opus-4');
+    assert.equal(
+      (await call('GET', `/api/agents/sessions/${key}/model`)).body.model,
+      'anthropic/claude-opus-4'
+    );
 
     // It rides in the session list, which is what the app renders the rail from.
-    const listed = (await call('GET', '/api/agents/sessions')).body.sessions.find((s) => s.key === key);
+    const listed = (await call('GET', '/api/agents/sessions')).body.sessions.find(
+      (s: { key: string }) => s.key === key
+    );
     assert.equal(listed.state._serveModel, 'anthropic/claude-opus-4');
 
     const cleared = await call('PUT', `/api/agents/sessions/${key}/model`, { model: null });
@@ -273,10 +328,7 @@ describe('agent sessions over HTTP', () => {
     assert.deepEqual((await call('GET', `/api/agents/sessions/${key}/model`)).body.choices, []);
 
     // What `serve` writes after asking the binary `--list-models`.
-    app.ws.agents.setModelChoices(key, [
-      { id: 'north::big', label: 'big', group: 'north' },
-      'plain-name',
-    ]);
+    app.ws.agents.setModelChoices(key, [{ id: 'north::big', label: 'big', group: 'north' }, 'plain-name']);
 
     const offered = (await call('GET', `/api/agents/sessions/${key}/model`)).body;
     assert.deepEqual(offered.choices, [
@@ -291,22 +343,30 @@ describe('agent sessions over HTTP', () => {
   });
 
   test('the session list says which agents can actually be called', async () => {
-    const automation = (await call('POST', '/api/agents/sessions', { agentId: 'digest', channel: 'general' })).body
-      .session.key;
-    const watched = (await call('POST', '/api/agents/sessions', { agentId: 'answers', channel: 'general' })).body
-      .session.key;
+    const automation = (await call('POST', '/api/agents/sessions', { agentId: 'digest', channel: 'general' }))
+      .body.session.key;
+    const watched = (await call('POST', '/api/agents/sessions', { agentId: 'answers', channel: 'general' }))
+      .body.session.key;
     writeFileSync(serveLockPath(watched, home), String(process.pid));
 
     const sessions = (await call('GET', '/api/agents/sessions')).body.sessions;
-    const byKey = new Map(sessions.map((s) => [s.key, s]));
-    assert.equal(byKey.get(automation).callable, false, 'nothing is watching it, so a mention would go nowhere');
-    assert.equal(byKey.get(watched).callable, true);
-    assert.equal(byKey.get(watched).serve.live, true);
+    const byKey = new Map<string, { callable: boolean; serve: { live: boolean } }>(
+      sessions.map((s: { key: string }) => [s.key, s])
+    );
+    assert.equal(
+      byKey.get(automation)!.callable,
+      false,
+      'nothing is watching it, so a mention would go nowhere'
+    );
+    assert.equal(byKey.get(watched)!.callable, true);
+    assert.equal(byKey.get(watched)!.serve.live, true);
 
     // The watcher stops, but the bookkeeping it wrote says it will be back.
     rmSync(serveLockPath(watched, home), { force: true });
     await call('PUT', `/api/agents/sessions/${watched}/state`, { state: { _serveThreads: {} } });
-    const after = (await call('GET', '/api/agents/sessions')).body.sessions.find((s) => s.key === watched);
+    const after = (await call('GET', '/api/agents/sessions')).body.sessions.find(
+      (s: { key: string }) => s.key === watched
+    );
     assert.equal(after.serve.live, false);
     assert.equal(after.callable, true, 'an agent between restarts is still an agent');
   });
@@ -332,19 +392,20 @@ describe('agent sessions over HTTP', () => {
     await call('POST', `/api/agents/sessions/${key}/typing`, { on: false, threadId: rootId });
 
     const events = await call('GET', '/api/events?since=0');
-    const typingEvents = events.body.events.filter((e) => e.type === 'agent.typing');
+    const typingEvents = events.body.events.filter((e: { type: string }) => e.type === 'agent.typing');
     assert.equal(typingEvents.length, 2);
     assert.equal(typingEvents[0].payload.on, true);
     assert.equal(typingEvents[0].threadId, rootId);
 
     const resumed = await call('POST', `/api/agents/sessions/${key}/resume`, {});
-    assert.ok(resumed.body.missed.every((e) => e.type !== 'agent.typing'));
+    assert.ok(resumed.body.missed.every((e: { type: string }) => e.type !== 'agent.typing'));
   });
 
   test('and the app can ask who is typing right now, rather than wait for a change it missed', async () => {
-    const key = (await call('POST', '/api/agents/sessions', { agentId: 'snap', channel: 'general' })).body.session.key;
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: '@snap are you working?' })).body
-      .message.id;
+    const key = (await call('POST', '/api/agents/sessions', { agentId: 'snap', channel: 'general' })).body
+      .session.key;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: '@snap are you working?' }))
+      .body.message.id;
 
     await call('POST', `/api/agents/sessions/${key}/typing`, { on: true, threadId: rootId });
     const quiet = await call('GET', '/api/typing');
@@ -367,8 +428,8 @@ describe('agent sessions over HTTP', () => {
   });
 
   test('a gateway with no session here can still say it is typing', async () => {
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'hermes, a question' }))
-      .body.message.id;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'hermes, a question' })).body
+      .message.id;
 
     const on = await call('POST', '/api/typing', { agentId: 'hermes', threadId: rootId, on: true });
     assert.equal(on.status, 200);
@@ -381,7 +442,9 @@ describe('agent sessions over HTTP', () => {
     assert.equal(live[0].agentId, 'hermes');
     assert.equal(live[0].sessionKey, null);
     assert.ok(
-      (await call('GET', '/api/agents/sessions')).body.sessions.every((s) => s.agentId !== 'hermes'),
+      (await call('GET', '/api/agents/sessions')).body.sessions.every(
+        (s: { agentId: string }) => s.agentId !== 'hermes'
+      ),
       'and nothing invented a session to hang it on'
     );
 
@@ -390,8 +453,10 @@ describe('agent sessions over HTTP', () => {
   });
 
   test('and a reply id means the thread it is in', async () => {
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'the root' })).body.message.id;
-    const replyId = (await call('POST', `/api/messages/${rootId}/replies`, { text: 'a reply' })).body.message.id;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'the root' })).body.message
+      .id;
+    const replyId = (await call('POST', `/api/messages/${rootId}/replies`, { text: 'a reply' })).body.message
+      .id;
 
     await call('POST', '/api/typing', { agentId: 'hermes', threadId: replyId, on: true });
     const live = (await call('GET', '/api/typing')).body.typing;
@@ -406,7 +471,8 @@ describe('agent sessions over HTTP', () => {
     assert.equal(missing.status, 404);
     assert.equal(missing.body.error.code, 'not_found');
 
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'anything' })).body.message.id;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'anything' })).body.message
+      .id;
     const named = await call('POST', '/api/typing', { agentId: 'not a name', threadId: rootId, on: true });
     assert.equal(named.status, 422);
     assert.equal(named.body.error.code, 'invalid_request');
@@ -414,19 +480,23 @@ describe('agent sessions over HTTP', () => {
   });
 
   test('thinking is the same signal with a shape to it, and just as un-resumable', async () => {
-    const key = (await call('POST', '/api/agents/sessions', { agentId: 'thinker', channel: 'general' })).body.session
-      .key;
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: '@thinker take your time' })).body
-      .message.id;
+    const key = (await call('POST', '/api/agents/sessions', { agentId: 'thinker', channel: 'general' })).body
+      .session.key;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: '@thinker take your time' }))
+      .body.message.id;
 
     const posted = await call('POST', `/api/agents/sessions/${key}/thinking`, {
       threadId: rootId,
-      think: { t: 'Working…', p: 'streaming', s: [{ id: 't1', t: 'Reading the thread…', st: 'in_progress' }] },
+      think: {
+        t: 'Working…',
+        p: 'streaming',
+        s: [{ id: 't1', t: 'Reading the thread…', st: 'in_progress' }],
+      },
     });
     assert.equal(posted.status, 200);
 
     const events = await call('GET', '/api/events?since=0');
-    const thinking = events.body.events.filter((e) => e.type === 'agent.thinking');
+    const thinking = events.body.events.filter((e: { type: string }) => e.type === 'agent.thinking');
     assert.equal(thinking.length, 1);
     assert.equal(thinking[0].threadId, rootId);
     assert.equal(thinking[0].payload.think.s[0].id, 't1');
@@ -434,20 +504,24 @@ describe('agent sessions over HTTP', () => {
     // The scratchpad is one agent's working-out, and it stays out of the
     // conversation every other agent replays.
     const resumed = await call('POST', `/api/agents/sessions/${key}/resume`, {});
-    assert.ok(resumed.body.missed.every((e) => e.type !== 'agent.thinking'));
+    assert.ok(resumed.body.missed.every((e: { type: string }) => e.type !== 'agent.thinking'));
 
     // Nobody is watching that session, so nothing of it is live.
     assert.deepEqual((await call('GET', '/api/thinking')).body.thinking, []);
   });
 
   test('and a gateway with no session here gets a snapshot until it says it is done', async () => {
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'hermes, think out loud' })).body
-      .message.id;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'hermes, think out loud' }))
+      .body.message.id;
 
     const on = await call('POST', '/api/thinking', {
       agentId: 'hermes',
       threadId: rootId,
-      think: { t: 'Searching…', p: 'streaming', s: [{ id: 't1', t: 'Searching the web…', st: 'in_progress' }] },
+      think: {
+        t: 'Searching…',
+        p: 'streaming',
+        s: [{ id: 't1', t: 'Searching the web…', st: 'in_progress' }],
+      },
     });
     assert.equal(on.status, 200);
 
@@ -471,7 +545,7 @@ describe('agent sessions over HTTP', () => {
 });
 
 describe('the agent’s own slash commands', () => {
-  let key;
+  let key: string;
 
   // An adapter whose "agent" is a two-line node script: it lists two commands
   // and answers one of them, which is all the daemon side needs to be real.
@@ -504,14 +578,15 @@ describe('the agent’s own slash commands', () => {
         },
       })
     );
-    key = (await call('POST', '/api/agents/sessions', { agentId: 'talky', channel: 'general' })).body.session.key;
+    key = (await call('POST', '/api/agents/sessions', { agentId: 'talky', channel: 'general' })).body.session
+      .key;
     await call('PUT', `/api/agents/sessions/${key}/state`, { state: { _serveAdapter: 'talky' } });
 
     const listed = await call('GET', `/api/agents/sessions/${key}/commands`);
     assert.equal(listed.status, 200);
     assert.equal(listed.body.error, null);
     assert.deepEqual(
-      listed.body.commands.map((c) => c.name),
+      listed.body.commands.map((c: { name: string }) => c.name),
       ['ping', 'model', 'nope']
     );
     assert.equal(listed.body.commands[0].summary, 'say hello');
@@ -538,14 +613,14 @@ describe('the agent’s own slash commands', () => {
     assert.equal(after, before, 'a command is not a message');
     const events = await call('GET', '/api/events?since=0');
     assert.ok(
-      events.body.events.every((e) => !String(e.type).includes('command')),
+      events.body.events.every((e: { type: string }) => !String(e.type).includes('command')),
       'and it is not in the log either'
     );
   });
 
   test('an agent with no commands of its own simply has none', async () => {
-    const plain = (await call('POST', '/api/agents/sessions', { agentId: 'quiet', channel: 'general' })).body.session
-      .key;
+    const plain = (await call('POST', '/api/agents/sessions', { agentId: 'quiet', channel: 'general' })).body
+      .session.key;
     const listed = await call('GET', `/api/agents/sessions/${plain}/commands`);
     assert.deepEqual(listed.body.commands, []);
     const ran = await call('POST', `/api/agents/sessions/${plain}/command`, { command: 'help' });
@@ -557,43 +632,45 @@ describe('push notifications', () => {
   // Its own server + workspace, with a fake `webpush` swapped in — real
   // delivery always speaks TLS regardless of the endpoint's scheme, so a
   // fake HTTP push endpoint can't stand in for it. This still exercises the
-  // real subscribe/unsubscribe/prune logic in push.js and the real
-  // agent-vs-human filtering in hub.js; only the actual network hop is fake.
-  let pushHome;
-  let pushApp;
-  let pushBase;
-  let calls;
+  // real subscribe/unsubscribe/prune logic in push.ts and the real
+  // agent-vs-human filtering in hub.ts; only the actual network hop is fake.
+  let pushHome: string;
+  let pushApp: SlickServer;
+  let pushBase: string;
+  let calls: { endpoint: string; payload: { body: string } }[];
   const PUSH_TOKEN = 'push-test-token';
 
-  before(async () => {
+  beforeAll(async () => {
     pushHome = mkdtempSync(join(tmpdir(), 'slick-server-push-'));
     calls = [];
     const fakeWebpush = {
       generateVAPIDKeys: () => ({ publicKey: 'fake-public-key', privateKey: 'fake-private-key' }),
       setVapidDetails: () => {},
-      sendNotification: (sub, payload) => {
+      sendNotification: (sub: PushSubscription, payload: string) => {
         calls.push({ endpoint: sub.endpoint, payload: JSON.parse(payload) });
         if (sub.endpoint.endsWith('/gone')) {
-          const err = new Error('subscription expired');
-          err.statusCode = 410;
-          return Promise.reject(err);
+          return Promise.reject(Object.assign(new Error('subscription expired'), { statusCode: 410 }));
         }
         return Promise.resolve();
       },
     };
     const workspace = Workspace.open({ home: pushHome });
     const push = createPushService(workspace, fakeWebpush);
-    pushApp = createServer({ workspace, token: PUSH_TOKEN, push });
+    pushApp = createServer({ workspace, token: PUSH_TOKEN, push, webRoot: null });
     const bound = await pushApp.listen(0);
     pushBase = bound.url;
   });
 
-  after(async () => {
+  afterAll(async () => {
     await pushApp.close();
     rmSync(pushHome, { recursive: true, force: true });
   });
 
-  async function pushCall(method, path, body) {
+  async function pushCall(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<{ status: number; body: any }> {
     const res = await fetch(`${pushBase}${path}`, {
       method,
       headers: {
@@ -620,14 +697,17 @@ describe('push notifications', () => {
     await sleep(50);
     assert.equal(calls.length, 0, 'human messages do not page anyone');
 
-    const started = await pushCall('POST', '/api/agents/sessions', { agentId: 'pushbot', channel: 'general' });
+    const started = await pushCall('POST', '/api/agents/sessions', {
+      agentId: 'pushbot',
+      channel: 'general',
+    });
     const key = started.body.session.key;
     await pushCall('POST', `/api/agents/sessions/${key}/messages`, { text: 'an agent reply, pushed' });
     await sleep(50);
 
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].endpoint, 'https://push.example/one');
-    assert.equal(calls[0].payload.body, 'an agent reply, pushed');
+    assert.equal(calls[0]!.endpoint, 'https://push.example/one');
+    assert.equal(calls[0]!.payload.body, 'an agent reply, pushed');
 
     await pushCall('POST', '/api/push/unsubscribe', { endpoint: 'https://push.example/one' });
   });
@@ -640,10 +720,10 @@ describe('push notifications', () => {
     const first = await pushCall('POST', '/api/agents/sessions', { agentId: 'pruner', channel: 'general' });
     await pushCall('POST', `/api/agents/sessions/${first.body.session.key}/messages`, { text: 'round one' });
     await sleep(50);
-    assert.deepEqual(
-      calls.map((c) => c.endpoint).sort(),
-      ['https://push.example/gone', 'https://push.example/still-good']
-    );
+    assert.deepEqual(calls.map((c) => c.endpoint).sort(), [
+      'https://push.example/gone',
+      'https://push.example/still-good',
+    ]);
 
     calls.length = 0;
     const second = await pushCall('POST', '/api/agents/sessions', { agentId: 'pruner2', channel: 'general' });
@@ -657,6 +737,58 @@ describe('push notifications', () => {
   });
 });
 
+/** Reads SSE frames off a fetch body until a predicate is satisfied. */
+function frameReader(res: Response) {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  /** The raw frame that satisfies `predicate`, or null when patience runs out. */
+  async function readRawUntil(
+    predicate: (chunk: string) => boolean,
+    timeoutMs = 6000
+  ): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
+      if (hit) return hit;
+      if (Date.now() >= deadline) return null;
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise<{ value: undefined; done: false }>((r) =>
+          setTimeout(() => r({ value: undefined, done: false }), 400)
+        ),
+      ]);
+      if (done) return null;
+      if (value) buffer += decoder.decode(value, { stream: true });
+    }
+  }
+
+  const parse = (chunk: string): any =>
+    JSON.parse(
+      chunk
+        .split('\n')
+        .find((l) => l.startsWith('data:'))!
+        .slice(5)
+        .trim()
+    );
+
+  /** The parsed payload that satisfies `predicate`, or null. */
+  async function readUntil(predicate: (event: any) => boolean, timeoutMs = 6000): Promise<any> {
+    const raw = await readRawUntil((chunk) => {
+      try {
+        return Boolean(predicate(parse(chunk)));
+      } catch {
+        return false;
+      }
+    }, timeoutMs);
+    return raw ? parse(raw) : null;
+  }
+
+  const cancel = () => reader.cancel().catch(() => {});
+  return { readRawUntil, readUntil, parse, cancel };
+}
+
 describe('live stream', () => {
   test('pushes events as they happen, including writes made outside HTTP', async () => {
     const controller = new AbortController();
@@ -665,52 +797,21 @@ describe('live stream', () => {
       signal: controller.signal,
     });
     assert.equal(res.status, 200);
-    assert.match(res.headers.get('content-type'), /text\/event-stream/);
+    assert.match(res.headers.get('content-type') ?? '', /text\/event-stream/);
+    const stream = frameReader(res);
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    /** Read until `predicate` is happy or we run out of patience. */
-    async function readUntil(predicate, timeoutMs = 6000) {
-      const deadline = Date.now() + timeoutMs;
-      while (Date.now() < deadline) {
-        const { value, done } = await Promise.race([
-          reader.read(),
-          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
-        ]);
-        if (done) break;
-        if (value) buffer += decoder.decode(value, { stream: true });
-        const events = buffer
-          .split('\n\n')
-          .filter((chunk) => chunk.includes('data:'))
-          .map((chunk) => {
-            const line = chunk.split('\n').find((l) => l.startsWith('data:'));
-            try {
-              return JSON.parse(line.slice(5).trim());
-            } catch {
-              return null;
-            }
-          })
-          .filter(Boolean);
-        const hit = events.find(predicate);
-        if (hit) return hit;
-      }
-      return null;
-    }
-
-    assert.ok(await readUntil((e) => e.type === 'stream.ready'), 'stream announces itself');
+    assert.ok(await stream.readUntil((e) => e.type === 'stream.ready'), 'stream announces itself');
 
     // Written straight to SQLite, exactly as the CLI would — the daemon must
     // still notice and fan it out.
     app.ws.messages.post({ channel: 'general', text: 'written outside the daemon' });
-    const seen = await readUntil((e) => e.message?.text === 'written outside the daemon');
+    const seen = await stream.readUntil((e) => e.message?.text === 'written outside the daemon');
     assert.ok(seen, 'external write reached the stream');
     assert.equal(seen.type, 'message.created');
     assert.equal(seen.channelSlug, 'general');
 
     controller.abort();
-    await reader.cancel().catch(() => {});
+    await stream.cancel();
   });
 
   test('carries a streamed delta to an open reader without writing anything down', async () => {
@@ -723,32 +824,9 @@ describe('live stream', () => {
       signal: controller.signal,
     });
     assert.equal(res.status, 200);
+    const stream = frameReader(res);
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    // Unlike the parser above this one hands back the *raw* frame, because
-    // what is being asserted about a delta is as much the lines it does not
-    // have as the payload it does.
-    async function readRawUntil(predicate, timeoutMs = 6000) {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
-        if (hit) return hit;
-        if (Date.now() >= deadline) return null;
-        const { value, done } = await Promise.race([
-          reader.read(),
-          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
-        ]);
-        if (done) return null;
-        if (value) buffer += decoder.decode(value, { stream: true });
-      }
-    }
-
-    const parse = (chunk) => JSON.parse(chunk.split('\n').find((l) => l.startsWith('data:')).slice(5).trim());
-
-    assert.ok(await readRawUntil((c) => c.includes('"stream.ready"')), 'stream announces itself');
+    assert.ok(await stream.readRawUntil((c) => c.includes('"stream.ready"')), 'stream announces itself');
 
     const before = (await call('GET', '/api/health')).body.seq;
     const posted = await call('POST', '/api/stream/delta', {
@@ -760,12 +838,19 @@ describe('live stream', () => {
     assert.equal(posted.status, 200);
     assert.deepEqual(posted.body, { ok: true });
 
-    const raw = await readRawUntil((c) => c.includes('"agent.delta"'));
+    // Unlike the parsed reads above this one wants the *raw* frame, because
+    // what is being asserted about a delta is as much the lines it does not
+    // have as the payload it does.
+    const raw = await stream.readRawUntil((c) => c.includes('"agent.delta"'));
     assert.ok(raw, 'the delta reached the open reader');
 
-    const frame = parse(raw);
+    const frame = stream.parse(raw);
     assert.equal(frame.threadId, rootId);
-    assert.equal(frame.channelId, root.body.message.channelId, 'the channel came from the message, not the caller');
+    assert.equal(
+      frame.channelId,
+      root.body.message.channelId,
+      'the channel came from the message, not the caller'
+    );
     assert.deepEqual(frame.actor, { id: 'hermes', kind: 'agent' });
     assert.equal(frame.text, 'the beginning of an ans');
     assert.equal(frame.think.s[0].id, 't1');
@@ -779,12 +864,12 @@ describe('live stream', () => {
     assert.equal((await call('GET', '/api/health')).body.seq, before, 'the log did not move');
     const events = await call('GET', '/api/events?since=0');
     assert.ok(
-      events.body.events.every((e) => e.type !== 'agent.delta'),
+      events.body.events.every((e: { type: string }) => e.type !== 'agent.delta'),
       'no row was written for a fragment of an answer that does not exist yet'
     );
 
     controller.abort();
-    await reader.cancel().catch(() => {});
+    await stream.cancel();
   });
 
   test('a reader too far behind is hung up on, never quietly skipped past', async () => {
@@ -794,31 +879,31 @@ describe('live stream', () => {
     const hub = createHub(app.ws, { activePollMs: 30 });
     /** A response that claims to be a megabyte behind on demand. */
     const fakeClient = () => {
-      const req = new EventEmitter();
-      req.headers = {};
-      const res = new EventEmitter();
-      res.writableLength = 0;
-      res.wrote = [];
-      res.ended = false;
-      res.writeHead = () => {};
-      res.flushHeaders = () => {};
-      res.write = (chunk) => res.wrote.push(chunk);
-      res.end = () => {
-        res.ended = true;
-      };
-      return { req, res };
+      const req = Object.assign(new EventEmitter(), { headers: {} });
+      const res = Object.assign(new EventEmitter(), {
+        writableLength: 0,
+        wrote: [] as string[],
+        ended: false,
+        writeHead: () => {},
+        flushHeaders: () => {},
+        write: (chunk: string) => res.wrote.push(chunk),
+        end: () => {
+          res.ended = true;
+        },
+      });
+      return { req: req as unknown as IncomingMessage, res, asResponse: res as unknown as ServerResponse };
     };
 
     try {
       const stalled = fakeClient();
-      const client = hub.subscribe(stalled.req, stalled.res, {});
+      const client = hub.subscribe(stalled.req, stalled.asResponse, {});
       const cursor = client.cursor;
       stalled.res.writableLength = 2_000_000;
 
       // An ephemeral frame is skipped and the client keeps its place: there is
       // no seq on a delta, so there is nothing for it to have missed.
-      const rootId = (await call('POST', '/api/channels/general/messages', { text: 'something to point at' })).body
-        .message.id;
+      const rootId = (await call('POST', '/api/channels/general/messages', { text: 'something to point at' }))
+        .body.message.id;
       hub.broadcast({ type: 'agent.delta', threadId: rootId, text: 'a fragment' });
       assert.equal(stalled.res.ended, false, 'a dropped delta is not worth a disconnect');
       assert.equal(hub.size, 1);
@@ -833,7 +918,7 @@ describe('live stream', () => {
 
       // A reader that is keeping up is untouched by any of it.
       const fine = fakeClient();
-      hub.subscribe(fine.req, fine.res, {});
+      hub.subscribe(fine.req, fine.asResponse, {});
       await call('POST', '/api/channels/general/messages', { text: 'and one for the healthy reader' });
       hub.wake();
       assert.equal(fine.res.ended, false);
@@ -847,8 +932,8 @@ describe('live stream', () => {
   });
 
   test('a delta is normalized and capped on the way in, like every other blob', async () => {
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'a question with a reply' })).body
-      .message.id;
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'a question with a reply' }))
+      .body.message.id;
 
     // The one body in the app that is copied onto every open socket at once
     // was also the only one arriving unchecked. A fragment has a size.
@@ -861,7 +946,11 @@ describe('live stream', () => {
     assert.equal(huge.body.error.code, 'invalid_request');
     assert.match(huge.body.error.message, /fragment/);
 
-    const wrong = await call('POST', '/api/stream/delta', { agentId: 'hermes', threadId: rootId, text: { no: 1 } });
+    const wrong = await call('POST', '/api/stream/delta', {
+      agentId: 'hermes',
+      threadId: rootId,
+      text: { no: 1 },
+    });
     assert.equal(wrong.status, 422);
 
     const controller = new AbortController();
@@ -869,25 +958,8 @@ describe('live stream', () => {
       headers: { authorization: `Bearer ${TOKEN}` },
       signal: controller.signal,
     });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    async function readUntilRaw(predicate, timeoutMs = 6000) {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
-        if (hit) return hit;
-        if (Date.now() >= deadline) return null;
-        const { value, done } = await Promise.race([
-          reader.read(),
-          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
-        ]);
-        if (done) return null;
-        if (value) buffer += decoder.decode(value, { stream: true });
-      }
-    }
-    const parse = (chunk) => JSON.parse(chunk.split('\n').find((l) => l.startsWith('data:')).slice(5).trim());
-    assert.ok(await readUntilRaw((c) => c.includes('"stream.ready"')));
+    const stream = frameReader(res);
+    assert.ok(await stream.readRawUntil((c) => c.includes('"stream.ready"')));
 
     // A reply id, because a producer answering in a thread has the reply in
     // hand and not the root — and the draft has to land under the same key
@@ -902,7 +974,7 @@ describe('live stream', () => {
       think: { t: 'T'.repeat(400), p: 'whatever', s: [{ t: 'Reading…', st: 'nonsense' }] },
     });
 
-    const frame = parse(await readUntilRaw((c) => c.includes('"agent.delta"')));
+    const frame = stream.parse((await stream.readRawUntil((c) => c.includes('"agent.delta"')))!);
     assert.equal(frame.threadId, rootId, 'the reply lit up the root it belongs to');
     assert.equal(frame.think.t.length, 200, 'the title was clamped, not taken as given');
     assert.equal(frame.think.p, 'streaming', 'and a phase nobody defined is a live one');
@@ -910,22 +982,33 @@ describe('live stream', () => {
     assert.equal(frame.think.s[0].id, 's0', 'a step with no id got one from its place');
 
     controller.abort();
-    await reader.cancel().catch(() => {});
+    await stream.cancel();
   });
 
   test('a delta it cannot place is refused, ephemeral or not', async () => {
-    const missing = await call('POST', '/api/stream/delta', { agentId: 'hermes', threadId: 'msg_nope', text: 'hi' });
+    const missing = await call('POST', '/api/stream/delta', {
+      agentId: 'hermes',
+      threadId: 'msg_nope',
+      text: 'hi',
+    });
     assert.equal(missing.status, 404);
     assert.equal(missing.body.error.code, 'not_found');
 
-    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'anything at all' })).body.message.id;
-    const named = await call('POST', '/api/stream/delta', { agentId: 'not a name', threadId: rootId, text: 'hi' });
+    const rootId = (await call('POST', '/api/channels/general/messages', { text: 'anything at all' })).body
+      .message.id;
+    const named = await call('POST', '/api/stream/delta', {
+      agentId: 'not a name',
+      threadId: rootId,
+      text: 'hi',
+    });
     assert.equal(named.status, 422);
     assert.equal(named.body.error.code, 'invalid_request');
   });
 
   test('so a reader that drops mid-answer resumes at the seq the delta never moved', async () => {
-    const root = await call('POST', '/api/channels/general/messages', { text: 'the question before the drop' });
+    const root = await call('POST', '/api/channels/general/messages', {
+      text: 'the question before the drop',
+    });
     const rootId = root.body.message.id;
 
     const controller = new AbortController();
@@ -933,39 +1016,28 @@ describe('live stream', () => {
       headers: { authorization: `Bearer ${TOKEN}` },
       signal: controller.signal,
     });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    const stream = frameReader(res);
 
-    async function readRawUntil(predicate, timeoutMs = 6000) {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const hit = buffer.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
-        if (hit) return hit;
-        if (Date.now() >= deadline) return null;
-        const { value, done } = await Promise.race([
-          reader.read(),
-          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
-        ]);
-        if (done) return null;
-        if (value) buffer += decoder.decode(value, { stream: true });
-      }
-    }
-
-    assert.ok(await readRawUntil((c) => c.includes('"stream.ready"')));
+    assert.ok(await stream.readRawUntil((c) => c.includes('"stream.ready"')));
 
     // One real event, whose id is what an EventSource would remember.
     await call('POST', '/api/channels/general/messages', { text: 'a real message before the stream' });
-    const durable = await readRawUntil((c) => c.includes('a real message before the stream'));
+    const durable = await stream.readRawUntil((c) => c.includes('a real message before the stream'));
     assert.ok(durable, 'the real message arrived');
-    const lastEventId = Number(durable.split('\n').find((l) => l.startsWith('id:')).slice(3).trim());
+    const lastEventId = Number(
+      durable
+        .split('\n')
+        .find((l) => l.startsWith('id:'))!
+        .slice(3)
+        .trim()
+    );
     assert.ok(Number.isFinite(lastEventId));
 
     await call('POST', '/api/stream/delta', { agentId: 'hermes', threadId: rootId, text: 'partial…' });
-    assert.ok(await readRawUntil((c) => c.includes('"agent.delta"')), 'the delta arrived after it');
+    assert.ok(await stream.readRawUntil((c) => c.includes('"agent.delta"')), 'the delta arrived after it');
 
     controller.abort();
-    await reader.cancel().catch(() => {});
+    await stream.cancel();
 
     // The delta left no id behind to remember, so the reconnect quotes the
     // last durable one — the same place it would have resumed from if nothing
@@ -975,38 +1047,21 @@ describe('live stream', () => {
       headers: { authorization: `Bearer ${TOKEN}`, 'last-event-id': String(lastEventId) },
       signal: resumed.signal,
     });
-    const reader2 = again.body.getReader();
-    const decoder2 = new TextDecoder();
-    let buffer2 = '';
+    const stream2 = frameReader(again);
 
-    async function readAgain(predicate, timeoutMs = 6000) {
-      const deadline = Date.now() + timeoutMs;
-      for (;;) {
-        const hit = buffer2.split('\n\n').find((chunk) => chunk.includes('data:') && predicate(chunk));
-        if (hit) return hit;
-        if (Date.now() >= deadline) return null;
-        const { value, done } = await Promise.race([
-          reader2.read(),
-          new Promise((r) => setTimeout(() => r({ value: undefined, done: false }), 400)),
-        ]);
-        if (done) return null;
-        if (value) buffer2 += decoder2.decode(value, { stream: true });
-      }
-    }
-
-    const ready = await readAgain((c) => c.includes('"stream.ready"'));
+    const ready = await stream2.readRawUntil((c) => c.includes('"stream.ready"'));
     assert.ok(ready);
-    const parsed = JSON.parse(ready.split('\n').find((l) => l.startsWith('data:')).slice(5).trim());
+    const parsed = stream2.parse(ready);
     assert.equal(parsed.since, lastEventId, 'resumed exactly where the last real event left it');
 
     await call('POST', '/api/channels/general/messages', { text: 'a real message after the reconnect' });
     assert.ok(
-      await readAgain((c) => c.includes('a real message after the reconnect')),
+      await stream2.readRawUntil((c) => c.includes('a real message after the reconnect')),
       'and the resumed stream is a working stream'
     );
 
     resumed.abort();
-    await reader2.cancel().catch(() => {});
+    await stream2.cancel();
   });
 });
 
@@ -1016,15 +1071,33 @@ describe('web UI hosting', () => {
     const html = await res.text();
     assert.equal(res.status, 200);
     assert.match(html, /<div id="app"/);
-    assert.match(res.headers.get('content-type'), /text\/html/);
+    assert.match(res.headers.get('content-type') ?? '', /text\/html/);
   });
 
-  test('serves the module graph', async () => {
-    for (const path of ['/styles.css', '/js/app.js', '/js/api.js', '/js/format.js', '/js/ui.js']) {
-      const res = await fetch(`${base}${path}`, { headers: { authorization: `Bearer ${TOKEN}` } });
-      assert.equal(res.status, 200, `${path} should be served`);
-      await res.text();
-    }
+  test('serves the shell and its bundle with the right types and lifetimes', async () => {
+    const css = await fetch(`${base}/styles.css`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    assert.equal(css.status, 200);
+    assert.match(css.headers.get('content-type') ?? '', /text\/css/);
+    assert.equal(css.headers.get('cache-control'), 'no-cache', 'the shell is re-asked for on every load');
+    await css.text();
+
+    // A content-hashed bundle changes its name when its bytes change, so a
+    // browser may keep it for as long as it likes.
+    const bundle = await fetch(`${base}/assets/app-abc123.js`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(bundle.status, 200);
+    assert.match(bundle.headers.get('content-type') ?? '', /text\/javascript/);
+    assert.match(bundle.headers.get('cache-control') ?? '', /immutable/);
+    await bundle.text();
+
+    // Unknown extensionless paths boot the shell; unknown files do not.
+    const spa = await fetch(`${base}/some/route`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    assert.equal(spa.status, 200);
+    assert.match(await spa.text(), /<div id="app"/);
+    const gone = await fetch(`${base}/assets/nope.js`, { headers: { authorization: `Bearer ${TOKEN}` } });
+    assert.equal(gone.status, 404);
+    await gone.text();
   });
 
   // An installed app launches with what the manifest gave it and nothing else,
@@ -1036,9 +1109,9 @@ describe('web UI hosting', () => {
       headers: { authorization: `Bearer ${TOKEN}` },
     });
     assert.equal(res.status, 200);
-    assert.match(res.headers.get('content-type'), /application\/manifest\+json/);
+    assert.match(res.headers.get('content-type') ?? '', /application\/manifest\+json/);
 
-    const manifest = await res.json();
+    const manifest = (await res.json()) as { start_url: string; name: string; icons: unknown[] };
     assert.equal(manifest.start_url, `./?token=${encodeURIComponent(TOKEN)}`);
     // Relative, so it survives the daemon coming up on another port, and inside
     // `scope` — a start_url outside it is not installable at all.
@@ -1053,23 +1126,22 @@ describe('web UI hosting', () => {
   test('the service worker carries the build it belongs to', async () => {
     const res = await fetch(`${base}/sw.js`, { headers: { authorization: `Bearer ${TOKEN}` } });
     assert.equal(res.status, 200);
-    assert.match(res.headers.get('content-type'), /text\/javascript/);
+    assert.match(res.headers.get('content-type') ?? '', /text\/javascript/);
 
     const source = await res.text();
     assert.doesNotMatch(source, /__BUILD__/, 'the placeholder should have been replaced');
-    const stamp = source.match(/const BUILD = ["']([0-9a-f]+)["']/)?.[1];
+    const stamp = /const BUILD = ["']([0-9a-f]+)["']/.exec(source)?.[1];
     assert.ok(stamp, 'the worker should name a build');
 
     // The same build the daemon reports, or the app cannot tell whether the
     // worker it is running is the one being served.
-    const health = await fetch(`${base}/api/health`, {
+    const health = (await fetch(`${base}/api/health`, {
       headers: { authorization: `Bearer ${TOKEN}` },
-    }).then((r) => r.json());
+    }).then((r) => r.json())) as { build: string };
     assert.equal(health.build, stamp);
   });
 
   test('and the build changes when the UI does', async () => {
-    const webRoot = resolveWebRoot(null);
     const file = join(webRoot, 'styles.css');
     const before = buildStamp(webRoot);
     const stat = statSync(file);

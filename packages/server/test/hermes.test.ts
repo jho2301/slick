@@ -1,9 +1,11 @@
-import { test, describe, before, beforeEach, after } from 'node:test';
+import { test, describe, beforeAll, beforeEach, afterAll } from 'vitest';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import type { JsonObject } from '@slick/core';
 
 import {
   DEFAULT_PROFILE,
@@ -16,11 +18,12 @@ import {
   readProfileUsage,
   setUsageClock,
   writeProfileModel,
-} from '../src/hermes.js';
-import { createServer } from '../src/index.js';
+  type Env,
+} from '../src/hermes.ts';
+import { createServer, type SlickServer } from '../src/index.ts';
 
 /** A throwaway HERMES_HOME. Nothing here ever touches the real one. */
-function fixtureHome(names = []) {
+function fixtureHome(names: string[] = []): string {
   const home = mkdtempSync(join(tmpdir(), 'slick-hermes-'));
   for (const name of names) mkdirSync(join(home, 'profiles', name), { recursive: true });
   return home;
@@ -89,8 +92,8 @@ describe('finding the profiles that exist', () => {
         listProfiles(home).map((p) => p.name),
         [DEFAULT_PROFILE, 'alpha', 'work']
       );
-      assert.equal(listProfiles(home)[0].dir, home);
-      assert.equal(listProfiles(home)[2].dir, join(home, 'profiles', 'work'));
+      assert.equal(listProfiles(home)[0]!.dir, home);
+      assert.equal(listProfiles(home)[2]!.dir, join(home, 'profiles', 'work'));
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -247,7 +250,7 @@ describe('naming the profile to read or write', () => {
  * tried, and `HERMES_HOME` is a directory made for this test.
  */
 const STUB = join(import.meta.dirname, 'fixtures', 'hermes-stub');
-const bridgeEnv = (extra = {}) => ({
+const bridgeEnv = (extra: Env = {}): Env => ({
   PATH: process.env.PATH,
   SLICK_HERMES_PYTHON: 'python3',
   PYTHONPATH: STUB,
@@ -256,12 +259,23 @@ const bridgeEnv = (extra = {}) => ({
 });
 
 /** A profile whose config already has more in it than Slick knows about. */
-function seedConfig(dir, config) {
+function seedConfig(dir: string, config: JsonObject): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'config.json'), JSON.stringify(config, null, 2));
 }
 
-const readConfig = (dir) => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+const readConfig = (dir: string): any => JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'));
+
+/** The catalog as the tests read it: whatever the bridge said, by value. */
+interface CatalogProvider {
+  value: string;
+  custom?: boolean;
+  authenticated?: boolean;
+  models: { value: string; label: string }[];
+}
+
+const providersOf = (answer: { providers: JsonObject[] }): CatalogProvider[] =>
+  answer.providers as unknown as CatalogProvider[];
 
 describe('reading a profile through the bridge', () => {
   test('reports the configured provider and model, and the catalog to change them with', async () => {
@@ -277,14 +291,15 @@ describe('reading a profile through the bridge', () => {
       assert.equal(answer.profile, DEFAULT_PROFILE);
       assert.deepEqual(answer.defaults, { provider: 'openai-codex', model: 'gpt-6-astra' });
 
-      const codex = answer.providers.find((p) => p.value === 'openai-codex');
+      const providers = providersOf(answer);
+      const codex = providers.find((p) => p.value === 'openai-codex')!;
       assert.deepEqual(
         codex.models.map((m) => m.value),
         ['gpt-6-astra', 'gpt-5.6-luna'],
         'exactly the ids Hermes reported, in its order'
       );
       assert.ok(
-        answer.providers.some((p) => p.value === 'custom:fano' && p.custom === true),
+        providers.some((p) => p.value === 'custom:fano' && p.custom === true),
         'a custom endpoint keeps its custom: slug'
       );
     } finally {
@@ -296,12 +311,24 @@ describe('reading a profile through the bridge', () => {
     const home = fixtureHome();
     try {
       seedConfig(home, {
-        model: { default: 'gpt-6-astra', provider: 'openai-codex', key_env: 'MY_KEY_VAR', api_key: 'sk-live-secret' },
+        model: {
+          default: 'gpt-6-astra',
+          provider: 'openai-codex',
+          key_env: 'MY_KEY_VAR',
+          api_key: 'sk-live-secret',
+        },
         providers: { fano: { key_env: 'FANO_KEY', api_key: 'sk-another-secret', base_url: 'https://x/v1' } },
       });
       const answer = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv());
       const wire = JSON.stringify(answer);
-      for (const secret of ['sk-live-secret', 'sk-another-secret', 'MY_KEY_VAR', 'FANO_KEY', 'api_key', 'key_env']) {
+      for (const secret of [
+        'sk-live-secret',
+        'sk-another-secret',
+        'MY_KEY_VAR',
+        'FANO_KEY',
+        'api_key',
+        'key_env',
+      ]) {
         assert.ok(!wire.includes(secret), `"${secret}" must not be in the payload`);
       }
     } finally {
@@ -326,7 +353,7 @@ describe('reading a profile through the bridge', () => {
       seedConfig(home, { model: { default: 'x' } });
       const answer = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv({ PYTHONPATH: '' }));
       assert.equal(answer.code, 'hermes_unavailable');
-      assert.match(answer.error, /Hermes/);
+      assert.match(answer.error!, /Hermes/);
       assert.deepEqual(answer.providers, [], 'no catalog is better than an invented one');
       assert.deepEqual(answer.defaults, { provider: null, model: null });
     } finally {
@@ -349,7 +376,8 @@ describe('the custom endpoints a profile has configured', () => {
       seedConfig(home, CONFIGURED);
       const answer = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv());
       assert.equal(answer.error, null, answer.error ?? '');
-      const values = answer.providers.map((p) => p.value);
+      const providers = providersOf(answer);
+      const values = providers.map((p) => p.value);
 
       // `custom_provider_slug` keeps the config *key* as the identity for a
       // keyed entry ("fano", not "fano-box") and the normalised display name
@@ -357,7 +385,7 @@ describe('the custom endpoints a profile has configured', () => {
       assert.ok(values.includes('custom:fano'), values.join(', '));
       assert.ok(values.includes('custom:old-rig'), values.join(', '));
       for (const value of ['custom:fano', 'custom:old-rig']) {
-        assert.equal(answer.providers.find((p) => p.value === value).custom, true, value);
+        assert.equal(providers.find((p) => p.value === value)!.custom, true, value);
       }
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -368,7 +396,9 @@ describe('the custom endpoints a profile has configured', () => {
     const home = fixtureHome();
     try {
       seedConfig(home, CONFIGURED);
-      const values = (await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv())).providers.map((p) => p.value);
+      const values = providersOf(await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv())).map(
+        (p) => p.value
+      );
       assert.deepEqual(
         values,
         [...new Set(values)],
@@ -385,7 +415,7 @@ describe('the custom endpoints a profile has configured', () => {
     try {
       seedConfig(home, CONFIGURED);
       const answer = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv());
-      const byValue = (v) => answer.providers.find((p) => p.value === v);
+      const byValue = (v: string) => providersOf(answer).find((p) => p.value === v)!;
       assert.deepEqual(
         byValue('custom:fano').models.map((m) => m.value),
         ['local-qwen'],
@@ -405,7 +435,9 @@ describe('the custom endpoints a profile has configured', () => {
     const home = fixtureHome();
     try {
       seedConfig(home, { model: { default: 'gpt-6-astra', provider: 'openai-codex' } });
-      const values = (await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv())).providers.map((p) => p.value);
+      const values = providersOf(await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv())).map(
+        (p) => p.value
+      );
       assert.ok(!values.some((v) => v.startsWith('custom:')), values.join(', '));
       assert.ok(values.includes('custom'), 'the bare one is still Hermes own');
     } finally {
@@ -424,9 +456,13 @@ describe('whose credentials the bridge runs with', () => {
       // The daemon may well have been started with a key in its environment.
       // It is not this profile's key, and a catalog that counts it says
       // "logged in" about a profile that is not.
-      const answer = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv({ STUB_PROVIDER_API_KEY: SECRET }));
+      const answer = await readProfileModel(
+        DEFAULT_PROFILE,
+        home,
+        bridgeEnv({ STUB_PROVIDER_API_KEY: SECRET })
+      );
       assert.equal(answer.error, null, answer.error ?? '');
-      assert.equal(answer.providers.find((p) => p.value === 'anthropic').authenticated, false);
+      assert.equal(providersOf(answer).find((p) => p.value === 'anthropic')!.authenticated, false);
       assert.ok(!JSON.stringify(answer).includes(SECRET), 'and it is nowhere on the wire');
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -445,9 +481,13 @@ describe('whose credentials the bridge runs with', () => {
       const inWork = await readProfileModel('work', home, bridgeEnv());
       const inDefault = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv());
 
-      assert.equal(inWork.providers.find((p) => p.value === 'anthropic').authenticated, true, 'its own key counts');
       assert.equal(
-        inDefault.providers.find((p) => p.value === 'anthropic').authenticated,
+        providersOf(inWork).find((p) => p.value === 'anthropic')!.authenticated,
+        true,
+        'its own key counts'
+      );
+      assert.equal(
+        providersOf(inDefault).find((p) => p.value === 'anthropic')!.authenticated,
         false,
         'the profile next door is a different login'
       );
@@ -463,7 +503,12 @@ describe('writing a profile through the bridge', () => {
     const home = fixtureHome();
     try {
       seedConfig(home, {
-        model: { default: 'gpt-6-astra', provider: 'openai-codex', key_env: 'SECRET_KEY_NAME', context_length: 200000 },
+        model: {
+          default: 'gpt-6-astra',
+          provider: 'openai-codex',
+          key_env: 'SECRET_KEY_NAME',
+          context_length: 200000,
+        },
         gateway: { platforms: { slick: { enabled: true } } },
       });
       const answer = await writeProfileModel(
@@ -507,7 +552,12 @@ describe('writing a profile through the bridge', () => {
     const home = fixtureHome();
     try {
       seedConfig(home, { model: 'gpt-6-astra' });
-      await writeProfileModel(DEFAULT_PROFILE, { provider: 'anthropic', model: 'claude-sonnet-5' }, home, bridgeEnv());
+      await writeProfileModel(
+        DEFAULT_PROFILE,
+        { provider: 'anthropic', model: 'claude-sonnet-5' },
+        home,
+        bridgeEnv()
+      );
       assert.deepEqual(readConfig(home).model, { default: 'claude-sonnet-5', provider: 'anthropic' });
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -586,12 +636,21 @@ describe('writing a profile through the bridge', () => {
           api_mode: 'responses',
         },
       });
-      await writeProfileModel(DEFAULT_PROFILE, { provider: 'custom:fano', model: 'local-qwen-2' }, home, bridgeEnv());
+      await writeProfileModel(
+        DEFAULT_PROFILE,
+        { provider: 'custom:fano', model: 'local-qwen-2' },
+        home,
+        bridgeEnv()
+      );
 
       const onDisk = readConfig(home).model;
       assert.equal(onDisk.default, 'local-qwen-2');
       assert.equal(onDisk.base_url, 'https://box/v1', 'the endpoint is still the endpoint');
-      assert.equal(onDisk.api_key, 'sk-endpoint-abcdefghijklmnopqrstuvwxyz', 'its key was not switched away from');
+      assert.equal(
+        onDisk.api_key,
+        'sk-endpoint-abcdefghijklmnopqrstuvwxyz',
+        'its key was not switched away from'
+      );
       assert.equal(onDisk.api_mode, 'responses');
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -620,7 +679,7 @@ describe('writing a profile through the bridge', () => {
       const answer = await writing;
       assert.equal(readConfig(home).note, 'someone else was here', 'the other edit is still on disk');
       assert.equal(answer.code, 'config_conflict', answer.error ?? 'the save should have been refused');
-      assert.match(answer.error, /changed/i);
+      assert.match(answer.error!, /changed/i);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -712,7 +771,7 @@ describe('writing a profile through the bridge', () => {
 
 describe('what a broken bridge is allowed to say', () => {
   /** An interpreter that fails the way a broken install does: loudly, on stderr. */
-  function babblingPython(says) {
+  function babblingPython(says: string): { path: string; dir: string } {
     const bin = mkdtempSync(join(tmpdir(), 'slick-hermes-python-'));
     const path = join(bin, 'python3');
     writeFileSync(path, `#!/bin/sh\ncat >/dev/null\necho "not json"\necho '${says}' >&2\nexit 1\n`);
@@ -738,8 +797,8 @@ describe('what a broken bridge is allowed to say', () => {
         // The last lines of a traceback are the diagnosis, so they are worth
         // forwarding — but whatever was interpolated into them is not.
         assert.equal(answer.code, 'bridge_unreadable', answer.error ?? '');
-        assert.ok(!JSON.stringify(answer).includes(TOKEN), answer.error);
-        assert.match(answer.error, /OPENAI_API_KEY/, 'the shape of the failure still survives');
+        assert.ok(!JSON.stringify(answer).includes(TOKEN), answer.error ?? '');
+        assert.match(answer.error!, /OPENAI_API_KEY/, 'the shape of the failure still survives');
       }
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -766,7 +825,10 @@ describe('what a failure is allowed to say about this machine', () => {
    * destructured away before anything is serialised to a browser. A sentence
    * is the field that has no such boundary to stop at.
    */
-  function assertNowhereLocal(answer, ...forbidden) {
+  function assertNowhereLocal(
+    answer: { catalogError?: string | null; error?: string | null },
+    ...forbidden: string[]
+  ): void {
     const wire = JSON.stringify({ catalogError: answer.catalogError ?? null, error: answer.error ?? null });
     assert.ok(!LOOKS_LOCAL.test(wire), `a filesystem path reached the caller: ${wire}`);
     for (const path of forbidden) {
@@ -809,15 +871,23 @@ describe('what a failure is allowed to say about this machine', () => {
       );
 
       assertNowhereLocal(answer, home);
-      for (const keep of ['custom:fano', 'https://box.invalid/v1', 'anthropic/claude-sonnet-4.5', 'openai-codex']) {
-        assert.ok(answer.catalogError.includes(keep), `"${keep}" is context, not a location: ${answer.catalogError}`);
+      for (const keep of [
+        'custom:fano',
+        'https://box.invalid/v1',
+        'anthropic/claude-sonnet-4.5',
+        'openai-codex',
+      ]) {
+        assert.ok(
+          answer.catalogError!.includes(keep),
+          `"${keep}" is context, not a location: ${answer.catalogError}`
+        );
       }
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  test("a profile .env that cannot be read does not say where it lives", async () => {
+  test('a profile .env that cannot be read does not say where it lives', async () => {
     const home = fixtureHome();
     try {
       seedConfig(home, { model: { default: 'gpt-6-astra', provider: 'openai-codex' } });
@@ -843,7 +913,7 @@ describe('what a failure is allowed to say about this machine', () => {
 
       assert.equal(answer.code, 'hermes_unavailable');
       assertNowhereLocal(answer);
-      assert.match(answer.error, /Hermes/, 'the reason is still the reason');
+      assert.match(answer.error!, /Hermes/, 'the reason is still the reason');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -862,11 +932,15 @@ describe('what a failure is allowed to say about this machine', () => {
       );
       chmodSync(python, 0o755);
 
-      const answer = await readProfileModel(DEFAULT_PROFILE, home, bridgeEnv({ SLICK_HERMES_PYTHON: python }));
+      const answer = await readProfileModel(
+        DEFAULT_PROFILE,
+        home,
+        bridgeEnv({ SLICK_HERMES_PYTHON: python })
+      );
 
       assert.equal(answer.code, 'bridge_unreadable', answer.error ?? '');
       assertNowhereLocal(answer, home, bin);
-      assert.match(answer.error, /ImportError/, 'the last line of a traceback is still the diagnosis');
+      assert.match(answer.error!, /ImportError/, 'the last line of a traceback is still the diagnosis');
     } finally {
       rmSync(home, { recursive: true, force: true });
       rmSync(bin, { recursive: true, force: true });
@@ -875,7 +949,7 @@ describe('what a failure is allowed to say about this machine', () => {
 });
 
 /** The two fields as the file now has them, for comparing a readback against. */
-function readAfterWrite(dir) {
+function readAfterWrite(dir: string): { provider: string | null; model: string | null } {
   const model = readConfig(dir).model ?? {};
   return { provider: model.provider ?? null, model: model.default ?? null };
 }
@@ -894,10 +968,12 @@ function readAfterWrite(dir) {
  */
 describe('reading what an account has left', () => {
   /** A profile on the one provider that reports limits. */
-  const onCodex = (home) => seedConfig(home, { model: { default: 'gpt-6-astra', provider: 'openai-codex' } });
+  const onCodex = (home: string) =>
+    seedConfig(home, { model: { default: 'gpt-6-astra', provider: 'openai-codex' } });
 
   /** The environment, with a usage script the stub will act out. */
-  const usageEnv = (script, extra = {}) => bridgeEnv({ SLICK_TEST_USAGE: JSON.stringify(script), ...extra });
+  const usageEnv = (script: JsonObject, extra: Env = {}) =>
+    bridgeEnv({ SLICK_TEST_USAGE: JSON.stringify(script), ...extra });
 
   const WINDOWS = [
     { label: 'Session', used_percent: 42.5, reset_at: '2026-09-05T17:00:00Z' },
@@ -922,19 +998,20 @@ describe('reading what an account has left', () => {
       );
 
       assert.equal(answer.error, null, answer.error ?? '');
-      assert.equal(answer.usage.supported, true);
-      assert.equal(answer.usage.available, true);
-      assert.equal(answer.usage.plan, 'Pro');
+      const usage = answer.usage!;
+      assert.equal(usage.supported, true);
+      assert.equal(usage.available, true);
+      assert.equal(usage.plan, 'Pro');
       assert.deepEqual(
-        answer.usage.windows.map((w) => [w.label, w.usedPercent, w.remainingPercent]),
+        usage.windows.map((w) => [w.label, w.usedPercent, w.remainingPercent]),
         [
           ['Session', 42.5, 57.5],
           ['Weekly', 88, 12],
         ],
         'both halves, computed once, in Hermes own order'
       );
-      assert.equal(answer.usage.windows[0].resetAt, '2026-09-05T17:00:00Z');
-      assert.equal(answer.usage.windows[1].resetAt, '2026-09-09T00:00:00Z');
+      assert.equal(usage.windows[0]!.resetAt, '2026-09-05T17:00:00Z');
+      assert.equal(usage.windows[1]!.resetAt, '2026-09-09T00:00:00Z');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -950,8 +1027,8 @@ describe('reading what an account has left', () => {
         // Hermes own phrasing, from `_fetch_codex_account_usage`.
         usageEnv({ windows: WINDOWS, details: ['You have 3 resets banked - use /usage reset to activate'] })
       );
-      assert.equal(answer.usage.bankedResets, 3, 'the panel can badge a count; it cannot badge a paragraph');
-      assert.equal(answer.usage.details.length, 1, 'and what Hermes actually said is still passed through');
+      assert.equal(answer.usage!.bankedResets, 3, 'the panel can badge a count; it cannot badge a paragraph');
+      assert.equal(answer.usage!.details.length, 1, 'and what Hermes actually said is still passed through');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -962,7 +1039,7 @@ describe('reading what an account has left', () => {
     try {
       onCodex(home);
       const answer = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ windows: WINDOWS }));
-      assert.equal(answer.usage.bankedResets, null);
+      assert.equal(answer.usage!.bankedResets, null);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -975,9 +1052,9 @@ describe('reading what an account has left', () => {
       const answer = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ windows: WINDOWS }));
       assert.equal(answer.error, null, 'nothing failed — there was nothing to ask');
       assert.equal(answer.code, null);
-      assert.equal(answer.usage.supported, false);
-      assert.equal(answer.usage.provider, 'anthropic');
-      assert.deepEqual(answer.usage.windows, []);
+      assert.equal(answer.usage!.supported, false);
+      assert.equal(answer.usage!.provider, 'anthropic');
+      assert.deepEqual(answer.usage!.windows, []);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -989,7 +1066,7 @@ describe('reading what an account has left', () => {
       onCodex(home);
       const answer = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ raise: 'auth' }));
       assert.equal(answer.code, 'not_authenticated', 'a login is the fix, and a retry is not');
-      assert.match(answer.error, /sign in/i);
+      assert.match(answer.error!, /sign in/i);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -1012,12 +1089,12 @@ describe('reading what an account has left', () => {
       onCodex(home);
       const rejected = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ raise: 'http:401' }));
       assert.equal(rejected.code, 'not_authenticated');
-      assert.match(rejected.error, /401/);
+      assert.match(rejected.error!, /401/);
 
       clearUsageCache();
       const broken = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ raise: 'http:500' }));
       assert.equal(broken.code, 'usage_http_error', 'a 500 is worth retrying and a 401 is not');
-      assert.match(broken.error, /500/);
+      assert.match(broken.error!, /500/);
 
       clearUsageCache();
       const limited = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ raise: 'http:429' }));
@@ -1033,7 +1110,7 @@ describe('reading what an account has left', () => {
       onCodex(home);
       const answer = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ raise: 'timeout' }));
       assert.equal(answer.code, 'usage_unreachable');
-      assert.equal(answer.error.includes('chatgpt.com'), false, 'the URL is not the diagnosis');
+      assert.equal(answer.error!.includes('chatgpt.com'), false, 'the URL is not the diagnosis');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -1061,7 +1138,7 @@ describe('reading what an account has left', () => {
       onCodex(home);
       const answer = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ none: true }));
       assert.equal(answer.code, 'usage_unavailable');
-      assert.equal(answer.usage.supported, true, 'the provider does report limits — this account had none');
+      assert.equal(answer.usage!.supported, true, 'the provider does report limits — this account had none');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -1071,7 +1148,11 @@ describe('reading what an account has left', () => {
     const home = fixtureHome();
     try {
       onCodex(home);
-      const answer = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Pro', windows: WINDOWS }));
+      const answer = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Pro', windows: WINDOWS })
+      );
       const wire = JSON.stringify(answer);
       assert.equal(wire.includes(home), false);
       assert.equal(wire.includes(homedir()), false);
@@ -1085,14 +1166,22 @@ describe('reading what an account has left', () => {
     const home = fixtureHome();
     try {
       onCodex(home);
-      const first = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Pro', windows: WINDOWS }));
+      const first = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Pro', windows: WINDOWS })
+      );
       assert.equal(first.cached, false);
 
       // A different script entirely. If the second call reached the bridge it
       // would come back as "Free", so the plan is the evidence.
-      const second = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Free', windows: WINDOWS }));
+      const second = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Free', windows: WINDOWS })
+      );
       assert.equal(second.cached, true);
-      assert.equal(second.usage.plan, 'Pro', 'the endpoint was not asked a second time');
+      assert.equal(second.usage!.plan, 'Pro', 'the endpoint was not asked a second time');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -1106,9 +1195,13 @@ describe('reading what an account has left', () => {
       onCodex(home);
       await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Pro', windows: WINDOWS }));
       now += 61_000;
-      const later = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Free', windows: WINDOWS }));
+      const later = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Free', windows: WINDOWS })
+      );
       assert.equal(later.cached, false);
-      assert.equal(later.usage.plan, 'Free', 'a stale number is worse than a slow one');
+      assert.equal(later.usage!.plan, 'Free', 'a stale number is worse than a slow one');
     } finally {
       setUsageClock(null);
       rmSync(home, { recursive: true, force: true });
@@ -1126,26 +1219,40 @@ describe('reading what an account has left', () => {
       // A click a second after the answer landed. The provider was asked one
       // second ago; asking it again is what the floor exists to prevent.
       now += 1_000;
-      const twitch = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Free', windows: WINDOWS }), {
-        refresh: true,
-      });
+      const twitch = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Free', windows: WINDOWS }),
+        {
+          refresh: true,
+        }
+      );
       assert.equal(twitch.throttled, true, 'the rate limit that matters is the provider own');
-      assert.equal(twitch.usage.plan, 'Pro', 'so a double click is one request, not two');
+      assert.equal(twitch.usage!.plan, 'Pro', 'so a double click is one request, not two');
 
       // Past the floor, and still inside the minute a plain read would reuse:
       // this is the case a refresh button exists for.
       now += 10_000;
-      const asked = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Free', windows: WINDOWS }), {
-        refresh: true,
-      });
+      const asked = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Free', windows: WINDOWS }),
+        {
+          refresh: true,
+        }
+      );
       assert.equal(asked.throttled, false, 'a refresh is a human saying they do not believe the cache');
-      assert.equal(asked.usage.plan, 'Free');
+      assert.equal(asked.usage!.plan, 'Free');
 
       // And a plain read straight after it is answered from what that fetched.
       now += 1_000;
-      const plain = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Team', windows: WINDOWS }));
+      const plain = await readProfileUsage(
+        DEFAULT_PROFILE,
+        home,
+        usageEnv({ plan: 'Team', windows: WINDOWS })
+      );
       assert.equal(plain.cached, true);
-      assert.equal(plain.usage.plan, 'Free');
+      assert.equal(plain.usage!.plan, 'Free');
     } finally {
       setUsageClock(null);
       rmSync(home, { recursive: true, force: true });
@@ -1164,7 +1271,7 @@ describe('reading what an account has left', () => {
       ]);
       // All three resolve from the one in-flight run: the two later callers
       // joined it rather than each spawning a bridge of their own.
-      assert.equal(a.usage.plan, 'Pro');
+      assert.equal(a.usage!.plan, 'Pro');
       assert.deepEqual(b.usage, a.usage);
       assert.deepEqual(c.usage, a.usage);
     } finally {
@@ -1176,13 +1283,15 @@ describe('reading what an account has left', () => {
     const home = fixtureHome(['work']);
     try {
       onCodex(home);
-      seedConfig(join(home, 'profiles', 'work'), { model: { default: 'gpt-6-astra', provider: 'openai-codex' } });
+      seedConfig(join(home, 'profiles', 'work'), {
+        model: { default: 'gpt-6-astra', provider: 'openai-codex' },
+      });
 
       const base = await readProfileUsage(DEFAULT_PROFILE, home, usageEnv({ plan: 'Pro', windows: WINDOWS }));
       const work = await readProfileUsage('work', home, usageEnv({ plan: 'Free', windows: WINDOWS }));
 
-      assert.equal(base.usage.plan, 'Pro');
-      assert.equal(work.usage.plan, 'Free', 'one profile answer is never handed to another');
+      assert.equal(base.usage!.plan, 'Pro');
+      assert.equal(work.usage!.plan, 'Free', 'one profile answer is never handed to another');
       assert.equal(work.cached, false);
       assert.equal(work.profile, 'work');
     } finally {
@@ -1218,8 +1327,12 @@ describe('reading what an account has left', () => {
       }
       const answer = await readProfileUsage(DEFAULT_PROFILE, home, bridgeEnv({ PYTHONPATH: overlay }));
       assert.equal(answer.code, 'usage_unsupported');
-      assert.equal(answer.usage.available, false);
-      assert.equal(answer.usage.supported, true, 'the provider still has limits; this Hermes cannot read them');
+      assert.equal(answer.usage!.available, false);
+      assert.equal(
+        answer.usage!.supported,
+        true,
+        'the provider still has limits; this Hermes cannot read them'
+      );
     } finally {
       rmSync(overlay, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });
@@ -1231,19 +1344,24 @@ describe('reading what an account has left', () => {
 
 describe('the Hermes profile routes', () => {
   const TOKEN = 'hermes-route-token';
-  let slickHome;
-  let hermesHome;
-  let app;
-  let base;
+  let slickHome: string;
+  let hermesHome: string;
+  let app: SlickServer;
+  let base: string;
 
-  before(async () => {
+  beforeAll(async () => {
     slickHome = mkdtempSync(join(tmpdir(), 'slick-hermes-ws-'));
     hermesHome = fixtureHome(['work']);
-    seedConfig(hermesHome, { model: { default: 'gpt-6-astra', provider: 'openai-codex', key_env: 'A_SECRET_NAME' } });
-    seedConfig(join(hermesHome, 'profiles', 'work'), { model: { default: 'claude-opus-5', provider: 'anthropic' } });
+    seedConfig(hermesHome, {
+      model: { default: 'gpt-6-astra', provider: 'openai-codex', key_env: 'A_SECRET_NAME' },
+    });
+    seedConfig(join(hermesHome, 'profiles', 'work'), {
+      model: { default: 'claude-opus-5', provider: 'anthropic' },
+    });
     app = createServer({
       home: slickHome,
       token: TOKEN,
+      webRoot: null,
       // Everything about Hermes is derived from this one environment, so a
       // test that hands over a throwaway one cannot reach the real install.
       hermesEnv: bridgeEnv({ HERMES_HOME: hermesHome }),
@@ -1251,13 +1369,18 @@ describe('the Hermes profile routes', () => {
     base = (await app.listen(0)).url;
   });
 
-  after(async () => {
+  afterAll(async () => {
     await app.close();
     rmSync(slickHome, { recursive: true, force: true });
     rmSync(hermesHome, { recursive: true, force: true });
   });
 
-  const call = (method, path, body, opts = {}) =>
+  const call = (
+    method: string,
+    path: string,
+    body?: unknown,
+    opts: { anonymous?: boolean } = {}
+  ): Promise<{ status: number; body: any }> =>
     fetch(`${base}${path}`, {
       method,
       headers: {
@@ -1271,7 +1394,7 @@ describe('the Hermes profile routes', () => {
     const res = await call('GET', '/api/hermes/profiles');
     assert.equal(res.status, 200);
     assert.deepEqual(
-      res.body.profiles.map((p) => p.name),
+      res.body.profiles.map((p: { name: string }) => p.name),
       ['default', 'work']
     );
     assert.equal(res.body.profiles[0].isDefault, true);
@@ -1311,7 +1434,10 @@ describe('the Hermes profile routes', () => {
     app.ws.agents.setModel(key, 'openai-codex::gpt-5.6-luna');
     app.ws.agents.setEffort(key, 'high');
 
-    await call('PUT', '/api/hermes/profiles/default/model', { provider: 'anthropic', model: 'claude-sonnet-5' });
+    await call('PUT', '/api/hermes/profiles/default/model', {
+      provider: 'anthropic',
+      model: 'claude-sonnet-5',
+    });
 
     const after = app.ws.agents.get(key);
     assert.equal(after.state._serveModel, 'openai-codex::gpt-5.6-luna', 'this chat keeps its own model');
@@ -1320,7 +1446,10 @@ describe('the Hermes profile routes', () => {
 
   test('a name that is not a profile is refused, and a traversal never reaches the disk', async () => {
     assert.equal((await call('GET', '/api/hermes/profiles/ghost/model')).status, 404);
-    assert.equal((await call('PUT', '/api/hermes/profiles/ghost/model', { provider: 'a', model: 'b' })).status, 404);
+    assert.equal(
+      (await call('PUT', '/api/hermes/profiles/ghost/model', { provider: 'a', model: 'b' })).status,
+      404
+    );
     for (const bad of ['..', '%2e%2e%2f%2e%2e', 'a.b', 'UP']) {
       const res = await call('PUT', `/api/hermes/profiles/${bad}/model`, { provider: 'a', model: 'b' });
       // 422 is this codebase's `invalid_request`; 404 is a well-formed name
@@ -1346,7 +1475,7 @@ describe('the Hermes profile routes', () => {
     try {
       const before = readConfig(hermesHome).model;
       assert.deepEqual(
-        (await call('GET', '/api/hermes/profiles')).body.profiles.map((p) => p.name),
+        (await call('GET', '/api/hermes/profiles')).body.profiles.map((p: { name: string }) => p.name),
         ['default', 'work']
       );
       const res = await call('PUT', '/api/hermes/profiles/alias/model', {
@@ -1382,7 +1511,7 @@ describe('the Hermes profile routes', () => {
     const again = await call('GET', '/api/hermes/profiles/work/model');
     assert.equal(again.body.effort, 'xhigh');
     assert.ok(
-      again.body.efforts.some((e) => e.value === 'xhigh'),
+      again.body.efforts.some((e: { value: string }) => e.value === 'xhigh'),
       'and the levels to change it to came with it'
     );
     assert.equal(
@@ -1436,12 +1565,13 @@ describe('the Hermes profile routes', () => {
   });
 
   test('none of it answers without a token', async () => {
-    for (const [method, path, body] of [
+    const cases: [string, string, unknown][] = [
       ['GET', '/api/hermes/profiles', null],
       ['GET', '/api/hermes/profiles/default/model', null],
       ['PUT', '/api/hermes/profiles/default/model', { provider: 'anthropic', model: 'claude-sonnet-5' }],
       ['GET', '/api/hermes/profiles/default/usage', null],
-    ]) {
+    ];
+    for (const [method, path, body] of cases) {
       const res = await call(method, path, body, { anonymous: true });
       assert.equal(res.status, 401, `${method} ${path}`);
       assert.equal(res.body.error.code, 'unauthorized');
@@ -1465,11 +1595,11 @@ describe('the Hermes profile routes', () => {
  *
  * No model is ever called: this reads and writes a config file.
  */
-function findRealHermes() {
+function findRealHermes(): string | null {
   const candidates = [
     process.env.SLICK_HERMES_TEST_PYTHON,
     join(homedir(), '.hermes', 'hermes-agent', 'venv', 'bin', 'python'),
-  ].filter(Boolean);
+  ].filter((python): python is string => Boolean(python));
   for (const python of candidates) {
     try {
       execFileSync(python, ['-c', 'import hermes_cli.config'], { stdio: 'ignore', timeout: 30_000 });
@@ -1482,11 +1612,16 @@ function findRealHermes() {
 }
 
 const REAL_PYTHON = findRealHermes();
-const realOpts = REAL_PYTHON ? {} : { skip: 'no importable Hermes on this machine' };
+/** The real-Hermes block, skipped when there is no importable Hermes on this machine. */
+const realTest = REAL_PYTHON ? test : test.skip;
 
 describe('a real Hermes, in a HERMES_HOME made for the test', () => {
   /** Only ever a temp dir; the real ~/.hermes is never named here. */
-  const realEnv = () => ({ PATH: process.env.PATH, SLICK_HERMES_TEST: '1', SLICK_HERMES_PYTHON: REAL_PYTHON });
+  const realEnv = (): Env => ({
+    PATH: process.env.PATH,
+    SLICK_HERMES_TEST: '1',
+    SLICK_HERMES_PYTHON: REAL_PYTHON ?? undefined,
+  });
 
   const CONFIG = [
     'model:',
@@ -1499,7 +1634,7 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
     '',
   ].join('\n');
 
-  test('a write survives being read back through Hermes itself', realOpts, async () => {
+  realTest('a write survives being read back through Hermes itself', async () => {
     const home = fixtureHome();
     try {
       writeFileSync(join(home, 'config.yaml'), CONFIG);
@@ -1528,7 +1663,7 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
     }
   });
 
-  test('the catalog is Hermes own, with its own provider-qualified ids', realOpts, async () => {
+  realTest('the catalog is Hermes own, with its own provider-qualified ids', async () => {
     const home = fixtureHome();
     try {
       writeFileSync(join(home, 'config.yaml'), CONFIG);
@@ -1540,7 +1675,7 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
       // and a test that pins them fails on the next one. What must hold is
       // that ids arrive verbatim — no re-spelling of a `custom:` slug, no
       // splitting a vendor-prefixed model id on its slash.
-      for (const provider of read.providers) {
+      for (const provider of providersOf(read)) {
         assert.equal(provider.value, provider.value.trim());
         assert.equal(typeof provider.custom, 'boolean');
         assert.equal(provider.custom, provider.value === 'custom' || provider.value.startsWith('custom:'));
@@ -1552,7 +1687,7 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
     }
   });
 
-  test('a real switch away from a custom endpoint takes its credentials with it', realOpts, async () => {
+  realTest('a real switch away from a custom endpoint takes its credentials with it', async () => {
     const home = fixtureHome();
     const KEY = 'sk-endpoint-Ab3nQ7zK1mVx9PlR4tYuWs2Dg6Hj8Kc0';
     try {
@@ -1595,7 +1730,7 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
     }
   });
 
-  test('a real config nobody else touched still saves', realOpts, async () => {
+  realTest('a real config nobody else touched still saves', async () => {
     const home = fixtureHome();
     try {
       writeFileSync(join(home, 'config.yaml'), CONFIG);
@@ -1603,7 +1738,12 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
       // a guard that refuses an uncontended write is a guard that broke the
       // feature.
       for (const model of ['claude-sonnet-5', 'claude-opus-5']) {
-        const saved = await writeProfileModel(DEFAULT_PROFILE, { provider: 'anthropic', model }, home, realEnv());
+        const saved = await writeProfileModel(
+          DEFAULT_PROFILE,
+          { provider: 'anthropic', model },
+          home,
+          realEnv()
+        );
         assert.equal(saved.error, null, saved.error ?? '');
         assert.equal(saved.defaults.model, model);
       }
@@ -1612,7 +1752,7 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
     }
   });
 
-  test('editing one profile leaves the other profile’s file byte-identical', realOpts, async () => {
+  realTest('editing one profile leaves the other profile’s file byte-identical', async () => {
     const home = fixtureHome(['work']);
     const work = join(home, 'profiles', 'work');
     try {
@@ -1622,7 +1762,11 @@ describe('a real Hermes, in a HERMES_HOME made for the test', () => {
 
       await writeProfileModel('work', { provider: 'anthropic', model: 'claude-opus-5' }, home, realEnv());
 
-      assert.equal(readFileSync(join(home, 'config.yaml'), 'utf8'), untouched, 'the default profile was not opened');
+      assert.equal(
+        readFileSync(join(home, 'config.yaml'), 'utf8'),
+        untouched,
+        'the default profile was not opened'
+      );
       assert.match(readFileSync(join(work, 'config.yaml'), 'utf8'), /claude-opus-5/);
     } finally {
       rmSync(home, { recursive: true, force: true });

@@ -24,7 +24,7 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { createServer } from '../packages/server/src/index.js';
+import { createServer } from '@slick/server';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 const STUB = join(REPO, 'packages', 'server', 'test', 'fixtures', 'hermes-stub');

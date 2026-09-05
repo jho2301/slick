@@ -78,6 +78,10 @@ export default tseslint.config(
       '@typescript-eslint/no-unsafe-call': 'off',
       '@typescript-eslint/no-unsafe-return': 'off',
       '@typescript-eslint/no-floating-promises': 'off',
+      // Tests read parsed JSON off the wire; typing every response shape
+      // would be a second copy of the code under test.
+      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/require-await': 'off',
     },
   }
 );

@@ -8,33 +8,54 @@
  * use `Authorization: Bearer`.
  */
 
-import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { Workspace } from '@slick/core';
+import { Workspace, isRecord } from '@slick/core';
 
-import { createRoutes, RAW } from './routes.js';
-import { createHub } from './hub.js';
-import { createPushService } from './push.js';
-import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot, serviceWorkerWithBuild } from './static.js';
-import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.js';
+import { createRoutes, RAW } from './routes.ts';
+import { createHub, type Hub } from './hub.ts';
+import { createPushService, type PushService } from './push.ts';
+import {
+  buildStamp,
+  createStaticHandler,
+  manifestWithToken,
+  resolveWebRoot,
+  serviceWorkerWithBuild,
+} from './static.ts';
+import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.ts';
+import type { Env } from './hermes.ts';
 
 export const VERSION = '0.5.0';
 const COOKIE = 'slick_token';
 const BODY_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
-export function newToken() {
+export function newToken(): string {
   return randomBytes(24).toString('base64url');
 }
 
-/**
- * @param {{
- *   workspace?: Workspace, home?: string, file?: string,
- *   token?: string|null, webRoot?: string|null, host?: string,
- *   trustedHosts?: string[], push?: ReturnType<typeof createPushService>,
- *   hermesEnv?: Record<string, string|undefined>,
- * }} [opts]
- */
-export function createServer(opts = {}) {
+export interface ServerOptions {
+  workspace?: Workspace;
+  home?: string | null;
+  file?: string;
+  /** `null` turns auth off; absent mints a fresh token. */
+  token?: string | null;
+  /** `null` serves no UI at all; absent looks for one. */
+  webRoot?: string | null;
+  host?: string;
+  trustedHosts?: string[];
+  push?: PushService;
+  hermesEnv?: Env;
+}
+
+export interface Bound {
+  port: number;
+  host: string;
+  url: string;
+}
+
+type AuthResult = { ok: true; from: 'disabled' | 'header' | 'query' | 'cookie' } | { ok: false };
+
+export function createServer(opts: ServerOptions = {}) {
   const ws = opts.workspace ?? Workspace.open({ home: opts.home, file: opts.file });
   const ownsWorkspace = !opts.workspace;
   const host = opts.host ?? '127.0.0.1';
@@ -42,7 +63,7 @@ export function createServer(opts = {}) {
   const token = opts.token === null ? null : (opts.token ?? newToken());
   const webRoot = opts.webRoot === null ? null : resolveWebRoot(opts.webRoot);
   const push = opts.push ?? createPushService(ws);
-  const hub = createHub(ws, { push });
+  const hub: Hub = createHub(ws, { push });
   const router = createRoutes({
     ws,
     hub,
@@ -56,7 +77,7 @@ export function createServer(opts = {}) {
   });
   const serveStatic = createStaticHandler(webRoot);
 
-  function authenticate(req, url) {
+  function authenticate(req: IncomingMessage, url: URL): AuthResult {
     if (!token) return { ok: true, from: 'disabled' };
     const header = req.headers.authorization ?? '';
     if (header.startsWith('Bearer ') && safeEqual(header.slice(7).trim(), token)) {
@@ -69,10 +90,10 @@ export function createServer(opts = {}) {
     return { ok: false };
   }
 
-  const server = createHttpServer(async (req, res) => {
-    let url;
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let url: URL;
     try {
-      url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
+      url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
     } catch {
       return sendJson(res, 400, { error: { code: 'bad_request', message: 'Malformed URL' } });
     }
@@ -94,14 +115,16 @@ export function createServer(opts = {}) {
         'access-control-allow-headers': 'authorization, content-type, last-event-id',
         'access-control-max-age': '600',
       });
-      return res.end();
+      res.end();
+      return;
     }
 
     const auth = authenticate(req, url);
     if (!auth.ok) {
       if (!url.pathname.startsWith('/api/')) {
         res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
-        return res.end(UNAUTHORIZED_PAGE);
+        res.end(UNAUTHORIZED_PAGE);
+        return;
       }
       return sendJson(res, 401, {
         error: {
@@ -119,10 +142,13 @@ export function createServer(opts = {}) {
     // Bearer tokens (scripts, mobile) may come cross-origin; cookies may not.
     if (auth.from === 'header') res.setHeader('access-control-allow-origin', '*');
 
-    const route = router.match(req.method, url.pathname);
-    if (route) {
-      try {
-        const body = BODY_METHODS.has(req.method) ? await readJson(req) : {};
+    // Everything from here on decodes what the client sent, so everything from
+    // here on is inside the error boundary: a malformed escape in a path is a
+    // 400, not an exception on its way to `process.exit`.
+    try {
+      const route = router.match(req.method, url.pathname);
+      if (route) {
+        const body = BODY_METHODS.has(req.method ?? '') ? await readJson(req) : {};
         const result = await route.handler({
           req,
           res,
@@ -140,86 +166,104 @@ export function createServer(opts = {}) {
         // anyway would buy nothing but a `ws.seq()` query against SQLite for
         // every fragment of every streamed answer.
         if (req.method !== 'GET' && url.pathname !== '/api/stream/delta') hub.wake();
-        if (result && typeof result === 'object' && 'status' in result && 'body' in result) {
+        if (isRecord(result) && 'status' in result && 'body' in result && typeof result.status === 'number') {
           return sendJson(res, result.status, result.body);
         }
         return sendJson(res, 200, result ?? { ok: true });
-      } catch (err) {
-        if (res.headersSent) return res.end();
-        return sendError(res, err);
       }
-    }
 
-    // `/api/*` is never static: an unknown endpoint must answer with JSON, not
-    // with the app shell that the SPA fallback would otherwise hand back.
-    if (url.pathname.startsWith('/api/')) {
-      return sendJson(res, 404, {
-        error: { code: 'no_such_route', message: `No route for ${req.method} ${url.pathname}` },
-      });
-    }
-
-    // Ahead of the static handler, which would serve the file as written: the
-    // copy on disk has no token in its `start_url`, and an installed app has
-    // nowhere else to get one. See `manifestWithToken`.
-    if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
-      const manifest = manifestWithToken(webRoot, token);
-      if (manifest) {
-        res.writeHead(200, {
-          'content-type': 'application/manifest+json',
-          'content-length': Buffer.byteLength(manifest),
-          'cache-control': 'no-cache',
+      // `/api/*` is never static: an unknown endpoint must answer with JSON, not
+      // with the app shell that the SPA fallback would otherwise hand back.
+      if (url.pathname.startsWith('/api/')) {
+        return sendJson(res, 404, {
+          error: { code: 'no_such_route', message: `No route for ${req.method} ${url.pathname}` },
         });
-        return res.end(manifest);
       }
-    }
 
-    // Also ahead of the static handler: the copy on disk has a placeholder
-    // where the build stamp goes. See `serviceWorkerWithBuild`.
-    if (req.method === 'GET' && url.pathname === '/sw.js') {
-      const source = serviceWorkerWithBuild(webRoot, buildStamp(webRoot));
-      if (source !== null) {
-        res.writeHead(200, {
-          'content-type': 'text/javascript; charset=utf-8',
-          'content-length': Buffer.byteLength(source),
-          'cache-control': 'no-cache',
-        });
-        return res.end(source);
+      // Ahead of the static handler, which would serve the file as written: the
+      // copy on disk has no token in its `start_url`, and an installed app has
+      // nowhere else to get one. See `manifestWithToken`.
+      if (req.method === 'GET' && url.pathname === '/manifest.webmanifest') {
+        const manifest = manifestWithToken(webRoot, token);
+        if (manifest) {
+          res.writeHead(200, {
+            'content-type': 'application/manifest+json',
+            'content-length': Buffer.byteLength(manifest),
+            'cache-control': 'no-cache',
+          });
+          res.end(manifest);
+          return;
+        }
       }
-    }
 
-    if (req.method === 'GET' && serveStatic(req, res, url.pathname)) return;
-    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-    res.end('Not found');
+      // Also ahead of the static handler: the copy on disk has a placeholder
+      // where the build stamp goes. See `serviceWorkerWithBuild`.
+      if (req.method === 'GET' && url.pathname === '/sw.js') {
+        const source = serviceWorkerWithBuild(webRoot, buildStamp(webRoot));
+        if (source !== null) {
+          res.writeHead(200, {
+            'content-type': 'text/javascript; charset=utf-8',
+            'content-length': Buffer.byteLength(source),
+            'cache-control': 'no-cache',
+          });
+          res.end(source);
+          return;
+        }
+      }
+
+      if (req.method === 'GET' && serveStatic(req, res, url.pathname)) return;
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Not found');
+    } catch (err) {
+      if (res.headersSent) {
+        res.end();
+        return;
+      }
+      sendError(res, err);
+    }
+  }
+
+  const server = createHttpServer((req, res) => {
+    handle(req, res).catch((err: unknown) => {
+      // `handle` answers its own errors; this is the last line of defence for
+      // a response that failed while being written.
+      console.error('[slick] request failed:', err);
+      if (!res.headersSent) sendError(res, err);
+      else res.end();
+    });
   });
 
-  /** @param {number} [port] 0 picks a free one */
-  function listen(port = 0) {
+  /** @param port 0 picks a free one */
+  function listen(port = 0): Promise<Bound> {
     return new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(port, host, () => {
         server.removeListener('error', reject);
         const address = server.address();
-        resolve({ port: address.port, host, url: `http://${host}:${address.port}` });
+        const bound = typeof address === 'object' && address ? address.port : port;
+        resolve({ port: bound, host, url: `http://${host}:${bound}` });
       });
     });
   }
 
-  function close() {
+  function close(): Promise<void> {
     hub.close();
     return new Promise((resolve) => {
       server.close(() => {
         if (ownsWorkspace) ws.close();
         resolve();
       });
-      server.closeIdleConnections?.();
+      server.closeIdleConnections();
     });
   }
 
   return { server, ws, hub, push, token, webRoot, host, listen, close };
 }
 
-function safeEqual(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+export type SlickServer = ReturnType<typeof createServer>;
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
@@ -236,3 +280,15 @@ code{background:#f4f4f5;padding:.15em .4em;border-radius:4px;font-size:.9em}</st
 <p>…or copy the URL printed by <code>slick daemon status</code>.</p>`;
 
 export { createHub, createPushService, resolveWebRoot };
+export type { Hub, PushService, Env };
+export type { DaemonInfo, DaemonStatus, StartedDaemon } from './daemon.ts';
+export type { CommandEntry, CommandList, CommandOutput } from './commands.ts';
+export type {
+  AccountUsage,
+  HermesProfile,
+  ProfileModel,
+  ProfileModelWritten,
+  ProfileUsage,
+  UsageWindow,
+  EffortChoice,
+} from './hermes.ts';

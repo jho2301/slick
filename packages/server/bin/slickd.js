@@ -20,8 +20,8 @@ const { execFile } = await import('node:child_process');
 const { promisify } = await import('node:util');
 const { existsSync, mkdirSync, readFileSync, writeFileSync } = await import('node:fs');
 const { paths } = await import('@slick/core/paths');
-const { createServer, newToken, VERSION } = await import('../src/index.js');
-const { writeDaemonFile, clearDaemonFile, readDaemonFile, daemonStatus } = await import('../src/daemon.js');
+const { createServer, newToken, VERSION } = await import('../src/index.ts');
+const { writeDaemonFile, clearDaemonFile, readDaemonFile, daemonStatus } = await import('../src/daemon.ts');
 
 const execFileAsync = promisify(execFile);
 

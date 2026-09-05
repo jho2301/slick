@@ -5,7 +5,14 @@
  * of the actual rules live in @slick/core, so the CLI (which calls the core
  * directly) and the desktop app (which calls it through here) can never drift
  * apart.
+ *
+ * A request body is JSON someone sent; the casts on the way into the core are
+ * the boundary where it becomes a typed input. The core validates the fields
+ * it reads and ignores the rest, which is exactly what it did when the body
+ * was untyped — the cast names the shape, it does not vouch for it.
  */
+
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import {
   SERVE_MODELS_AT_KEY,
@@ -14,16 +21,58 @@ import {
   readServeEffort,
   readServeModel,
   readServeModelChoices,
+  type AgentPostInput,
+  type CategoryInput,
+  type CategoryPatch,
+  type ChannelInput,
+  type ChannelPatch,
+  type ExternalThinkingInput,
+  type ExternalTypingInput,
+  type JsonObject,
+  type MessagePatch,
+  type PostMessageInput,
+  type PullOptions,
+  type ResumeOptions,
+  type SessionPatch,
+  type StartSessionInput,
+  type ThinkingInput,
+  type TypingInput,
+  type Workspace,
 } from '@slick/core';
 
-import { listCommands, runCommand } from './commands.js';
-import { hermesRoot, listProfiles, readProfileModel, readProfileUsage, writeProfileModel } from './hermes.js';
-import { createRouter, query } from './http.js';
+import { listCommands, runCommand } from './commands.ts';
+import {
+  hermesRoot,
+  listProfiles,
+  readProfileModel,
+  readProfileUsage,
+  writeProfileModel,
+  type Env,
+} from './hermes.ts';
+import { createRouter, query, type Query } from './http.ts';
+import type { Hub } from './hub.ts';
+import type { PushService } from './push.ts';
 
 /** Returned by handlers that wrote the response themselves. */
 export const RAW = Symbol('raw');
 
-const CREATED = (body) => ({ status: 201, body });
+/** A handler's answer: JSON to send as 200, a status with a body, or RAW. */
+export type RouteResult = unknown;
+
+export interface RouteContext {
+  req: IncomingMessage;
+  res: ServerResponse;
+  params: Record<string, string>;
+  q: Query;
+  body: JsonObject;
+  url: URL;
+  ws: Workspace;
+  hub: Hub;
+}
+
+export type RouteHandler = (ctx: RouteContext) => RouteResult;
+
+const CREATED = (body: unknown) => ({ status: 201, body });
 
 /**
  * The shape @slick/core accepts for an agent id. It is not exported from
@@ -64,8 +113,8 @@ const EFFORT_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/i;
  * "no opinion" out. `''` when the body says `''` — clear the setting, back to
  * whatever Hermes defaults to. A level otherwise.
  */
-function hermesEffort(body) {
-  if (body == null || !Object.hasOwn(body, 'effort')) return undefined;
+function hermesEffort(body: JsonObject): string | null | undefined {
+  if (!Object.hasOwn(body, 'effort')) return undefined;
   const wanted = body.effort;
   if (wanted === null) return null;
   if (typeof wanted !== 'string') {
@@ -83,8 +132,22 @@ function hermesEffort(body) {
   return level;
 }
 
-export function createRoutes({ ws, hub, push, version, build, hermesEnv = process.env }) {
-  const router = createRouter();
+const asString = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+
+/** The JSON someone sent, as the input the core reads it as. See the header. */
+const asInput = <T>(body: JsonObject): T => body as unknown as T;
+
+export interface RoutesOptions {
+  ws: Workspace;
+  hub: Hub;
+  push: PushService;
+  version: string;
+  build?: () => string | null;
+  hermesEnv?: Env;
+}
+
+export function createRoutes({ ws, hub, push, version, build, hermesEnv = process.env }: RoutesOptions) {
+  const router = createRouter<RouteHandler>();
   const r = router.add;
 
   // --------------------------------------------------------- workspace ---
@@ -105,7 +168,7 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
 
   r('PATCH /api/workspace', ({ body }) => {
     if (body.user) ws.setUser(body.user);
-    if (body.name) ws.setMeta('workspace.name', body.name);
+    if (typeof body.name === 'string' && body.name) ws.setMeta('workspace.name', body.name);
     return ws.info();
   });
 
@@ -118,24 +181,28 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
     }),
   }));
 
-  r('POST /api/channels', ({ body }) => CREATED({ channel: ws.channels.create(body) }));
+  r('POST /api/channels', ({ body }) =>
+    CREATED({ channel: ws.channels.create(asInput<ChannelInput>(body)) })
+  );
 
   r('GET /api/channels/:ref', ({ params }) => ({ channel: ws.channels.get(params.ref) }));
 
   r('PATCH /api/channels/:ref', ({ params, body }) => ({
-    channel: ws.channels.update(params.ref, body),
+    channel: ws.channels.update(params.ref ?? '', asInput<ChannelPatch>(body)),
   }));
 
   r('DELETE /api/channels/:ref', ({ params, q }) => ({
-    channel: ws.channels.remove(params.ref, { force: q.bool('force') }),
+    channel: ws.channels.remove(params.ref ?? '', { force: q.bool('force') }),
   }));
 
-  r('POST /api/channels/:ref/archive', ({ params }) => ({ channel: ws.channels.archive(params.ref) }));
+  r('POST /api/channels/:ref/archive', ({ params }) => ({ channel: ws.channels.archive(params.ref ?? '') }));
 
-  r('POST /api/channels/:ref/unarchive', ({ params }) => ({ channel: ws.channels.unarchive(params.ref) }));
+  r('POST /api/channels/:ref/unarchive', ({ params }) => ({
+    channel: ws.channels.unarchive(params.ref ?? ''),
+  }));
 
   r('GET /api/channels/:ref/messages', ({ params, q }) =>
-    ws.messages.list(params.ref, {
+    ws.messages.list(params.ref ?? '', {
       limit: q.int('limit'),
       before: q.get('before'),
       after: q.get('after'),
@@ -145,27 +212,29 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   );
 
   r('POST /api/channels/:ref/messages', ({ params, body }) =>
-    CREATED({ message: ws.messages.post({ ...body, channel: params.ref }) })
+    CREATED({ message: ws.messages.post({ ...asInput<PostMessageInput>(body), channel: params.ref }) })
   );
 
   // -------------------------------------------------------- categories ---
 
   r('GET /api/categories', () => ({ categories: ws.categories.list() }));
 
-  r('POST /api/categories', ({ body }) => CREATED({ category: ws.categories.create(body) }));
+  r('POST /api/categories', ({ body }) =>
+    CREATED({ category: ws.categories.create(asInput<CategoryInput>(body)) })
+  );
 
   // Declared before `:ref` so "reorder" is never read as a category name.
   r('POST /api/categories/reorder', ({ body }) => ({
-    categories: ws.categories.reorder(body.order ?? body.categories ?? []),
+    categories: ws.categories.reorder((body.order ?? body.categories ?? []) as string[]),
   }));
 
   r('GET /api/categories/:ref', ({ params }) => ({ category: ws.categories.get(params.ref) }));
 
   r('PATCH /api/categories/:ref', ({ params, body }) => ({
-    category: ws.categories.update(params.ref, body),
+    category: ws.categories.update(params.ref ?? '', asInput<CategoryPatch>(body)),
   }));
 
-  r('DELETE /api/categories/:ref', ({ params }) => ({ category: ws.categories.remove(params.ref) }));
+  r('DELETE /api/categories/:ref', ({ params }) => ({ category: ws.categories.remove(params.ref ?? '') }));
 
   r('GET /api/categories/:ref/channels', ({ params, q }) => ({
     channels: ws.channels.list({ category: params.ref, includeArchived: q.bool('includeArchived') }),
@@ -176,17 +245,17 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   r('GET /api/messages/:id', ({ params }) => ({ message: ws.messages.get(params.id) }));
 
   r('PATCH /api/messages/:id', ({ params, body }) => ({
-    message: ws.messages.update(params.id, body),
+    message: ws.messages.update(params.id ?? '', asInput<MessagePatch>(body)),
   }));
 
   r('DELETE /api/messages/:id', ({ params, q }) => ({
-    message: ws.messages.remove(params.id, { hard: q.bool('hard') }),
+    message: ws.messages.remove(params.id ?? '', { hard: q.bool('hard') }),
   }));
 
-  r('GET /api/messages/:id/thread', ({ params }) => ws.messages.thread(params.id));
+  r('GET /api/messages/:id/thread', ({ params }) => ws.messages.thread(params.id ?? ''));
 
   r('POST /api/messages/:id/replies', ({ params, body }) =>
-    CREATED({ message: ws.messages.reply(params.id, body) })
+    CREATED({ message: ws.messages.reply(params.id ?? '', asInput<PostMessageInput>(body)) })
   );
 
   // ------------------------------------------------------------ search ---
@@ -229,7 +298,9 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
     }),
   }));
 
-  r('POST /api/agents/sessions', ({ body }) => CREATED({ session: ws.agents.start(body) }));
+  r('POST /api/agents/sessions', ({ body }) =>
+    CREATED({ session: ws.agents.start(asInput<StartSessionInput>(body)) })
+  );
 
   r('GET /api/agents/sessions/:ref', ({ params, q }) => ({
     session: ws.agents.get(params.ref, { agentId: q.get('agent') }),
@@ -237,23 +308,27 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   }));
 
   r('PATCH /api/agents/sessions/:ref', ({ params, body }) => ({
-    session: ws.agents.update(params.ref, body, { agentId: body.agent }),
+    session: ws.agents.update(params.ref ?? '', asInput<SessionPatch>(body), {
+      agentId: asString(body.agent),
+    }),
   }));
 
-  r('DELETE /api/agents/sessions/:ref', ({ params }) => ({ session: ws.agents.remove(params.ref) }));
+  r('DELETE /api/agents/sessions/:ref', ({ params }) => ({ session: ws.agents.remove(params.ref ?? '') }));
 
   r('POST /api/agents/sessions/:ref/resume', ({ params, body }) =>
-    ws.agents.resume(params.ref, body)
+    ws.agents.resume(params.ref ?? '', asInput<ResumeOptions>(body))
   );
 
-  r('POST /api/agents/sessions/:ref/pull', ({ params, body }) => ws.agents.pull(params.ref, body));
+  r('POST /api/agents/sessions/:ref/pull', ({ params, body }) =>
+    ws.agents.pull(params.ref ?? '', asInput<PullOptions>(body))
+  );
 
   r('POST /api/agents/sessions/:ref/ack', ({ params, body }) => ({
-    session: ws.agents.ack(params.ref, body.seq),
+    session: ws.agents.ack(params.ref ?? '', body.seq as number | string | null | undefined),
   }));
 
   r('PUT /api/agents/sessions/:ref/state', ({ params, body }) => ({
-    session: ws.agents.setState(params.ref, body.state ?? {}, { merge: body.merge !== false }),
+    session: ws.agents.setState(params.ref ?? '', body.state ?? {}, { merge: body.merge !== false }),
   }));
 
   // Which model `slick agent serve` calls for this session. A running watcher
@@ -265,12 +340,14 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
       // What the agent binary last told `serve` it can run, so a human picks
       // from a list instead of remembering model names.
       choices: readServeModelChoices(state),
-      checkedAt: Number(state?.[SERVE_MODELS_AT_KEY]) || null,
+      checkedAt: Number(state[SERVE_MODELS_AT_KEY]) || null,
     };
   });
 
   r('PUT /api/agents/sessions/:ref/model', ({ params, body }) => {
-    const session = ws.agents.setModel(params.ref, body.model ?? null, { agentId: body.agent });
+    const session = ws.agents.setModel(params.ref ?? '', body.model ?? null, {
+      agentId: asString(body.agent),
+    });
     return { model: readServeModel(session.state), session };
   });
 
@@ -282,15 +359,19 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   });
 
   r('PUT /api/agents/sessions/:ref/effort', ({ params, body }) => {
-    const session = ws.agents.setEffort(params.ref, body.effort ?? null, { agentId: body.agent });
+    const session = ws.agents.setEffort(params.ref ?? '', body.effort ?? null, {
+      agentId: asString(body.agent),
+    });
     return { effort: readServeEffort(session.state), session };
   });
 
   r('POST /api/agents/sessions/:ref/messages', ({ params, body }) =>
-    CREATED(ws.agents.post(params.ref, body))
+    CREATED(ws.agents.post(params.ref ?? '', asInput<AgentPostInput>(body)))
   );
 
-  r('POST /api/agents/sessions/:ref/typing', ({ params, body }) => ws.agents.typing(params.ref, body));
+  r('POST /api/agents/sessions/:ref/typing', ({ params, body }) =>
+    ws.agents.typing(params.ref ?? '', asInput<TypingInput>(body))
+  );
 
   // Who is typing *now*. The stream carries changes, and a tab that opened
   // mid-reply missed the one that mattered, so it asks.
@@ -300,20 +381,22 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   // answering over this API rather than through `slick agent serve`. It has
   // no history key to name and no lock to hold, so the snapshot believes it
   // only for as long as its window.
-  r('POST /api/typing', ({ body }) => ws.agents.externalTyping(body ?? {}));
+  r('POST /api/typing', ({ body }) => ws.agents.externalTyping(asInput<ExternalTypingInput>(body)));
 
   // Thinking is typing with a shape to it: the same live signal, carrying the
   // steps the agent is working through rather than a bare on/off. It is a
   // durable event like typing, and like typing it is missing from
   // `CONVERSATION_EVENTS`, so one agent's scratchpad never turns up in
   // another agent's `pull`.
-  r('POST /api/agents/sessions/:ref/thinking', ({ params, body }) => ws.agents.thinking(params.ref, body));
+  r('POST /api/agents/sessions/:ref/thinking', ({ params, body }) =>
+    ws.agents.thinking(params.ref ?? '', asInput<ThinkingInput>(body))
+  );
 
   // And the same reason for a snapshot: a tab that opened halfway through a
   // long answer saw none of the steps go by.
   r('GET /api/thinking', () => ({ thinking: ws.agents.thinkingNow() }));
 
-  r('POST /api/thinking', ({ body }) => ws.agents.externalThinking(body ?? {}));
+  r('POST /api/thinking', ({ body }) => ws.agents.externalThinking(asInput<ExternalThinkingInput>(body)));
 
   // The one route in the app that writes nothing down.
   //
@@ -325,9 +408,11 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   // was not open for it has missed nothing: the message it was a preview of
   // arrives through the log like every other message.
   r('POST /api/stream/delta', ({ body }) => {
-    const agentId = String(body?.agentId ?? '').trim().toLowerCase();
+    const agentId = String(body.agentId ?? '')
+      .trim()
+      .toLowerCase();
     if (!AGENT_ID_RE.test(agentId)) {
-      throw new ValidationError(`"${body?.agentId ?? ''}" is not a valid agent id.`, {
+      throw new ValidationError(`"${String(body.agentId ?? '')}" is not a valid agent id.`, {
         hint: 'Use letters, digits, "-", "_" or "." — the name the agent posts under.',
       });
     }
@@ -335,10 +420,10 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
     // id that names nothing is a 404 the caller can act on, and the channel
     // comes from the message instead of from whoever asked, so nobody can
     // aim a preview at a channel they were never in.
-    const { threadId, text, think, done } = body ?? {};
+    const { threadId, text, think, done } = body;
     const target = ws.messages.get(String(threadId ?? '').trim());
     if (text != null && typeof text !== 'string') {
-      throw new ValidationError('A delta\u2019s "text" is a piece of the answer, so it has to be a string.');
+      throw new ValidationError('A delta’s "text" is a piece of the answer, so it has to be a string.');
     }
     if (typeof text === 'string' && text.length > MAX_DELTA_TEXT) {
       // Refused rather than trimmed. Truncating would put a fragment on screen
@@ -356,7 +441,7 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
       // answering a reply would otherwise leave a draft under the reply id and
       // a thinking blob under the root, and the browser would clear one of
       // them and hold the other open forever.
-      threadId: target.threadId ?? target.id,
+      threadId: target.threadId,
       channelId: target.channelId,
       actor: { id: agentId, kind: 'agent' },
       text,
@@ -376,14 +461,14 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
   // output goes back in this response and nowhere else — no message, no event,
   // nothing in the log, because it is one person's answer to one question.
   r('GET /api/agents/sessions/:ref/commands', ({ params, q }) =>
-    listCommands(ws, params.ref, { force: q.bool('refresh') })
+    listCommands(ws, params.ref ?? '', { force: q.bool('refresh') })
   );
 
   r('POST /api/agents/sessions/:ref/command', ({ params, body }) =>
-    runCommand(ws, params.ref, { command: body.command, args: body.args })
+    runCommand(ws, params.ref ?? '', { command: body.command, args: body.args })
   );
 
-  r('POST /api/agents/sessions/:ref/end', ({ params }) => ({ session: ws.agents.end(params.ref) }));
+  r('POST /api/agents/sessions/:ref/end', ({ params }) => ({ session: ws.agents.end(params.ref ?? '') }));
 
   // ------------------------------------------------------------ hermes ---
 
@@ -405,12 +490,16 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
     return {
       // Deliberately not the directory: the app has no use for a path, and a
       // path in a payload is one screenshot away from being public.
-      profiles: listProfiles(root).map(({ name, isDefault, configured }) => ({ name, isDefault, configured })),
+      profiles: listProfiles(root).map(({ name, isDefault, configured }) => ({
+        name,
+        isDefault,
+        configured,
+      })),
     };
   });
 
   r('GET /api/hermes/profiles/:name/model', async ({ params }) => {
-    const { dir, ...rest } = await readProfileModel(params.name, hermesRoot(hermesEnv), hermesEnv);
+    const { dir: _dir, ...rest } = await readProfileModel(params.name, hermesRoot(hermesEnv), hermesEnv);
     return rest;
   });
 
@@ -429,14 +518,14 @@ export function createRoutes({ ws, hub, push, version, build, hermesEnv = proces
     // Checked here as well as in the bridge. The bridge is the one that must
     // never write rubbish into a config file; this is the one that gives a
     // browser a 400 with a sentence in it rather than a 200 saying "no".
-    const provider = String(body?.provider ?? '').trim();
-    const model = String(body?.model ?? '').trim();
+    const provider = String(body.provider ?? '').trim();
+    const model = String(body.model ?? '').trim();
     if (!provider || !model) {
       throw new ValidationError('A Hermes default needs both a provider and a model.', {
         hint: 'They are one setting: a provider without a model leaves the profile pointing at a model it does not serve.',
       });
     }
-    const { dir, ...rest } = await writeProfileModel(
+    const { dir: _dir, ...rest } = await writeProfileModel(
       params.name,
       { provider, model, effort: hermesEffort(body) },
       hermesRoot(hermesEnv),

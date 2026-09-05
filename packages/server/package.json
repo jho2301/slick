@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "description": "Local daemon: REST + live event stream over the Slick workspace",
-  "main": "./src/index.js",
+  "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.js",
-    "./daemon": "./src/daemon.js"
+    ".": "./src/index.ts",
+    "./daemon": "./src/daemon.ts"
   },
   "bin": {
     "slickd": "./bin/slickd.js"
@@ -17,6 +17,6 @@
     "web-push": "^3.6.7"
   },
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.18.0"
   }
 }

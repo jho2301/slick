@@ -25,13 +25,23 @@
  * default the profile hands out when nobody has overridden anything.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { NotFoundError, ValidationError } from '@slick/core';
+import {
+  NotFoundError,
+  ValidationError,
+  errorCode,
+  errorMessage,
+  isRecord,
+  type JsonObject,
+} from '@slick/core';
+
+/** The environment the daemon was started with, or one a test hands over. */
+export type Env = Record<string, string | undefined>;
 
 /**
  * The profile that is `HERMES_HOME` itself. Hermes has no name for it — it is
@@ -105,13 +115,13 @@ const LOCAL_PATH = /(?<![A-Za-z0-9_:~./\\-])(?:[A-Za-z]:\\[^\s'"]*|~?(?:\/[A-Za-
 const TRAILING = /[.,;:)]+$/;
 
 /** An error message with anything key-shaped taken out of it. */
-export function redactSecrets(text) {
+export function redactSecrets(text: unknown): string {
   return String(text ?? '').replace(SECRETISH, '…');
 }
 
 /** An error message with every place on this machine taken out of it. */
-export function redactLocalPaths(text) {
-  return String(text ?? '').replace(LOCAL_PATH, (path) => `…${path.match(TRAILING)?.[0] ?? ''}`);
+export function redactLocalPaths(text: unknown): string {
+  return String(text ?? '').replace(LOCAL_PATH, (path: string) => `…${TRAILING.exec(path)?.[0] ?? ''}`);
 }
 
 /**
@@ -123,7 +133,7 @@ export function redactLocalPaths(text) {
  * is still a path. Collapsing the path whole takes the token with it, and the
  * secret pass then does its work on what is left.
  */
-export function redactForBrowser(text) {
+export function redactForBrowser(text: unknown): string {
   return redactSecrets(redactLocalPaths(text));
 }
 
@@ -143,7 +153,7 @@ export const BRIDGE_SCRIPT = join(here, 'hermes-bridge.py');
  *
  * `HERMES_HOME` wins because that is the switch Hermes itself reads.
  */
-export function hermesHome(env = process.env) {
+export function hermesHome(env: Env = process.env): string {
   const set = String(env.HERMES_HOME ?? '').trim();
   return set ? resolve(set) : join(homedir(), '.hermes');
 }
@@ -157,7 +167,7 @@ export function hermesHome(env = process.env) {
  * `get_default_hermes_root()` by recognising the shape of a profile path and
  * climbing back out of it, and so does this.
  */
-export function hermesRoot(env = process.env) {
+export function hermesRoot(env: Env = process.env): string {
   const home = hermesHome(env);
   const parent = dirname(home);
   const name = home.slice(parent.length + 1);
@@ -168,7 +178,7 @@ export function hermesRoot(env = process.env) {
   return home;
 }
 
-function badName(name) {
+function badName(name: unknown): ValidationError {
   return new ValidationError(`"${String(name).slice(0, 80)}" is not a valid Hermes profile name.`, {
     hint: 'Lower-case letters, digits, "-" or "_", and not one of Hermes\' reserved names — it is one directory under HERMES_HOME/profiles.',
   });
@@ -182,10 +192,9 @@ function badName(name) {
  * still under `home`, which is the check that survives someone widening the
  * pattern later.
  *
- * @param {string} name
- * @param {string} home  HERMES_HOME
+ * @param home  HERMES_HOME
  */
-export function profileDir(name, home) {
+export function profileDir(name: unknown, home: string): string {
   const wanted = String(name ?? '');
   if (wanted === DEFAULT_PROFILE) return resolve(home);
   if (!PROFILE_RE.test(wanted) || RESERVED_PROFILE_NAMES.has(wanted)) throw badName(wanted);
@@ -206,14 +215,21 @@ export function profileDir(name, home) {
  * will offer; a profile that has no config yet is fine, because that is what a
  * freshly created one looks like.
  */
-function configContained(dir) {
+function configContained(dir: string): boolean {
   try {
     return lstatSync(join(dir, CONFIG_FILE)).isFile();
   } catch (err) {
     // Absent is the ordinary case. Anything else — a permission wall, a
     // vanished mount — is a file this process cannot vouch for.
-    return err?.code === 'ENOENT';
+    return errorCode(err) === 'ENOENT';
   }
+}
+
+export interface HermesProfile {
+  name: string;
+  dir: string;
+  isDefault: boolean;
+  configured: boolean;
 }
 
 /**
@@ -226,18 +242,22 @@ function configContained(dir) {
  * matters because these names are writable — `profiles/self -> ..` would let a
  * save aimed at "self" land on the installation's own `config.yaml`.
  *
- * @param {string} home  HERMES_HOME
- * @returns {Array<{name: string, dir: string, isDefault: boolean, configured: boolean}>}
+ * @param home  HERMES_HOME
  */
-export function listProfiles(home) {
+export function listProfiles(home: string): HermesProfile[] {
   const root = resolve(home);
-  const found = [];
+  const found: HermesProfile[] = [];
   if (configContained(root)) {
-    found.push({ name: DEFAULT_PROFILE, dir: root, isDefault: true, configured: existsSync(join(root, CONFIG_FILE)) });
+    found.push({
+      name: DEFAULT_PROFILE,
+      dir: root,
+      isDefault: true,
+      configured: existsSync(join(root, CONFIG_FILE)),
+    });
   }
 
-  let realRoot;
-  let realProfiles;
+  let realRoot: string;
+  let realProfiles: string;
   try {
     realRoot = realpathSync(root);
     realProfiles = realpathSync(join(realRoot, 'profiles'));
@@ -247,17 +267,17 @@ export function listProfiles(home) {
   // `profiles/` may itself be a link, but not one that leaves the installation.
   if (realProfiles !== join(realRoot, 'profiles') && !realProfiles.startsWith(realRoot + sep)) return found;
 
-  let entries = [];
+  let entries;
   try {
     entries = readdirSync(realProfiles, { withFileTypes: true });
   } catch {
     return found;
   }
 
-  const named = [];
+  const named: HermesProfile[] = [];
   for (const entry of entries) {
     const name = entry.name;
-    let dir;
+    let dir: string;
     try {
       dir = profileDir(name, root); // the name rule and the reserved list, once
     } catch {
@@ -287,7 +307,7 @@ export function listProfiles(home) {
  * one would turn `PUT /api/hermes/profiles/%20/model` into a write to the
  * installation's own config. Only an omitted name means "the default".
  */
-export function getProfile(name, home) {
+export function getProfile(name: unknown, home: string): HermesProfile {
   const wanted = name == null ? DEFAULT_PROFILE : String(name);
   const profiles = listProfiles(home);
   const found = profiles.find((profile) => profile.name === wanted);
@@ -311,7 +331,7 @@ export function getProfile(name, home) {
  * it somewhere else — and is what the tests point at a throwaway interpreter,
  * so no test ever needs a real Hermes.
  */
-export function bridgePython(home, env = process.env) {
+export function bridgePython(home: string, env: Env = process.env): string {
   const override = String(env.SLICK_HERMES_PYTHON ?? '').trim();
   if (override) return override;
   const venv = join(resolve(home), 'hermes-agent', 'venv', 'bin', 'python');
@@ -358,10 +378,10 @@ const ENV_KEEP = new Set([
 /**
  * The environment one bridge run gets: this profile, and no one's secrets.
  *
- * @param {string} dir  the profile's HERMES_HOME
+ * @param dir  the profile's HERMES_HOME
  */
-export function bridgeEnvironment(dir, env = process.env) {
-  const out = {};
+export function bridgeEnvironment(dir: string, env: Env = process.env): Record<string, string> {
+  const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
     if (typeof value !== 'string') continue;
     if (ENV_KEEP.has(key) || key.startsWith('SLICK_')) out[key] = value;
@@ -379,6 +399,13 @@ export function bridgeEnvironment(dir, env = process.env) {
   return out;
 }
 
+/** What the bridge prints: a JSON object with `ok`, and a reason when not. */
+interface BridgeAnswer extends JsonObject {
+  ok?: boolean;
+  error?: string | null;
+  code?: string | null;
+}
+
 /**
  * Run the bridge and read its answer.
  *
@@ -387,15 +414,14 @@ export function bridgeEnvironment(dir, env = process.env) {
  * *answers* — the UI shows them as "unavailable, and here is why" rather than
  * inventing a provider list. Only a bridge that cannot be started at all, or
  * that prints something that is not JSON, becomes an error here.
- *
- * @param {string[]} argv
- * @param {{home: string, dir: string, env?: object, input?: object}} opts
- * @returns {Promise<{ok: boolean, error: string|null, code: string|null, [k: string]: any}>}
  */
-function callBridge(argv, { home, dir, env = process.env, input } = {}) {
+function callBridge(
+  argv: string[],
+  { home, dir, env = process.env, input }: { home: string; dir: string; env?: Env; input?: JsonObject }
+): Promise<BridgeAnswer> {
   const python = bridgePython(home, env);
   return new Promise((resolve_) => {
-    let child;
+    let child: ChildProcess;
     try {
       child = spawn(python, [BRIDGE_SCRIPT, ...argv], {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -404,7 +430,7 @@ function callBridge(argv, { home, dir, env = process.env, input } = {}) {
     } catch (err) {
       resolve_({
         ok: false,
-        error: redactForBrowser(`could not start "${python}": ${err.message}`),
+        error: redactForBrowser(`could not start "${python}": ${errorMessage(err)}`),
         code: 'bridge_unavailable',
       });
       return;
@@ -416,35 +442,39 @@ function callBridge(argv, { home, dir, env = process.env, input } = {}) {
       timedOut = true;
       child.kill('SIGKILL');
     }, BRIDGE_TIMEOUT_MS);
-    timer.unref?.();
+    timer.unref();
 
-    child.stdout.on('data', (chunk) => {
-      if (stdout.length < MAX_BRIDGE_OUTPUT) stdout += chunk;
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (stdout.length < MAX_BRIDGE_OUTPUT) stdout += String(chunk);
     });
-    child.stderr.on('data', (chunk) => {
-      if (stderr.length < 8192) stderr += chunk;
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      if (stderr.length < 8192) stderr += String(chunk);
     });
     child.on('error', (err) => {
       clearTimeout(timer);
       resolve_({
         ok: false,
-        error: redactForBrowser(`could not start "${python}": ${err.message}`),
+        error: redactForBrowser(`could not start "${python}": ${errorMessage(err)}`),
         code: 'bridge_unavailable',
       });
     });
     child.on('close', () => {
       clearTimeout(timer);
       if (timedOut) {
-        resolve_({ ok: false, error: `Hermes did not answer within ${BRIDGE_TIMEOUT_MS / 1000}s.`, code: 'bridge_timeout' });
+        resolve_({
+          ok: false,
+          error: `Hermes did not answer within ${BRIDGE_TIMEOUT_MS / 1000}s.`,
+          code: 'bridge_timeout',
+        });
         return;
       }
-      let parsed = null;
+      let parsed: unknown = null;
       try {
         parsed = JSON.parse(stdout.trim());
       } catch {
         /* not JSON */
       }
-      if (!parsed || typeof parsed !== 'object') {
+      if (!isRecord(parsed)) {
         // Whatever the interpreter said goes in the message, trimmed: a
         // traceback's last line is usually the whole diagnosis. Redacted on
         // the way, because this is the one path where text the bridge never
@@ -461,9 +491,22 @@ function callBridge(argv, { home, dir, env = process.env, input } = {}) {
       resolve_(parsed);
     });
 
-    if (input !== undefined) child.stdin.write(JSON.stringify(input));
-    child.stdin.end();
+    if (input !== undefined) child.stdin?.write(JSON.stringify(input));
+    child.stdin?.end();
   });
+}
+
+export interface EffortChoice {
+  value: string;
+  label: string;
+}
+
+export interface ProfileEfforts {
+  /** What this profile sets. */
+  effort: string | null;
+  efforts: EffortChoice[];
+  /** What its configured model actually gets, overrides included. */
+  effectiveEffort: string | null;
 }
 
 /**
@@ -476,33 +519,62 @@ function callBridge(argv, { home, dir, env = process.env, input } = {}) {
  * per-model override can make those two different facts, so they are never
  * merged here.
  */
-function effortsOf(answer) {
+function effortsOf(answer: BridgeAnswer): ProfileEfforts {
+  const efforts: EffortChoice[] = [];
+  if (Array.isArray(answer.efforts)) {
+    for (const entry of answer.efforts) {
+      if (!isRecord(entry) || typeof entry.value !== 'string' || !entry.value) continue;
+      efforts.push({ value: entry.value, label: String(entry.label ?? entry.value) });
+    }
+  }
   return {
     effort: typeof answer.effort === 'string' && answer.effort ? answer.effort : null,
-    efforts: Array.isArray(answer.efforts)
-      ? answer.efforts
-          .filter((entry) => entry && typeof entry.value === 'string' && entry.value)
-          .map((entry) => ({ value: entry.value, label: String(entry.label ?? entry.value) }))
-      : [],
+    efforts,
     effectiveEffort:
       typeof answer.effectiveEffort === 'string' && answer.effectiveEffort ? answer.effectiveEffort : null,
   };
 }
 
+export interface ProfileDefaults {
+  provider: string | null;
+  model: string | null;
+}
+
+function defaultsOf(answer: BridgeAnswer): ProfileDefaults {
+  const raw = isRecord(answer.defaults) ? answer.defaults : {};
+  return {
+    provider: typeof raw.provider === 'string' ? raw.provider : null,
+    model: typeof raw.model === 'string' ? raw.model : null,
+  };
+}
+
+export interface ProfileModel extends ProfileEfforts {
+  profile: string;
+  dir: string;
+  defaults: ProfileDefaults;
+  /** The catalog, in whatever shape Hermes reported it. */
+  providers: JsonObject[];
+  catalogError: string | null;
+  active: string | null;
+  error: string | null;
+  code: string | null;
+}
+
 /**
  * What one profile is set to, and what it could be set to instead.
- *
- * @returns {Promise<{profile: string, defaults: {provider: string|null, model: string|null},
- *                    providers: Array, error: string|null, code: string|null}>}
  */
-export async function readProfileModel(name, home, env = process.env) {
+export async function readProfileModel(
+  name: unknown,
+  home: string,
+  env: Env = process.env
+): Promise<ProfileModel> {
   const profile = getProfile(name, home);
   const answer = await callBridge(['read', '--dir', profile.dir], { home, dir: profile.dir, env });
   return {
     profile: profile.name,
     dir: profile.dir,
-    defaults: answer.defaults ?? { provider: null, model: null },
-    providers: Array.isArray(answer.providers) ? answer.providers : [],
+    defaults: defaultsOf(answer),
+    providers: Array.isArray(answer.providers) ? answer.providers.filter(isRecord) : [],
     ...effortsOf(answer),
     // A catalog that came back empty for its own reason, with the config still
     // readable. Separate from `error` because the panel can still show what the
@@ -538,6 +610,49 @@ const USAGE_TTL_MS = 60_000;
  */
 const USAGE_REFRESH_MS = 10_000;
 
+export interface UsageWindow {
+  label: string;
+  usedPercent: number | null;
+  remainingPercent: number | null;
+  resetAt: string | null;
+  detail: string | null;
+}
+
+export interface AccountUsage {
+  provider: string | null;
+  supported: boolean;
+  available: boolean;
+  title: string;
+  plan: string | null;
+  source: string | null;
+  fetchedAt: string | null;
+  windows: UsageWindow[];
+  details: string[];
+  bankedResets: number | null;
+  unavailableReason: string | null;
+}
+
+/** The cached half of an answer: what the bridge said, minus who asked. */
+export interface UsageAnswer {
+  usage: AccountUsage | null;
+  note: string | null;
+  fetchedAt: string;
+  error: string | null;
+  code: string | null;
+}
+
+export interface ProfileUsage extends UsageAnswer {
+  profile: string;
+  cached: boolean;
+  throttled: boolean;
+}
+
+interface UsageCacheEntry {
+  at: number;
+  answer: UsageAnswer | undefined;
+  inFlight?: Promise<UsageAnswer>;
+}
+
 /**
  * One entry per profile: `{ at, answer, inFlight }`.
  *
@@ -546,18 +661,18 @@ const USAGE_REFRESH_MS = 10_000;
  * not two; without it the "avoid hammering" rule holds only for requests that
  * happen to be sequential.
  */
-const usageCache = new Map();
+const usageCache = new Map<string, UsageCacheEntry>();
 
 /** Test seam: a clock, so a TTL can be tested without waiting a minute. */
-let usageNow = () => Date.now();
+let usageNow: () => number = () => Date.now();
 
 /** Drop everything remembered about account limits. For tests, and for logout. */
-export function clearUsageCache() {
+export function clearUsageCache(): void {
   usageCache.clear();
 }
 
 /** @internal Replace the clock the usage cache ages against. */
-export function setUsageClock(clock) {
+export function setUsageClock(clock: (() => number) | null | undefined): void {
   usageNow = typeof clock === 'function' ? clock : () => Date.now();
 }
 
@@ -573,12 +688,14 @@ export function setUsageClock(clock) {
  * answers with a `code` on them, because the panel has to draw *something* and
  * "not signed in" and "could not ask" are different sentences.
  *
- * @param {string} name
- * @param {string} home  HERMES_HOME
- * @param {object} env
- * @param {{refresh?: boolean}} [opts]
+ * @param home  HERMES_HOME
  */
-export async function readProfileUsage(name, home, env = process.env, { refresh = false } = {}) {
+export async function readProfileUsage(
+  name: unknown,
+  home: string,
+  env: Env = process.env,
+  { refresh = false }: { refresh?: boolean } = {}
+): Promise<ProfileUsage> {
   const profile = getProfile(name, home);
   const key = profile.dir;
   const entry = usageCache.get(key);
@@ -604,22 +721,24 @@ export async function readProfileUsage(name, home, env = process.env, { refresh 
     return { ...entry.answer, profile: profile.name, cached: true, throttled: refresh };
   }
 
-  const pending = callBridge(['usage', '--dir', profile.dir], { home, dir: profile.dir, env }).then((answer) => {
-    const shaped = {
-      // No `dir`: a path is not the panel's business, and this answer is the
-      // one most likely to be screenshotted next to a support question.
-      usage: usageOf(answer.usage),
-      note: answer.catalogError ? redactForBrowser(answer.catalogError) : null,
-      fetchedAt: new Date(usageNow()).toISOString(),
-      error: answer.ok ? null : redactForBrowser(answer.error ?? 'Hermes could not read this account.'),
-      code: answer.ok ? null : (answer.code ?? 'unavailable'),
-    };
-    // Cached either way. A failure is worth remembering for the same reason a
-    // success is: a profile that is not signed in would otherwise spawn an
-    // interpreter on every redraw to be told so again.
-    usageCache.set(key, { at: usageNow(), answer: shaped });
-    return shaped;
-  });
+  const pending = callBridge(['usage', '--dir', profile.dir], { home, dir: profile.dir, env }).then(
+    (answer) => {
+      const shaped: UsageAnswer = {
+        // No `dir`: a path is not the panel's business, and this answer is the
+        // one most likely to be screenshotted next to a support question.
+        usage: usageOf(answer.usage),
+        note: answer.catalogError ? redactForBrowser(answer.catalogError) : null,
+        fetchedAt: new Date(usageNow()).toISOString(),
+        error: answer.ok ? null : redactForBrowser(answer.error ?? 'Hermes could not read this account.'),
+        code: answer.ok ? null : (answer.code ?? 'unavailable'),
+      };
+      // Cached either way. A failure is worth remembering for the same reason a
+      // success is: a profile that is not signed in would otherwise spawn an
+      // interpreter on every redraw to be told so again.
+      usageCache.set(key, { at: usageNow(), answer: shaped });
+      return shaped;
+    }
+  );
 
   usageCache.set(key, { at: entry?.at ?? 0, answer: entry?.answer, inFlight: pending });
   try {
@@ -641,12 +760,28 @@ export async function readProfileUsage(name, home, env = process.env, { refresh 
  * and "everything the bridge said" is not a contract anybody checked. A field
  * added upstream stays out until it is named here.
  */
-function usageOf(usage) {
-  if (!usage || typeof usage !== 'object') return null;
-  const percent = (value) =>
+function usageOf(usage: unknown): AccountUsage | null {
+  if (!isRecord(usage)) return null;
+  const percent = (value: unknown): number | null =>
     typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
-  const text = (value, max = 200) =>
+  const text = (value: unknown, max = 200): string | null =>
     typeof value === 'string' && value.trim() ? redactForBrowser(value.trim()).slice(0, max) : null;
+  const windows: UsageWindow[] = (Array.isArray(usage.windows) ? usage.windows : [])
+    .slice(0, 8)
+    .map((window) => {
+      const w = isRecord(window) ? window : {};
+      return {
+        label: text(w.label, 40) ?? 'Limit',
+        usedPercent: percent(w.usedPercent),
+        remainingPercent: percent(w.remainingPercent),
+        resetAt: text(w.resetAt, 40),
+        detail: text(w.detail),
+      };
+    });
+  const details = (Array.isArray(usage.details) ? usage.details : [])
+    .slice(0, 8)
+    .map((line) => text(line, 240))
+    .filter((line): line is string => line !== null);
   return {
     provider: text(usage.provider, 64),
     supported: usage.supported === true,
@@ -655,23 +790,32 @@ function usageOf(usage) {
     plan: text(usage.plan, 64),
     source: text(usage.source, 64),
     fetchedAt: text(usage.fetchedAt, 40),
-    windows: (Array.isArray(usage.windows) ? usage.windows : []).slice(0, 8).map((window) => ({
-      label: text(window?.label, 40) ?? 'Limit',
-      usedPercent: percent(window?.usedPercent),
-      remainingPercent: percent(window?.remainingPercent),
-      resetAt: text(window?.resetAt, 40),
-      detail: text(window?.detail),
-    })),
-    details: (Array.isArray(usage.details) ? usage.details : [])
-      .slice(0, 8)
-      .map((line) => text(line, 240))
-      .filter(Boolean),
+    windows,
+    details,
     bankedResets:
       typeof usage.bankedResets === 'number' && Number.isFinite(usage.bankedResets) && usage.bankedResets >= 0
         ? Math.floor(usage.bankedResets)
         : null,
     unavailableReason: text(usage.unavailableReason, 240),
   };
+}
+
+export interface ProfileModelWrite {
+  provider: string | null;
+  model: string | null;
+  /**
+   * Tri-state: `undefined` says nothing, `null` says "leave it alone", `''`
+   * clears the level, anything else sets it.
+   */
+  effort?: string | null;
+}
+
+export interface ProfileModelWritten extends ProfileEfforts {
+  profile: string;
+  dir: string;
+  defaults: ProfileDefaults;
+  error: string | null;
+  code: string | null;
 }
 
 /**
@@ -682,7 +826,12 @@ function usageOf(usage) {
  * not serve. The bridge writes them together and reads the file back, so the
  * answer is what is now on disk rather than what was asked for.
  */
-export async function writeProfileModel(name, { provider, model, effort }, home, env = process.env) {
+export async function writeProfileModel(
+  name: unknown,
+  { provider, model, effort }: ProfileModelWrite,
+  home: string,
+  env: Env = process.env
+): Promise<ProfileModelWritten> {
   const profile = getProfile(name, home);
   const answer = await callBridge(['write', '--dir', profile.dir], {
     home,
@@ -700,7 +849,7 @@ export async function writeProfileModel(name, { provider, model, effort }, home,
   return {
     profile: profile.name,
     dir: profile.dir,
-    defaults: answer.defaults ?? { provider: null, model: null },
+    defaults: defaultsOf(answer),
     ...effortsOf(answer),
     error: answer.ok ? null : redactForBrowser(answer.error ?? 'Hermes could not be written.'),
     code: answer.ok ? null : (answer.code ?? 'unavailable'),

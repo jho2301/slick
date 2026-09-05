@@ -14,15 +14,21 @@
  * daemon rather than in the watcher: nothing about it belongs in the log.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 
 import {
   DEFAULT_ADAPTER,
   buildCommandListCall,
   buildCommandRunCall,
+  errorMessage,
+  isRecord,
   loadAdapter,
   readServeAdapter,
   supportsCommands,
+  type AgentSession,
+  type Adapter,
+  type CommandCall,
+  type Workspace,
 } from '@slick/core';
 
 /** Long enough for a cold interpreter, short enough not to hold a request. */
@@ -35,25 +41,54 @@ const LIST_TTL_MS = 10 * 60 * 1000;
 /** As much output as is worth showing in a line above the composer. */
 const MAX_OUTPUT = 20_000;
 
+/** One entry as the composer wants it. */
+export interface CommandEntry {
+  name: string;
+  summary: string;
+  args: string;
+  aliases: string[];
+  /** A Slick-side picker to open instead of running the command as typed. */
+  picker?: string | null;
+  /** What the agent says about running this one here; anything but "run" is shown, not offered. */
+  where: string;
+}
+
+export interface CommandList {
+  commands: CommandEntry[];
+  error: string | null;
+  checkedAt: number | null;
+}
+
+export interface CommandOutput {
+  command: string;
+  output: string;
+  error: string | null;
+}
+
+interface RunResult {
+  ok: boolean;
+  output: string;
+  error: string | null;
+}
+
 /** adapter name -> {at, commands} */
-const listCache = new Map();
+const listCache = new Map<string, { at: number; commands: CommandEntry[] }>();
 
 /**
  * Run one call and collect what it printed. Never throws: a command that will
  * not start is a message to show, not a failed request.
- *
- * @returns {Promise<{ok: boolean, output: string, error: string|null}>}
  */
-function run(call, timeoutMs) {
+function run(call: CommandCall, timeoutMs: number): Promise<RunResult> {
   return new Promise((resolve) => {
-    let child;
+    const cmd = call.cmd ?? '';
+    let child: ChildProcess;
     try {
-      child = spawn(call.cmd, call.args, {
+      child = spawn(cmd, call.args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: call.cwd ?? undefined,
       });
     } catch (err) {
-      resolve({ ok: false, output: '', error: `could not start "${call.cmd}": ${err.message}` });
+      resolve({ ok: false, output: '', error: `could not start "${cmd}": ${errorMessage(err)}` });
       return;
     }
     let stdout = '';
@@ -63,18 +98,22 @@ function run(call, timeoutMs) {
       timedOut = true;
       child.kill('SIGKILL');
     }, timeoutMs);
-    timer.unref?.();
+    timer.unref();
 
-    child.stdout.on('data', (chunk) => (stdout += chunk));
-    child.stderr.on('data', (chunk) => (stderr += chunk));
+    child.stdout?.on('data', (chunk: Buffer | string) => (stdout += String(chunk)));
+    child.stderr?.on('data', (chunk: Buffer | string) => (stderr += String(chunk)));
     child.on('error', (err) => {
       clearTimeout(timer);
-      resolve({ ok: false, output: '', error: `could not start "${call.cmd}": ${err.message}` });
+      resolve({ ok: false, output: '', error: `could not start "${cmd}": ${errorMessage(err)}` });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
       if (timedOut) {
-        resolve({ ok: false, output: '', error: `${call.cmd} did not answer within ${Math.round(timeoutMs / 1000)}s` });
+        resolve({
+          ok: false,
+          output: '',
+          error: `${cmd} did not answer within ${Math.round(timeoutMs / 1000)}s`,
+        });
         return;
       }
       const text = stdout.trim().slice(0, MAX_OUTPUT);
@@ -86,7 +125,7 @@ function run(call, timeoutMs) {
 }
 
 /** The adapter behind a session, as its watcher last recorded it. */
-function adapterFor(ws, session) {
+function adapterFor(ws: Workspace, session: AgentSession): Adapter {
   return loadAdapter(readServeAdapter(session.state) ?? DEFAULT_ADAPTER, ws.home);
 }
 
@@ -94,10 +133,12 @@ function adapterFor(ws, session) {
  * One entry as the composer wants it. Anything the agent does not say is
  * simply absent — Slick does not fill in a description it does not have.
  */
-function normalizeEntry(raw) {
+function normalizeEntry(raw: unknown): CommandEntry | null {
   if (typeof raw === 'string') return { name: raw, summary: '', args: '', aliases: [], where: 'run' };
-  if (!raw || typeof raw !== 'object') return null;
-  const name = String(raw.name ?? '').trim().replace(/^\//, '');
+  if (!isRecord(raw)) return null;
+  const name = String(raw.name ?? '')
+    .trim()
+    .replace(/^\//, '');
   if (!name || !/^[a-z0-9][a-z0-9._:-]{0,63}$/i.test(name)) return null;
   return {
     name,
@@ -116,10 +157,8 @@ function normalizeEntry(raw) {
 
 /**
  * What this session's agent says it can be asked.
- *
- * @returns {Promise<{commands: Array, error: string|null, checkedAt: number|null}>}
  */
-export async function listCommands(ws, ref, { force = false } = {}) {
+export async function listCommands(ws: Workspace, ref: string, { force = false } = {}): Promise<CommandList> {
   const session = ws.agents.get(ref);
   const adapter = adapterFor(ws, session);
   if (!supportsCommands(adapter)) return { commands: [], error: null, checkedAt: null };
@@ -129,34 +168,47 @@ export async function listCommands(ws, ref, { force = false } = {}) {
     return { commands: cached.commands, error: null, checkedAt: cached.at };
   }
 
-  const call = buildCommandListCall(adapter, adapter.cmd);
+  const call = buildCommandListCall(adapter, adapter.cmd ?? '');
+  if (!call) return { commands: [], error: null, checkedAt: null };
   const result = await run(call, LIST_TIMEOUT_MS);
-  if (!result.ok) return { commands: cached?.commands ?? [], error: result.error, checkedAt: cached?.at ?? null };
+  if (!result.ok)
+    return { commands: cached?.commands ?? [], error: result.error, checkedAt: cached?.at ?? null };
 
-  let parsed;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(result.output);
   } catch {
-    return { commands: cached?.commands ?? [], error: 'the command list was not JSON', checkedAt: cached?.at ?? null };
+    return {
+      commands: cached?.commands ?? [],
+      error: 'the command list was not JSON',
+      checkedAt: cached?.at ?? null,
+    };
   }
-  const rows = Array.isArray(parsed) ? parsed : (parsed?.commands ?? []);
-  const commands = (Array.isArray(rows) ? rows : []).map(normalizeEntry).filter(Boolean).slice(0, 500);
+  const rows: unknown = Array.isArray(parsed) ? parsed : isRecord(parsed) ? (parsed.commands ?? []) : [];
+  const commands = (Array.isArray(rows) ? rows : [])
+    .map(normalizeEntry)
+    .filter((entry): entry is CommandEntry => entry !== null)
+    .slice(0, 500);
   listCache.set(adapter.name, { at: Date.now(), commands });
   return { commands, error: null, checkedAt: Date.now() };
 }
 
 /**
  * Run one, and hand back what it said.
- *
- * @returns {Promise<{command: string, output: string, error: string|null}>}
  */
-export async function runCommand(ws, ref, { command, args = '' } = {}) {
+export async function runCommand(
+  ws: Workspace,
+  ref: string,
+  { command, args = '' }: { command?: unknown; args?: unknown } = {}
+): Promise<CommandOutput> {
   const session = ws.agents.get(ref);
   const adapter = adapterFor(ws, session);
-  const name = String(command ?? '').trim().replace(/^\//, '');
+  const name = String(command ?? '')
+    .trim()
+    .replace(/^\//, '');
   if (!name) return { command: '', output: '', error: 'No command to run.' };
 
-  const call = buildCommandRunCall(adapter, adapter.cmd, { command: name, args: String(args ?? '') });
+  const call = buildCommandRunCall(adapter, adapter.cmd ?? '', { command: name, args: String(args ?? '') });
   if (!call) {
     return { command: name, output: '', error: `The "${adapter.name}" adapter cannot run commands.` };
   }

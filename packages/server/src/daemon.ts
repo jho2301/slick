@@ -11,61 +11,86 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
 import { paths } from '@slick/core/paths';
+import { errorCode, isRecord, type JsonObject } from '@slick/core';
 
 const here = dirname(fileURLToPath(import.meta.url));
+/** The daemon's entry point. A `.js` shim, so the file name never changes. */
 export const SLICKD_ENTRY = resolve(here, '../bin/slickd.js');
 
-export function readDaemonFile(home) {
+/** What `slickd` writes down about itself. */
+export interface DaemonInfo {
+  pid: number;
+  version: string;
+  url: string;
+  host: string;
+  port: number;
+  token: string | null;
+  home: string;
+  db: string;
+  webRoot: string | null;
+  startedAt: number;
+}
+
+/** A daemon that answered, or one that only left a file behind. */
+export type DaemonStatus =
+  | ({ running: true; health: JsonObject } & DaemonInfo)
+  | ({ running: false; stale?: boolean } & Partial<DaemonInfo>);
+
+export function readDaemonFile(home?: string | null): DaemonInfo | null {
   const file = paths(home).daemonFile;
   if (!existsSync(file)) return null;
   try {
-    return JSON.parse(readFileSync(file, 'utf8'));
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    return isRecord(parsed) ? (parsed as unknown as DaemonInfo) : null;
   } catch {
     return null;
   }
 }
 
-export function writeDaemonFile(home, info) {
+export function writeDaemonFile(home: string | null | undefined, info: DaemonInfo): DaemonInfo {
   const p = paths(home);
   mkdirSync(p.root, { recursive: true });
   writeFileSync(p.daemonFile, `${JSON.stringify(info, null, 2)}\n`, { mode: 0o600 });
   return info;
 }
 
-export function clearDaemonFile(home) {
+export function clearDaemonFile(home?: string | null): void {
   rmSync(paths(home).daemonFile, { force: true });
 }
 
-function pidAlive(pid) {
+function pidAlive(pid: number | undefined): boolean {
   if (!pid) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return err.code === 'EPERM';
+    return errorCode(err) === 'EPERM';
   }
 }
 
-/** @param {{url: string, token?: string|null, timeoutMs?: number}} target */
-export async function ping(target) {
+export interface PingTarget {
+  url: string;
+  token?: string | null;
+  timeoutMs?: number;
+}
+
+export async function ping(target: PingTarget): Promise<JsonObject | null> {
   try {
     const res = await fetch(`${target.url}/api/health`, {
       headers: target.token ? { authorization: `Bearer ${target.token}` } : {},
       signal: AbortSignal.timeout(target.timeoutMs ?? 1500),
     });
     if (!res.ok) return null;
-    return await res.json();
+    const body: unknown = await res.json();
+    return isRecord(body) ? body : null;
   } catch {
     return null;
   }
 }
 
-/**
- * @param {string} [home]
- * @returns {Promise<{running: boolean, stale?: boolean} & Record<string, any>>}
- */
-export async function daemonStatus(home) {
+export async function daemonStatus(home?: string | null): Promise<DaemonStatus> {
   const info = readDaemonFile(home);
   if (!info) return { running: false };
   const health = await ping(info);
@@ -74,13 +99,22 @@ export async function daemonStatus(home) {
   return { running: false, stale, ...info };
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export interface StartDaemonOptions {
+  home?: string | null;
+  port?: number;
+  host?: string;
+  webRoot?: string;
+  timeoutMs?: number;
+}
+
+export type StartedDaemon = DaemonStatus & { alreadyRunning?: boolean; started?: boolean };
 
 /**
  * Start the daemon in the background and wait until it answers.
- * @param {{home?: string, port?: number, host?: string, webRoot?: string, timeoutMs?: number}} [opts]
  */
-export async function startDaemon(opts = {}) {
+export async function startDaemon(opts: StartDaemonOptions = {}): Promise<StartedDaemon> {
   const home = opts.home;
   const existing = await daemonStatus(home);
   if (existing.running) return { ...existing, alreadyRunning: true };
@@ -111,15 +145,22 @@ export async function startDaemon(opts = {}) {
   while (Date.now() < deadline) {
     await sleep(120);
     const status = await daemonStatus(home);
-    if (status.running) return { ...status, started: true, pid: status.pid ?? child.pid };
+    if (status.running) return { ...status, started: true, pid: status.pid ?? child.pid ?? 0 };
   }
   throw new Error(
     `The daemon did not come up within ${(opts.timeoutMs ?? 10_000) / 1000}s. See ${p.daemonLog}`
   );
 }
 
-/** @param {{home?: string, timeoutMs?: number}} [opts] */
-export async function stopDaemon(opts = {}) {
+export interface StopResult {
+  stopped: boolean;
+  reason?: string;
+  pid?: number;
+}
+
+export async function stopDaemon(
+  opts: { home?: string | null; timeoutMs?: number } = {}
+): Promise<StopResult> {
   const info = readDaemonFile(opts.home);
   if (!info) return { stopped: false, reason: 'not running' };
   if (!pidAlive(info.pid)) {
@@ -129,7 +170,7 @@ export async function stopDaemon(opts = {}) {
   try {
     process.kill(info.pid, 'SIGTERM');
   } catch (err) {
-    if (err.code !== 'ESRCH') throw err;
+    if (errorCode(err) !== 'ESRCH') throw err;
   }
   const deadline = Date.now() + (opts.timeoutMs ?? 5000);
   while (Date.now() < deadline) {
@@ -148,7 +189,7 @@ export async function stopDaemon(opts = {}) {
 }
 
 /** Status, starting the daemon first if it is not already up. */
-export async function ensureDaemon(opts = {}) {
+export async function ensureDaemon(opts: StartDaemonOptions = {}): Promise<StartedDaemon> {
   const status = await daemonStatus(opts.home);
   if (status.running) return status;
   return startDaemon(opts);

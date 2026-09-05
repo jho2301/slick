@@ -7,10 +7,15 @@
 
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { dirname, extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const MIME = {
+import { isRecord } from '@slick/core';
+
+import { safeDecode } from './http.ts';
+
+const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8',
@@ -22,22 +27,39 @@ const MIME = {
   '.jpg': 'image/jpeg',
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
   '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.txt': 'text/plain; charset=utf-8',
   '.map': 'application/json; charset=utf-8',
 };
 
+/**
+ * Where the bundler puts content-hashed files. Their names change when their
+ * bytes do, so a browser may keep them for as long as it likes; everything
+ * else — the shell, the worker, the manifest — is what points at them and has
+ * to be re-asked for every time.
+ */
+const IMMUTABLE_PREFIX = '/assets/';
+
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** Find the UI whether we run from the repo, a workspace symlink, or a bundle. */
-export function resolveWebRoot(explicit) {
+/**
+ * Find the UI whether we run from the repo or from a build.
+ *
+ * The built bundle in `packages/server/public` wins over the source tree, so a
+ * checkout that has been built serves the build and one that has not falls
+ * back to whatever the web app's directory holds.
+ */
+export function resolveWebRoot(explicit?: string | null): string | null {
   const candidates = [
     explicit,
     process.env.SLICK_WEB_ROOT,
     resolve(here, '../public'),
     resolve(here, '../../../apps/web'),
-    resolve(here, '../../../../apps/web'),
-  ].filter(Boolean);
+  ];
   for (const candidate of candidates) {
+    if (!candidate) continue;
     if (existsSync(join(candidate, 'index.html'))) return resolve(candidate);
   }
   return null;
@@ -57,14 +79,15 @@ export function resolveWebRoot(explicit) {
  * This is not a wider exposure than the manifest already was: it 401s like
  * everything else, so only a caller that could already read the token gets it.
  *
- * @returns {string|null} JSON, or null if there is no manifest to serve
+ * @returns JSON, or null if there is no manifest to serve
  */
-export function manifestWithToken(webRoot, token) {
+export function manifestWithToken(webRoot: string | null, token: string | null): string | null {
   if (!webRoot || !token) return null;
   const file = join(resolve(webRoot), 'manifest.webmanifest');
   if (!existsSync(file)) return null;
   try {
-    const manifest = JSON.parse(readFileSync(file, 'utf8'));
+    const manifest: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    if (!isRecord(manifest)) return null;
     // Relative, so it keeps working whatever port the daemon came up on, and
     // stays inside `scope` — a start_url outside it is not installable.
     manifest.start_url = `./?token=${encodeURIComponent(token)}`;
@@ -83,7 +106,7 @@ export function manifestWithToken(webRoot, token) {
  * files are read off local disk, and the question is only "is this the same
  * build I already have".
  */
-export function buildStamp(webRoot) {
+export function buildStamp(webRoot: string | null): string | null {
   if (!webRoot) return null;
   const root = resolve(webRoot);
   if (!existsSync(root)) return null;
@@ -99,7 +122,7 @@ export function buildStamp(webRoot) {
       continue; // vanished between the listing and the stat — not part of a build
     }
     if (stat.isDirectory()) continue;
-    hash.update(`${entry}:${stat.size}:${Math.round(stat.mtimeMs)}\n`);
+    hash.update(`${String(entry)}:${stat.size}:${Math.round(stat.mtimeMs)}\n`);
   }
   return hash.digest('hex').slice(0, 10);
 }
@@ -113,9 +136,9 @@ export function buildStamp(webRoot) {
  * on that for weeks. Folding the stamp in makes any change to the UI a change
  * to the worker, which is the one thing browsers do check for on their own.
  *
- * @returns {string|null} the source, or null if there is no worker to serve
+ * @returns the source, or null if there is no worker to serve
  */
-export function serviceWorkerWithBuild(webRoot, stamp) {
+export function serviceWorkerWithBuild(webRoot: string | null, stamp: string | null): string | null {
   if (!webRoot || !stamp) return null;
   const file = join(resolve(webRoot), 'sw.js');
   if (!existsSync(file)) return null;
@@ -129,15 +152,17 @@ export function serviceWorkerWithBuild(webRoot, stamp) {
   }
 }
 
-export function createStaticHandler(webRoot) {
+export type StaticHandler = (req: IncomingMessage, res: ServerResponse, pathname: string) => boolean;
+
+export function createStaticHandler(webRoot: string | null): StaticHandler {
   const root = webRoot ? resolve(webRoot) : null;
 
   /**
-   * @returns {boolean} true when the request was handled
+   * @returns true when the request was handled
    */
-  return function serve(req, res, pathname) {
+  return function serve(_req, res, pathname) {
     if (!root) return false;
-    const relative = normalize(decodeURIComponent(pathname)).replace(/^(\.\.[/\\])+/, '');
+    const relative = normalize(safeDecode(pathname)).replace(/^(\.\.[/\\])+/, '');
     let file = join(root, relative === '/' || relative === '\\' ? 'index.html' : relative);
     if (!file.startsWith(root)) return false;
 
@@ -150,10 +175,11 @@ export function createStaticHandler(webRoot) {
     }
 
     const stat = statSync(file);
+    const immutable = pathname.startsWith(IMMUTABLE_PREFIX) && file !== join(root, 'index.html');
     res.writeHead(200, {
       'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
       'content-length': stat.size,
-      'cache-control': 'no-cache',
+      'cache-control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
     });
     createReadStream(file).pipe(res);
     return true;
