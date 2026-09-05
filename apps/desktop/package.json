@@ -9,8 +9,8 @@
     "start": "electron ."
   },
   "dependencies": {
-    "@slick/core": "0.1.0",
-    "@slick/server": "0.1.0"
+    "@slick/core": "^0.5.0",
+    "@slick/server": "^0.5.0"
   },
   "devDependencies": {
     "electron": "^43.0.0"
