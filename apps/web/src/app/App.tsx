@@ -6,7 +6,8 @@
 import { useAtomValue } from 'jotai';
 import { useEffect } from 'react';
 
-import { clearUnread, closePalette, openPalette, toggleRail } from './actions.ts';
+import { clearUnread } from './data.ts';
+import { closePalette, openPalette, toggleRail } from './layout-actions.ts';
 import {
   channelRevealedAtom,
   currentChannelAtom,

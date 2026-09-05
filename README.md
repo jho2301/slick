@@ -546,7 +546,8 @@ Source directories follow the responsibilities inside each workspace:
 apps/web/src/
   app/                  application shell, shared state, navigation, and live events
   features/
-    messages/           channels, threads, composer, message rendering, and helpers
+    channels/           channel and category management dialogs
+    messages/           channel state, threads, composer, commands, and message rendering
     thinking/           thinking display and its UI state
     hermes/             profile, model, and usage UI with its helpers and store
     search/             search palette
@@ -567,7 +568,10 @@ packages/server/src/
 ```
 
 Keep feature components and their helpers together. Application-wide orchestration
-belongs in `app/`; reusable infrastructure belongs in `shared/`. Each workspace
+belongs in `app/`; reusable infrastructure belongs in `shared/`. Startup lives in
+`app/boot.ts`, refreshers in `app/data.ts`, and feature actions beside their
+components. Import actions from their owning module so features do not depend
+on application startup or a shared action barrel. Each workspace
 keeps its tests in `test/` and executable shims in `bin/` where needed. Core domain
 modules stay in `packages/core/src/`, and CLI handlers stay in
 `packages/cli/src/commands/`. Package names and public exports remain the stable

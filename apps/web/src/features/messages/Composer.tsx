@@ -9,7 +9,7 @@
 
 import { useEffect, useRef, useState, type KeyboardEvent, type SyntheticEvent } from 'react';
 
-import { runSlashCommand } from '../../app/actions.ts';
+import { runSlashCommand } from './command-actions.ts';
 import {
   COMMAND_LINE_RE,
   commandMatches,

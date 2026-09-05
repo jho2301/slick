@@ -6,16 +6,11 @@ import type { Message } from '@slick/core';
 import { useAtomValue } from 'jotai';
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 
-import {
-  deleteChannel,
-  editChannel,
-  loadCommands,
-  loadOlder,
-  scrollToBottom,
-  send,
-  toggleArchive,
-  toggleRail,
-} from '../../app/actions.ts';
+import { deleteChannel, editChannel, toggleArchive } from '../channels/actions.ts';
+import { loadCommands } from './command-actions.ts';
+import { loadOlder, scrollToBottom } from './channel-state.ts';
+import { send } from './actions.ts';
+import { toggleRail } from '../../app/layout-actions.ts';
 import {
   atBottomAtom,
   bootErrorAtom,

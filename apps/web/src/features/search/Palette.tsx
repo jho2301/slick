@@ -6,7 +6,8 @@ import type { Message } from '@slick/core';
 import { useAtomValue } from 'jotai';
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 
-import { closePalette, flashMessage, selectChannel } from '../../app/actions.ts';
+import { closePalette } from '../../app/layout-actions.ts';
+import { flashMessage, selectChannel } from '../messages/channel-state.ts';
 import { channelsAtom, paletteOpenAtom } from '../../app/atoms.ts';
 import { highlight } from '../../shared/lib/format.ts';
 import { openThread } from '../../app/navigation.ts';

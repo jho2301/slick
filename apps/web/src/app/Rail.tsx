@@ -7,14 +7,9 @@ import type { Category, Channel } from '@slick/core';
 import { useAtomValue } from 'jotai';
 import { useState, type DragEvent } from 'react';
 
-import {
-  editCategory,
-  moveChannel,
-  openPalette,
-  openSettings,
-  selectChannel,
-  toggleCategory,
-} from './actions.ts';
+import { editCategory, moveChannel, toggleCategory } from '../features/channels/actions.ts';
+import { openPalette, openSettings } from './layout-actions.ts';
+import { selectChannel } from '../features/messages/channel-state.ts';
 import {
   categoriesAtom,
   channelsAtom,

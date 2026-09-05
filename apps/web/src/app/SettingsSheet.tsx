@@ -6,7 +6,8 @@
 import { useAtomValue } from 'jotai';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 
-import { closeSettings, createCategory, createChannel } from './actions.ts';
+import { closeSettings } from './layout-actions.ts';
+import { createCategory, createChannel } from '../features/channels/actions.ts';
 import { settingsOpenAtom, versionAtom, workspaceAtom } from './atoms.ts';
 import { currentSubscription, disablePush, enablePush, pushSupported } from '../pwa/push.ts';
 import { api, store } from './store.ts';

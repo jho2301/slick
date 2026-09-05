@@ -9,7 +9,8 @@
 import { Provider } from 'jotai';
 import { createRoot } from 'react-dom/client';
 
-import { boot, goTo } from './app/actions.ts';
+import { boot } from './app/boot.ts';
+import { goTo } from './app/deep-links.ts';
 import { App } from './app/App.tsx';
 import { store } from './app/store.ts';
 import { bootstrapServiceWorker } from './pwa/sw-bootstrap.ts';

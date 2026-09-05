@@ -10,7 +10,8 @@
 
 import type { HydratedEvent, Message } from '@slick/core';
 
-import { bumpUnread, loadMessages, refreshCategories, refreshChannels, refreshSessions } from './actions.ts';
+import { bumpUnread, refreshCategories, refreshChannels, refreshSessions } from './data.ts';
+import { loadMessages } from '../features/messages/channel-state.ts';
 import {
   atBottomAtom,
   channelsAtom,

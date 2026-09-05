@@ -7,7 +7,8 @@ import type { Message } from '@slick/core';
 import { useAtomValue } from 'jotai';
 import { useEffect, useLayoutEffect, useRef, type KeyboardEvent, type PointerEvent } from 'react';
 
-import { loadCommands, sendThreadReply } from '../../app/actions.ts';
+import { loadCommands } from './command-actions.ts';
+import { sendThreadReply } from './actions.ts';
 import { commandsAtom, sessionsAtom, streamingActiveAtom, threadAtom, typingAtom } from '../../app/atoms.ts';
 import { agentSuggestions } from './sessions.ts';
 import { closeThread } from '../../app/navigation.ts';

@@ -7,7 +7,7 @@ import type { Author, Message } from '@slick/core';
 import { useAtomValue } from 'jotai';
 import { memo, useEffect, useMemo, useRef } from 'react';
 
-import { copyId, removeMessage, saveEdit } from '../../app/actions.ts';
+import { copyId, removeMessage, saveEdit } from './actions.ts';
 import {
   badgeSessionsAtom,
   editingAtom,
