@@ -5,7 +5,7 @@
  * process or a workspace.
  */
 
-import { test, describe } from 'node:test';
+import { test, describe } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
@@ -28,7 +28,7 @@ import {
   buildCommandRunCall,
   splitMessageText,
   supportsResume,
-} from '../src/index.js';
+} from '../src/index.ts';
 
 const { claude, plain } = BUILT_IN_ADAPTERS;
 
@@ -99,7 +99,13 @@ describe('reading an agent’s reply', () => {
     const reply = parseAgentReply(claude, {
       stdout: JSON.stringify({ result: 'done', session_id: 's-9', modelUsage: { 'claude-opus-4': {} } }),
     });
-    assert.deepEqual(reply, { text: 'done', sessionId: 's-9', model: 'claude-opus-4', effort: null, error: null });
+    assert.deepEqual(reply, {
+      text: 'done',
+      sessionId: 's-9',
+      model: 'claude-opus-4',
+      effort: null,
+      error: null,
+    });
   });
 
   test('an agent that reports an error is a failure even when it exits 0', () => {
@@ -112,8 +118,11 @@ describe('reading an agent’s reply', () => {
   });
 
   test('an empty answer is a failure, not an answer nobody can post', () => {
-    const reply = parseAgentReply(claude, { stdout: JSON.stringify({ result: '  ', session_id: 's-9' }), cmd: 'x' });
-    assert.match(reply.error, /empty answer/);
+    const reply = parseAgentReply(claude, {
+      stdout: JSON.stringify({ result: '  ', session_id: 's-9' }),
+      cmd: 'x',
+    });
+    assert.match(reply.error!, /empty answer/);
   });
 
   test('output that is not the JSON we hoped for is still read as an answer', () => {
@@ -135,7 +144,10 @@ describe('reading an agent’s reply', () => {
   test('a non-zero exit is reported with whatever it said on the way out', () => {
     const reply = parseAgentReply(plain, { stdout: '', stderr: 'no such model', code: 1, cmd: 'agent' });
     assert.equal(reply.error, 'no such model');
-    assert.equal(parseAgentReply(plain, { stdout: '', code: 3, cmd: 'agent' }).error, 'agent exited with code 3');
+    assert.equal(
+      parseAgentReply(plain, { stdout: '', code: 3, cmd: 'agent' }).error,
+      'agent exited with code 3'
+    );
   });
 
   test('reply field names are the adapter’s to choose, nested ones included', () => {
@@ -178,21 +190,38 @@ describe('values that are not one flag one value', () => {
   });
 
   test('a value of another shape takes the other branch', () => {
-    assert.deepEqual(buildAgentArgs(split, { prompt: 'hi', model: 'gpt-5.4' }), ['-q', 'hi', '-m', 'gpt-5.4']);
+    assert.deepEqual(buildAgentArgs(split, { prompt: 'hi', model: 'gpt-5.4' }), [
+      '-q',
+      'hi',
+      '-m',
+      'gpt-5.4',
+    ]);
   });
 
   test('with no other branch, a value that does not match leaves the group out', () => {
     const strict = normalizeAdapter(
-      { cmd: 'x', args: { prompt: ['-q', '{prompt}'], model: { match: '^local:(.+)$', args: ['--weights', '{1}'] } } },
+      {
+        cmd: 'x',
+        args: { prompt: ['-q', '{prompt}'], model: { match: '^local:(.+)$', args: ['--weights', '{1}'] } },
+      },
       { name: 'strict', source: 'built-in' }
     );
-    assert.deepEqual(buildAgentArgs(strict, { prompt: 'hi', model: 'local:qwen.gguf' }), ['-q', 'hi', '--weights', 'qwen.gguf']);
+    assert.deepEqual(buildAgentArgs(strict, { prompt: 'hi', model: 'local:qwen.gguf' }), [
+      '-q',
+      'hi',
+      '--weights',
+      'qwen.gguf',
+    ]);
     assert.deepEqual(buildAgentArgs(strict, { prompt: 'hi', model: 'gpt-5.4' }), ['-q', 'hi']);
   });
 
   test('a group that is an object without a match is refused', () => {
     assert.throws(
-      () => normalizeAdapter({ cmd: 'x', args: { prompt: ['{prompt}'], model: { args: ['-m'] } } }, { name: 'x', source: '/tmp/x.json' }),
+      () =>
+        normalizeAdapter(
+          { cmd: 'x', args: { prompt: ['{prompt}'], model: { args: ['-m'] } } },
+          { name: 'x', source: '/tmp/x.json' }
+        ),
       /needs a "match" pattern/
     );
   });
@@ -213,7 +242,13 @@ describe('reading a reply that is not JSON', () => {
       stdout: 'the answer\n',
       stderr: '↻ Resumed session old-1 (2 messages)\n\nsession_id: 20260824_120000_abc\n',
     });
-    assert.deepEqual(reply, { text: 'the answer', sessionId: '20260824_120000_abc', model: null, effort: null, error: null });
+    assert.deepEqual(reply, {
+      text: 'the answer',
+      sessionId: '20260824_120000_abc',
+      model: null,
+      effort: null,
+      error: null,
+    });
   });
 
   test('`from` says which stream to believe', () => {
@@ -229,7 +264,7 @@ describe('reading a reply that is not JSON', () => {
       cmd: 'hermes',
     });
     assert.equal(reply.sessionId, 'sess-9');
-    assert.match(reply.error, /provider unreachable/);
+    assert.match(reply.error!, /provider unreachable/);
   });
 
   test('naming a JSON field on a text reply is refused, with the fix in the hint', () => {
@@ -244,7 +279,7 @@ describe('reading a reply that is not JSON', () => {
   });
 });
 describe('adapter manifests', () => {
-  const bad = (raw, pattern) => {
+  const bad = (raw: unknown, pattern: RegExp) => {
     assert.throws(() => normalizeAdapter(raw, { name: 'x', source: '/tmp/x.json' }), pattern);
   };
 
@@ -264,8 +299,8 @@ describe('adapter manifests', () => {
 });
 
 describe('finding adapters', () => {
-  let home;
-  const write = (name, body) => writeFileSync(join(home, 'adapters', `${name}.json`), body);
+  let home: string;
+  const write = (name: string, body: string) => writeFileSync(join(home, 'adapters', `${name}.json`), body);
 
   test('a file wins over a built-in of the same name', () => {
     home = mkdtempSync(join(tmpdir(), 'slick-adapters-'));
@@ -283,14 +318,18 @@ describe('finding adapters', () => {
   test('a manifest that does not parse costs you that adapter, not the list', () => {
     write('broken', '{ this is not json');
     const found = listAdapters(home);
-    assert.match(found.find((a) => a.name === 'broken').error, /not valid JSON/);
-    assert.ok(found.find((a) => a.name === 'plain'), 'the others are still listed');
+    assert.match(found.find((a) => a.name === 'broken')!.error!, /not valid JSON/);
+    assert.ok(
+      found.find((a) => a.name === 'plain'),
+      'the others are still listed'
+    );
     rmSync(home, { recursive: true, force: true });
   });
 });
 
 describe('splitting an answer too long to post', () => {
-  const fits = (pieces, cap) => pieces.every((piece) => piece.length <= cap && piece.trim().length > 0);
+  const fits = (pieces: string[], cap: number) =>
+    pieces.every((piece) => piece.length <= cap && piece.trim().length > 0);
 
   test('anything that already fits comes back untouched', () => {
     assert.deepEqual(splitMessageText('hello'), ['hello']);
@@ -315,7 +354,7 @@ describe('splitting an answer too long to post', () => {
       assert.equal(fences.length % 2, 0, `a piece renders as half a fence:\n${piece}`);
     }
     assert.equal(
-      pieces.join('\n').match(/const a\d+ = /g).length,
+      pieces.join('\n').match(/const a\d+ = /g)!.length,
       code.length,
       'every line of code is still there'
     );
@@ -335,10 +374,10 @@ describe('splitting an answer too long to post', () => {
 });
 
 describe('asking the agent’s own store which model ran', () => {
-  let home;
-  let store;
+  let home: string;
+  let store: string;
 
-  const adapter = (model) =>
+  const adapter = (model: Record<string, unknown>) =>
     normalizeAdapter(
       { cmd: 'x', args: { prompt: ['{prompt}'] }, reply: { format: 'text', model } },
       { name: 'x', source: '/tmp/x.json' }
@@ -364,7 +403,11 @@ describe('asking the agent’s own store which model ran', () => {
       pattern: '([^/\\\\]+?)(?:\\.(?:gguf|safetensors))?$',
     });
     assert.equal(lookupReported(trimmed, { sessionId: 'sess-2' }), 'Qwen3.8-27B');
-    assert.equal(lookupReported(trimmed, { sessionId: 'sess-1' }), 'gpt-5.6-luna', 'and leaves a plain name alone');
+    assert.equal(
+      lookupReported(trimmed, { sessionId: 'sess-1' }),
+      'gpt-5.6-luna',
+      'and leaves a plain name alone'
+    );
   });
 
   test('nothing to find is no badge, never a failed answer', () => {
@@ -372,18 +415,26 @@ describe('asking the agent’s own store which model ran', () => {
     assert.equal(lookupReported(found, { sessionId: 'never-existed' }), null);
     assert.equal(lookupReported(found, { sessionId: null }), null, 'no id, nothing to bind');
 
-    const gone = adapter({ sqlite: join(home, 'not-here.db'), query: 'SELECT model FROM sessions WHERE id = ?' });
+    const gone = adapter({
+      sqlite: join(home, 'not-here.db'),
+      query: 'SELECT model FROM sessions WHERE id = ?',
+    });
     assert.equal(lookupReported(gone, { sessionId: 'sess-1' }), null);
 
     const wrongTable = adapter({ sqlite: store, query: 'SELECT model FROM runs WHERE id = ?' });
     assert.equal(lookupReported(wrongTable, { sessionId: 'sess-1' }), null);
 
-    assert.equal(lookupReported(BUILT_IN_ADAPTERS.claude, { sessionId: 'sess-1' }), null, 'no lookup, no query');
+    assert.equal(
+      lookupReported(BUILT_IN_ADAPTERS.claude, { sessionId: 'sess-1' }),
+      null,
+      'no lookup, no query'
+    );
     rmSync(home, { recursive: true, force: true });
   });
 
   test('it stays a lookup: one SELECT, one bind, and never the session id', () => {
-    const bad = (model, pattern) => assert.throws(() => adapter(model), pattern);
+    const bad = (model: Record<string, unknown>, pattern: RegExp) =>
+      assert.throws(() => adapter(model), pattern);
     bad({ sqlite: '/tmp/x.db', query: 'DELETE FROM sessions' }, /must be a single SELECT/);
     bad({ sqlite: '/tmp/x.db', query: 'SELECT 1; DROP TABLE sessions' }, /must be a single SELECT/);
     bad({ sqlite: '/tmp/x.db', query: 'SELECT model FROM s WHERE a = ? AND b = ?' }, /at most one "\?"/);
@@ -424,8 +475,12 @@ describe('asking the agent’s own store which model ran', () => {
       },
       { name: 'x', source: '/tmp/x.json' }
     );
-    assert.equal(lookupReported(withStore, { sessionId: 'sess-1' }, 'text').length, 5000);
-    assert.equal(lookupReported(withStore, { sessionId: 'nobody' }, 'text'), null, 'and stays quiet with no row');
+    assert.equal(lookupReported(withStore, { sessionId: 'sess-1' }, 'text')!.length, 5000);
+    assert.equal(
+      lookupReported(withStore, { sessionId: 'nobody' }, 'text'),
+      null,
+      'and stays quiet with no row'
+    );
     rmSync(home, { recursive: true, force: true });
   });
 });
@@ -440,13 +495,20 @@ describe('a trimming pattern is not a search pattern', () => {
         args: { prompt: ['{prompt}'] },
         reply: {
           format: 'text',
-          model: { sqlite: '/nope/state.db', query: 'SELECT model FROM sessions WHERE id = ?', pattern: '(.*)$' },
+          model: {
+            sqlite: '/nope/state.db',
+            query: 'SELECT model FROM sessions WHERE id = ?',
+            pattern: '(.*)$',
+          },
           sessionId: { pattern: 'session_id:\\s*(\\S+)', from: 'stderr' },
         },
       },
       { name: 'x', source: '/tmp/x.json' }
     );
-    const reply = parseAgentReply(adapter, { stdout: 'the whole answer\n', stderr: '\nsession_id: sess-1\n' });
+    const reply = parseAgentReply(adapter, {
+      stdout: 'the whole answer\n',
+      stderr: '\nsession_id: sess-1\n',
+    });
     assert.equal(reply.text, 'the whole answer');
     assert.equal(reply.model, null, 'the badge waits for the lookup rather than eating the answer');
     assert.equal(reply.sessionId, 'sess-1');
@@ -502,14 +564,19 @@ describe('how hard to think', () => {
           format: 'text',
           effort: {
             sqlite: store,
-            query: "SELECT json_extract(model_config, '$.reasoning_config.effort') FROM sessions WHERE id = ?",
+            query:
+              "SELECT json_extract(model_config, '$.reasoning_config.effort') FROM sessions WHERE id = ?",
           },
         },
       },
       { name: 'x', source: '/tmp/x.json' }
     );
     assert.equal(lookupReported(adapter, { sessionId: 'sess-1' }, 'effort'), 'max');
-    assert.equal(lookupReported(adapter, { sessionId: 'sess-1' }, 'model'), null, 'a field with no lookup stays quiet');
+    assert.equal(
+      lookupReported(adapter, { sessionId: 'sess-1' }, 'model'),
+      null,
+      'a field with no lookup stays quiet'
+    );
     rmSync(home, { recursive: true, force: true });
   });
 });
@@ -517,10 +584,10 @@ describe('how hard to think', () => {
 describe('splitting stays inside the cap, whatever the text', () => {
   const FENCES = ['```', '```js', '~~~', '````', '   ```py'];
   /** Everything but whitespace and fence lines — what a split must not lose. */
-  const body = (s) =>
+  const body = (s: string) =>
     s
       .split('\n')
-      .filter((line) => !/^ {0,3}(`{3,}|~{3,})/.test(line))
+      .filter((line: string) => !/^ {0,3}(`{3,}|~{3,})/.test(line))
       .join('')
       .replace(/\s/g, '');
 
@@ -541,7 +608,7 @@ describe('splitting stays inside the cap, whatever the text', () => {
 
   test('and no document does, over a few thousand of them', () => {
     let seed = 12345;
-    const rnd = (n) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff), seed % n);
+    const rnd = (n: number) => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff), seed % n);
     for (let round = 0; round < 2000; round++) {
       const cap = 200 + rnd(400);
       const lines = [];
@@ -579,14 +646,20 @@ describe('an answer that lives in a store', () => {
     );
 
   test('is not guessed at from the printed output, and is not an empty-answer failure', () => {
-    const reply = parseAgentReply(withLookup(), { stdout: 'reasoning noise\nand more', stderr: '\nid: s-1\n' });
+    const reply = parseAgentReply(withLookup(), {
+      stdout: 'reasoning noise\nand more',
+      stderr: '\nid: s-1\n',
+    });
     assert.equal(reply.error, null, 'the caller has a store to ask; this is not a failure yet');
     assert.equal(reply.text, '', 'and the printed noise is not the answer');
     assert.equal(reply.sessionId, 's-1');
   });
 
   test('a trimming pattern beside it does not turn every run into a failure', () => {
-    const reply = parseAgentReply(withLookup({ pattern: '(.*)$' }), { stdout: 'noise', stderr: '\nid: s-1\n' });
+    const reply = parseAgentReply(withLookup({ pattern: '(.*)$' }), {
+      stdout: 'noise',
+      stderr: '\nid: s-1\n',
+    });
     assert.equal(reply.error, null);
     assert.equal(reply.text, '');
   });
@@ -608,7 +681,10 @@ describe('an answer that lives in a store', () => {
           {
             cmd: 'x',
             args: { prompt: ['{prompt}'] },
-            reply: { format: 'text', model: { sqlite: '/x/state.db', query: 'SELECT model FROM s', bind: 'sessionId' } },
+            reply: {
+              format: 'text',
+              model: { sqlite: '/x/state.db', query: 'SELECT model FROM s', bind: 'sessionId' },
+            },
           },
           { name: 'x', source: '/tmp/x.json' }
         ),
@@ -650,7 +726,11 @@ describe('an agent that fails in its own words', () => {
       },
       { name: 'x', source: '/tmp/x.json' }
     );
-    const failed = parseAgentReply(adapter, { stdout: 'half an answer', stderr: 'ERROR: quota exhausted', code: 0 });
+    const failed = parseAgentReply(adapter, {
+      stdout: 'half an answer',
+      stderr: 'ERROR: quota exhausted',
+      code: 0,
+    });
     assert.equal(failed.error, 'quota exhausted');
     assert.equal(failed.text, '');
 
@@ -661,7 +741,7 @@ describe('an agent that fails in its own words', () => {
 });
 
 describe('an agent’s own commands', () => {
-  const spec = (extra) =>
+  const spec = (extra: unknown) =>
     normalizeAdapter(
       { cmd: 'x', args: { prompt: ['{prompt}'] }, commands: extra },
       { name: 'x', source: '/tmp/x.json' }
@@ -699,19 +779,23 @@ describe('an agent’s own commands', () => {
 });
 
 describe('what the agent says while it is still answering', () => {
-  const withStream = (stream, args = { prompt: ['-p', '{prompt}'] }) =>
+  const withStream = (stream: unknown, args: Record<string, unknown> = { prompt: ['-p', '{prompt}'] }) =>
     normalizeAdapter({ cmd: 'x', args, stream }, { name: 'x', source: '/tmp/x.json' });
 
   test('the flag that asks for the narration rides in with the paths that read it', () => {
     const adapter = withStream({ text: 'delta.text', step: 'tool.name', args: ['--stream-json'] });
     assert.deepEqual(buildAgentArgs(adapter, { prompt: 'p' }), ['-p', 'p', '--stream-json']);
-    assert.deepEqual(adapter.stream.read({ delta: { text: 'hal' }, tool: { name: 'grep' } }), {
+    assert.deepEqual(adapter.stream!.read({ delta: { text: 'hal' }, tool: { name: 'grep' } }), {
       text: 'hal',
       reasoning: null,
       step: 'grep',
       stepStatus: null,
     });
-    assert.equal(adapter.stream.read({ usage: { tokens: 12 } }), null, 'a frame it cannot read is not a flicker');
+    assert.equal(
+      adapter.stream!.read({ usage: { tokens: 12 } }),
+      null,
+      'a frame it cannot read is not a flicker'
+    );
   });
 
   test('asking for the narration without saying how to read it is refused', () => {

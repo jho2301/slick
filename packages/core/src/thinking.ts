@@ -8,7 +8,7 @@
  * hydrated copy of that message, forever.
  *
  * Which is also why this one metadata key gets validated when no other one
- * does. `messages.js` stringifies whatever metadata it is handed — no schema,
+ * does. `messages.ts` stringifies whatever metadata it is handed — no schema,
  * no size cap — and that has been fine, because metadata has been a handful
  * of bookkeeping keys an author wrote once. A reasoning trace is the first
  * payload that is machine-generated, unbounded, and re-sent on every read: a
@@ -16,7 +16,12 @@
  * all, and every subsequent hydration of that message carries them to every
  * client. So the caps live here, and they clamp rather than throw — an agent
  * that over-shares should lose the tail of its scratchpad, never its answer.
+ *
+ * This module has no imports on purpose: the web app runs the same code in
+ * the browser, and the two copies of a merge have to agree.
  */
+
+import type { StepStatus, ThinkingPhase, ThinkingSource, ThinkingStep, ThinkingTrace } from './types.ts';
 
 export const THINK_KEY = '_think';
 
@@ -40,20 +45,42 @@ const MAX_ID = 120;
  */
 const MAX_BLOB_BYTES = 16 * 1024;
 
-const PHASES = new Set(['streaming', 'done', 'error']);
-const STEP_STATUSES = new Set(['pending', 'in_progress', 'complete', 'error']);
+const PHASES: ReadonlySet<string> = new Set<ThinkingPhase>(['streaming', 'done', 'error']);
+const STEP_STATUSES: ReadonlySet<string> = new Set<StepStatus>([
+  'pending',
+  'in_progress',
+  'complete',
+  'error',
+]);
+
+const isPhase = (value: unknown): value is ThinkingPhase => typeof value === 'string' && PHASES.has(value);
+const isStepStatus = (value: unknown): value is StepStatus =>
+  typeof value === 'string' && STEP_STATUSES.has(value);
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * A step as a patch says it: every field optional, because "absent" has to
+ * mean "the patch said nothing about this". See `step` below.
+ */
+type StepPatch = Partial<ThinkingStep> & { id: string };
+
+/** UTF-8 length without a Node dependency, so the browser can share this file. */
+function byteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
 
 /** A trimmed string, cut to `max`, or '' for anything that is not one. */
-function text(value, max) {
+function text(value: unknown, max: number): string {
   if (typeof value !== 'string') return '';
   const trimmed = value.trim();
   return trimmed.length > max ? trimmed.slice(0, max) : trimmed;
 }
 
 /** Bullets: the first `count` usable strings, each cut to `max`. */
-function bullets(value, count, max) {
+function bullets(value: unknown, count: number, max: number): string[] | null {
   if (!Array.isArray(value)) return null;
-  const out = [];
+  const out: string[] = [];
   for (const entry of value) {
     if (out.length >= count) break;
     const line = text(entry, max);
@@ -62,12 +89,12 @@ function bullets(value, count, max) {
   return out.length ? out : null;
 }
 
-function sources(value) {
+function sources(value: unknown): ThinkingSource[] | null {
   if (!Array.isArray(value)) return null;
-  const out = [];
+  const out: ThinkingSource[] = [];
   for (const entry of value) {
     if (out.length >= MAX_SOURCES) break;
-    if (!entry || typeof entry !== 'object') continue;
+    if (!isObject(entry)) continue;
     const u = text(entry.u, MAX_SOURCE_URL);
     if (!u) continue;
     const t = text(entry.t, MAX_SOURCE_TITLE);
@@ -85,12 +112,12 @@ function sources(value) {
  * the defaults back afterwards, where a missing status really does mean
  * pending.
  */
-function step(raw, index) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const out = { id: text(raw.id, MAX_ID) || `s${index}` };
+function step(raw: unknown, index: number): StepPatch | null {
+  if (!isObject(raw)) return null;
+  const out: StepPatch = { id: text(raw.id, MAX_ID) || `s${index}` };
   const title = text(raw.t, MAX_STEP_TITLE);
   if (title) out.t = title;
-  if (STEP_STATUSES.has(raw.st)) out.st = raw.st;
+  if (isStepStatus(raw.st)) out.st = raw.st;
   const d = bullets(raw.d, MAX_DETAILS, MAX_DETAIL);
   if (d) out.d = d;
   const o = text(raw.o, MAX_OUTPUT);
@@ -101,14 +128,16 @@ function step(raw, index) {
 }
 
 /** Key order is fixed so a blob that did not change also does not re-serialize. */
-function settleStep(entry) {
-  const out = { id: entry.id };
+function settleStep(entry: StepPatch): ThinkingStep {
+  // Assigned in this order on purpose: JSON.stringify emits keys in insertion
+  // order, and the order is part of the "did it change" comparison.
+  const out: Partial<ThinkingStep> & { id: string } = { id: entry.id };
   if (entry.t) out.t = entry.t;
-  out.st = STEP_STATUSES.has(entry.st) ? entry.st : 'pending';
+  out.st = isStepStatus(entry.st) ? entry.st : 'pending';
   if (entry.d) out.d = entry.d;
   if (entry.o) out.o = entry.o;
   if (entry.src) out.src = entry.src;
-  return out;
+  return out as ThinkingStep;
 }
 
 /**
@@ -120,27 +149,24 @@ function settleStep(entry) {
  * still follow, and the title always survives, because a summary line with no
  * steps behind it is still a useful thing to render.
  */
-function assemble(title, phase, steps) {
+function assemble(title: string, phase: ThinkingPhase, steps: StepPatch[]): ThinkingTrace | null {
   const kept = steps.slice(0, MAX_STEPS).map(settleStep);
   if (!title && kept.length === 0) return null;
 
-  const build = () => {
-    const blob = {};
-    if (title) blob.t = title;
-    blob.p = phase;
-    blob.s = kept;
+  const build = (): ThinkingTrace => {
+    const blob: ThinkingTrace = title ? { t: title, p: phase, s: kept } : { p: phase, s: kept };
     return blob;
   };
 
   let blob = build();
-  while (kept.length > 0 && Buffer.byteLength(JSON.stringify(blob), 'utf8') > MAX_BLOB_BYTES) {
+  while (kept.length > 0 && byteLength(JSON.stringify(blob)) > MAX_BLOB_BYTES) {
     kept.pop();
     blob = build();
   }
   // A title-only blob that is still over cap cannot happen — `t` is 200 chars
   // — but if the caps ever move, an oversized title is worth less than a
   // predictable ceiling.
-  if (Buffer.byteLength(JSON.stringify(blob), 'utf8') > MAX_BLOB_BYTES) return null;
+  if (byteLength(JSON.stringify(blob)) > MAX_BLOB_BYTES) return null;
   return blob;
 }
 
@@ -152,20 +178,17 @@ function assemble(title, phase, steps) {
  * writing an answer down, `agents.thinking` recording a live signal. A
  * malformed scratchpad is a cosmetic problem and must not become a failed
  * reply.
- *
- * @param {unknown} value
- * @returns {{t?: string, p: string, s: object[]}|null}
  */
-export function normalizeThinking(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+export function normalizeThinking(value: unknown): ThinkingTrace | null {
+  if (!isObject(value)) return null;
 
   const title = text(value.t, MAX_TITLE);
-  const phase = PHASES.has(value.p) ? value.p : 'streaming';
+  const phase = isPhase(value.p) ? value.p : 'streaming';
 
   // Ids are unique within a blob, so a repeated one is an upsert here too —
   // the same rule `mergeThinking` follows, applied to a blob that arrived
   // with its own duplicates.
-  const steps = new Map();
+  const steps = new Map<string, StepPatch>();
   if (Array.isArray(value.s)) {
     for (const [index, raw] of value.s.entries()) {
       const entry = step(raw, index);
@@ -191,16 +214,12 @@ export function normalizeThinking(value) {
  * appends. Nothing is ever sorted or inserted mid-list: the order steps first
  * appeared in is the order they happened in, and that is the only order a
  * reader can follow.
- *
- * @param {unknown} base
- * @param {unknown} patch
- * @returns {{t?: string, p: string, s: object[]}|null}
  */
-export function mergeThinking(base, patch) {
+export function mergeThinking(base: unknown, patch: unknown): ThinkingTrace | null {
   const current = normalizeThinking(base);
-  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return current;
+  if (!isObject(patch)) return current;
 
-  const steps = new Map();
+  const steps = new Map<string, StepPatch>();
   for (const entry of current?.s ?? []) steps.set(entry.id, entry);
 
   if (Array.isArray(patch.s)) {
@@ -215,6 +234,6 @@ export function mergeThinking(base, patch) {
   }
 
   const title = text(patch.t, MAX_TITLE) || current?.t || '';
-  const phase = PHASES.has(patch.p) ? patch.p : (current?.p ?? 'streaming');
+  const phase = isPhase(patch.p) ? patch.p : (current?.p ?? 'streaming');
   return assemble(title, phase, [...steps.values()]);
 }

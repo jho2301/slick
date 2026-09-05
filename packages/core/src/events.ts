@@ -7,7 +7,10 @@
  * durable pointer into this log).
  */
 
-import { row, rows } from './db.js';
+import type { DatabaseSync } from 'node:sqlite';
+
+import { row, rows, type SQLInputValue } from './db.ts';
+import type { Author, AuthorKind, EventRecord, JsonObject } from './types.ts';
 
 export const EVENT_TYPES = Object.freeze({
   channelCreated: 'channel.created',
@@ -30,6 +33,8 @@ export const EVENT_TYPES = Object.freeze({
   agentThinking: 'agent.thinking',
 });
 
+export type EventType = (typeof EVENT_TYPES)[keyof typeof EVENT_TYPES];
+
 /**
  * Events an agent cares about when catching up on a conversation. `category.*`
  * is deliberately absent: rearranging the sidebar is not something an agent
@@ -49,7 +54,7 @@ export const EVENT_TYPES = Object.freeze({
  * the same reason this list leaves the event off; the browser, which is who
  * the trace was written for, gets it whole.
  */
-export const CONVERSATION_EVENTS = Object.freeze([
+export const CONVERSATION_EVENTS: readonly EventType[] = Object.freeze([
   EVENT_TYPES.messageCreated,
   EVENT_TYPES.messageUpdated,
   EVENT_TYPES.messageDeleted,
@@ -59,21 +64,19 @@ export const CONVERSATION_EVENTS = Object.freeze([
   EVENT_TYPES.channelDeleted,
 ]);
 
-/**
- * @param {import('node:sqlite').DatabaseSync} db
- * @param {{
- *   type: string,
- *   actor?: {id?: string, kind?: string},
- *   channelId?: string|null,
- *   messageId?: string|null,
- *   threadId?: string|null,
- *   sessionKey?: string|null,
- *   payload?: Record<string, unknown>,
- *   now?: number,
- * }} input
- * @returns {number} the assigned seq
- */
-export function recordEvent(db, input) {
+export interface RecordEventInput {
+  type: string;
+  actor?: Partial<Author> | null;
+  channelId?: string | null;
+  messageId?: string | null;
+  threadId?: string | null;
+  sessionKey?: string | null;
+  payload?: JsonObject;
+  now?: number;
+}
+
+/** @returns the assigned seq */
+export function recordEvent(db: DatabaseSync, input: RecordEventInput): number {
   const now = input.now ?? Date.now();
   const info = db
     .prepare(
@@ -95,24 +98,35 @@ export function recordEvent(db, input) {
 }
 
 /** Highest seq issued so far; 0 on an empty workspace. */
-export function maxSeq(db) {
+export function maxSeq(db: DatabaseSync): number {
   const r = db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events').get();
-  return Number(r.seq);
+  return Number(r?.seq ?? 0);
 }
 
-function hydrate(record) {
-  const e = row(record);
-  if (!e) return null;
-  let payload = {};
+interface EventRow {
+  seq: number;
+  type: string;
+  actor_id: string;
+  actor_kind: string;
+  channel_id: string | null;
+  message_id: string | null;
+  thread_id: string | null;
+  session_key: string | null;
+  payload: string | null;
+  created_at: number;
+}
+
+function hydrateRow(e: EventRow): EventRecord {
+  let payload: JsonObject;
   try {
-    payload = JSON.parse(e.payload ?? '{}');
+    payload = JSON.parse(e.payload ?? '{}') as JsonObject;
   } catch {
     payload = { _unparsed: e.payload };
   }
   return {
     seq: Number(e.seq),
     type: e.type,
-    actor: { id: e.actor_id, kind: e.actor_kind },
+    actor: { id: e.actor_id, kind: e.actor_kind as AuthorKind },
     channelId: e.channel_id,
     messageId: e.message_id,
     threadId: e.thread_id,
@@ -122,17 +136,23 @@ function hydrate(record) {
   };
 }
 
-/**
- * @param {import('node:sqlite').DatabaseSync} db
- * @param {{since?: number, limit?: number, channelId?: string|null,
- *          types?: readonly string[]|null, excludeSessionKey?: string|null}} [opts]
- */
-export function listEvents(db, opts = {}) {
-  const since = Number.isFinite(opts.since) ? Number(opts.since) : 0;
-  const limit = Math.min(Math.max(Number(opts.limit ?? 200), 1), 1000);
-  const where = ['seq > ?'];
-  const params = [since];
+function hydrate(record: unknown): EventRecord | null {
+  const e = row<EventRow>(record);
+  return e ? hydrateRow(e) : null;
+}
 
+export interface ListEventsOptions {
+  since?: number;
+  limit?: number;
+  channelId?: string | null;
+  types?: readonly string[] | null;
+  excludeSessionKey?: string | null;
+}
+
+function filters(opts: ListEventsOptions): { where: string[]; params: SQLInputValue[] } {
+  const since = Number.isFinite(opts.since) ? Number(opts.since) : 0;
+  const where = ['seq > ?'];
+  const params: SQLInputValue[] = [since];
   if (opts.channelId) {
     where.push('channel_id = ?');
     params.push(opts.channelId);
@@ -145,32 +165,23 @@ export function listEvents(db, opts = {}) {
     where.push('(session_key IS NULL OR session_key != ?)');
     params.push(opts.excludeSessionKey);
   }
+  return { where, params };
+}
 
+export function listEvents(db: DatabaseSync, opts: ListEventsOptions = {}): EventRecord[] {
+  const limit = Math.min(Math.max(Number(opts.limit ?? 200), 1), 1000);
+  const { where, params } = filters(opts);
   const list = db
     .prepare(`SELECT * FROM events WHERE ${where.join(' AND ')} ORDER BY seq ASC LIMIT ?`)
     .all(...params, limit);
-  return rows(list).map(hydrate);
+  return rows<EventRow>(list).map(hydrateRow);
 }
 
 /** Count of events after `since` matching the same filters — used for "unread". */
-export function countEvents(db, opts = {}) {
-  const since = Number.isFinite(opts.since) ? Number(opts.since) : 0;
-  const where = ['seq > ?'];
-  const params = [since];
-  if (opts.channelId) {
-    where.push('channel_id = ?');
-    params.push(opts.channelId);
-  }
-  if (opts.types?.length) {
-    where.push(`type IN (${opts.types.map(() => '?').join(', ')})`);
-    params.push(...opts.types);
-  }
-  if (opts.excludeSessionKey) {
-    where.push('(session_key IS NULL OR session_key != ?)');
-    params.push(opts.excludeSessionKey);
-  }
+export function countEvents(db: DatabaseSync, opts: ListEventsOptions = {}): number {
+  const { where, params } = filters(opts);
   const r = db.prepare(`SELECT COUNT(*) AS n FROM events WHERE ${where.join(' AND ')}`).get(...params);
-  return Number(r.n);
+  return Number(r?.n ?? 0);
 }
 
 export { hydrate as hydrateEvent };

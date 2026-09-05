@@ -4,6 +4,17 @@ out/
 shots/
 *.log
 
+# TypeScript build mode writes declarations here and nothing runs from them.
+.tsbuild/
+*.tsbuildinfo
+
+# The built web UI. The daemon serves it from here; `npm run build` makes it.
+packages/server/public/
+apps/web/dev-dist/
+.vite/
+coverage/
+.eslintcache
+
 # A workspace accidentally created inside the repo
 .slick/
 *.db

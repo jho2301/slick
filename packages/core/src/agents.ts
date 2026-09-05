@@ -13,11 +13,14 @@
  * is exact — no re-reading messages you already handled, no missed messages.
  */
 
-import { ConflictError, NotFoundError, ValidationError } from './errors.js';
-import { newHistoryKey, looksLikeHistoryKey } from './ids.js';
-import { row, rows, transact } from './db.js';
-import { readServeLock, serveStatus } from './serve.js';
-import { THINK_KEY, normalizeThinking } from './thinking.js';
+import type { DatabaseSync } from 'node:sqlite';
+
+import { ConflictError, NotFoundError, ValidationError } from './errors.ts';
+import { isRecord } from './guards.ts';
+import { newHistoryKey, looksLikeHistoryKey } from './ids.ts';
+import { row, rows, transact, type SQLInputValue } from './db.ts';
+import { readServeLock, serveStatus } from './serve.ts';
+import { THINK_KEY, normalizeThinking } from './thinking.ts';
 import {
   CONVERSATION_EVENTS,
   EVENT_TYPES,
@@ -25,7 +28,22 @@ import {
   listEvents,
   maxSeq,
   recordEvent,
-} from './events.js';
+  type ListEventsOptions,
+} from './events.ts';
+import type { ChannelService } from './channels.ts';
+import type { MessageService } from './messages.ts';
+import type {
+  AgentSession,
+  Channel,
+  EventRecord,
+  HydratedEvent,
+  JsonObject,
+  Message,
+  MessageMetadata,
+  ModelChoice,
+  SessionState,
+  ThinkingTrace,
+} from './types.ts';
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 
@@ -39,7 +57,7 @@ const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 export const SERVE_MODEL_KEY = '_serveModel';
 
 /** The model set on a session, or null for "whatever the agent defaults to". */
-export function readServeModel(state) {
+export function readServeModel(state: SessionState | null | undefined): string | null {
   const value = state?.[SERVE_MODEL_KEY];
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
@@ -61,7 +79,7 @@ export const SERVE_EFFORT_KEY = '_serveEffort';
 export const SERVE_ADAPTER_KEY = '_serveAdapter';
 
 /** The adapter a watcher last served this session with, if one has. */
-export function readServeAdapter(state) {
+export function readServeAdapter(state: SessionState | null | undefined): string | null {
   const value = state?.[SERVE_ADAPTER_KEY];
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
@@ -74,7 +92,7 @@ export function readServeAdapter(state) {
 const TYPING_WINDOW_MS = 5 * 60 * 1000;
 
 /** The reasoning effort set on a session, or null for the agent's own default. */
-export function readServeEffort(state) {
+export function readServeEffort(state: SessionState | null | undefined): string | null {
   const value = state?.[SERVE_EFFORT_KEY];
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
@@ -97,18 +115,27 @@ const MAX_CHOICES = 300;
  * Normalise whatever the binary answered into `{id, label, group}` rows.
  * Accepts a bare array of names, or objects with `id`/`name`/`model`, so an
  * agent can answer in the shape that suits it.
- * @returns {Array<{id: string, label: string, group: string|null}>}
  */
-export function normalizeModelChoices(input) {
-  const list = Array.isArray(input) ? input : Array.isArray(input?.models) ? input.models : [];
-  const out = [];
-  const seen = new Set();
+export function normalizeModelChoices(input: unknown): ModelChoice[] {
+  const list: unknown[] = Array.isArray(input)
+    ? input
+    : isRecord(input) && Array.isArray(input.models)
+      ? input.models
+      : [];
+  const out: ModelChoice[] = [];
+  const seen = new Set<string>();
   for (const entry of list) {
-    const id = String((typeof entry === 'string' ? entry : (entry?.id ?? entry?.name ?? entry?.model)) ?? '').trim();
+    const rec = isRecord(entry) ? entry : null;
+    const id = String(
+      (typeof entry === 'string' ? entry : (rec?.id ?? rec?.name ?? rec?.model)) ?? ''
+    ).trim();
     if (!id || id.length > 200 || seen.has(id)) continue;
     seen.add(id);
-    const label = String(entry?.label ?? entry?.name ?? id).trim().slice(0, 200) || id;
-    const group = entry?.group ?? entry?.provider ?? null;
+    const label =
+      String(rec?.label ?? rec?.name ?? id)
+        .trim()
+        .slice(0, 200) || id;
+    const group = rec?.group ?? rec?.provider ?? null;
     out.push({ id, label, group: group ? String(group).trim().slice(0, 80) : null });
     if (out.length >= MAX_CHOICES) break;
   }
@@ -116,26 +143,27 @@ export function normalizeModelChoices(input) {
 }
 
 /** The choices stored on a session, normalised. Always an array. */
-export function readServeModelChoices(state) {
+export function readServeModelChoices(state: SessionState | null | undefined): ModelChoice[] {
   return normalizeModelChoices(state?.[SERVE_MODELS_KEY]);
 }
 
-function parseState(value) {
+function parseState(value: unknown): SessionState {
   try {
-    const parsed = JSON.parse(value ?? '{}');
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    const parsed: unknown = JSON.parse(String(value ?? '{}'));
+    return isRecord(parsed) ? parsed : {};
   } catch {
     return {};
   }
 }
 
 /** Key-order-independent JSON, so "did this actually change?" has one answer. */
-function stableJson(value) {
+function stableJson(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  return `{${Object.keys(value)
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
     .sort()
-    .map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`)
+    .map((k) => `${JSON.stringify(k)}:${stableJson(record[k])}`)
     .join(',')}}`;
 }
 
@@ -146,12 +174,154 @@ function stableJson(value) {
  */
 const SEEN_HEARTBEAT_MS = 30_000;
 
-export function createAgentService(ctx) {
+interface SessionRow {
+  key: string;
+  agent_id: string;
+  name: string | null;
+  title: string;
+  channel_id: string | null;
+  channel_slug?: string | null;
+  cursor_seq: number;
+  state: string;
+  status: string;
+  message_count: number;
+  resume_count: number;
+  created_at: number;
+  updated_at: number;
+  last_seen_at: number | null;
+}
+
+/** The latest row per (session, agent, thread) for a live signal query. */
+interface SignalRow {
+  seq: number;
+  session_key: string | null;
+  thread_id: string;
+  channel_id: string | null;
+  actor_id: string;
+  payload: string | null;
+  created_at: number;
+}
+
+export interface SessionReadOptions {
+  agentId?: string;
+}
+
+export interface SessionListOptions extends SessionReadOptions {
+  includeEnded?: boolean;
+  limit?: number;
+}
+
+export interface StartSessionInput {
+  agentId?: string;
+  name?: string | null;
+  title?: string;
+  channel?: string | null;
+  state?: SessionState;
+  fromBeginning?: boolean;
+  reuse?: boolean;
+}
+
+/** What to read for a session: which channel, whose messages, which types. */
+export interface ReadFilterOptions {
+  includeOwn?: boolean;
+  channel?: string | null;
+  scope?: 'workspace' | 'session';
+  types?: readonly string[] | null;
+}
+
+export interface PullOptions extends ReadFilterOptions, SessionReadOptions {
+  limit?: number;
+  peek?: boolean;
+}
+
+export interface PullResult {
+  session: AgentSession;
+  events: HydratedEvent[];
+  previousCursor: number;
+  cursor: number;
+  hasMore: boolean;
+  pending: number;
+}
+
+export interface ResumeOptions extends ReadFilterOptions, SessionReadOptions {
+  limit?: number;
+  contextLimit?: number;
+  create?: boolean;
+  title?: string;
+}
+
+export interface ResumeResult {
+  session: AgentSession;
+  state: SessionState;
+  cursor: number;
+  channel: Channel | null;
+  context: Message[];
+  missed: HydratedEvent[];
+  hasMore: boolean;
+  pending: number;
+}
+
+export interface SessionPatch {
+  title?: string | null;
+  name?: string | null;
+  channel?: string | null;
+}
+
+export interface AgentPostInput extends SessionReadOptions {
+  channel?: string | null;
+  text: string;
+  threadId?: string | null;
+  metadata?: MessageMetadata | null;
+  label?: string;
+}
+
+export interface TypingInput extends SessionReadOptions {
+  on?: boolean;
+  threadId?: string | null;
+  channelId?: string | null;
+}
+
+export interface TypingEntry {
+  threadId: string;
+  channelId: string | null;
+  agentId: string;
+  sessionKey: string | null;
+  at: number;
+}
+
+export interface ThinkingInput extends SessionReadOptions {
+  think?: unknown;
+  threadId?: string | null;
+  channelId?: string | null;
+}
+
+export interface ThinkingEntry extends TypingEntry {
+  think: ThinkingTrace;
+}
+
+export interface ExternalTypingInput {
+  agentId?: string;
+  threadId?: string;
+  on?: boolean;
+}
+
+export interface ExternalThinkingInput {
+  agentId?: string;
+  threadId?: string;
+  think?: unknown;
+}
+
+export interface AgentServiceContext {
+  db: DatabaseSync;
+  home: string | undefined;
+  channels: ChannelService;
+  messages: MessageService;
+}
+
+export function createAgentService(ctx: AgentServiceContext) {
   const { db, channels, messages, home } = ctx;
 
-  function serialize(record) {
-    const s = row(record);
-    if (!s) return null;
+  function serializeRow(s: SessionRow): AgentSession {
     const state = parseState(s.state);
     // Whether anyone answers for this session, rather than only posts through
     // it. Every caller that offers agents to a human needs this, and none of
@@ -177,16 +347,19 @@ export function createAgentService(ctx) {
     };
   }
 
+  function serialize(record: unknown): AgentSession | null {
+    const s = row<SessionRow>(record);
+    return s ? serializeRow(s) : null;
+  }
+
   const SELECT_SESSION = `SELECT s.*, c.slug AS channel_slug
                             FROM agent_sessions s
                             LEFT JOIN channels c ON c.id = s.channel_id`;
 
   /**
    * Look a session up by history key, or by `name` scoped to an agent.
-   * @param {string} ref
-   * @param {{agentId?: string}} [opts]
    */
-  function find(ref, opts = {}) {
+  function find(ref: string | null | undefined, opts: SessionReadOptions = {}): AgentSession | null {
     if (!ref) return null;
     const raw = String(ref).trim();
     const byKey = db.prepare(`${SELECT_SESSION} WHERE s.key = ?`).get(raw);
@@ -198,7 +371,7 @@ export function createAgentService(ctx) {
     return named ? serialize(named) : null;
   }
 
-  function get(ref, opts = {}) {
+  function get(ref: string | null | undefined, opts: SessionReadOptions = {}): AgentSession {
     const found = find(ref, opts);
     if (!found) {
       throw new NotFoundError(`No agent session for "${ref}".`, {
@@ -210,10 +383,9 @@ export function createAgentService(ctx) {
     return found;
   }
 
-  /** @param {{agentId?: string, includeEnded?: boolean, limit?: number}} [opts] */
-  function list(opts = {}) {
-    const where = [];
-    const params = [];
+  function list(opts: SessionListOptions = {}): AgentSession[] {
+    const where: string[] = [];
+    const params: SQLInputValue[] = [];
     if (opts.agentId) {
       where.push('s.agent_id = ?');
       params.push(opts.agentId);
@@ -221,17 +393,18 @@ export function createAgentService(ctx) {
     if (!opts.includeEnded) where.push("s.status = 'active'");
     const sql = `${SELECT_SESSION} ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
                  ORDER BY s.updated_at DESC LIMIT ?`;
-    return rows(db.prepare(sql).all(...params, Math.min(Number(opts.limit ?? 100), 500))).map(serialize);
+    return rows<SessionRow>(db.prepare(sql).all(...params, Math.min(Number(opts.limit ?? 100), 500))).map(
+      serializeRow
+    );
   }
 
   /**
    * Mint a new history key.
-   * @param {{agentId?: string, name?: string|null, title?: string,
-   *          channel?: string|null, state?: Record<string, unknown>,
-   *          fromBeginning?: boolean, reuse?: boolean}} [input]
    */
-  function start(input = {}) {
-    const agentId = String(input.agentId ?? 'agent').trim().toLowerCase();
+  function start(input: StartSessionInput = {}): AgentSession & { reused?: boolean } {
+    const agentId = String(input.agentId ?? 'agent')
+      .trim()
+      .toLowerCase();
     if (!NAME_RE.test(agentId)) {
       throw new ValidationError(`"${agentId}" is not a valid agent id.`, {
         hint: 'Use letters, digits, "-", "_" or "." (e.g. claude, reviewer-bot).',
@@ -292,10 +465,10 @@ export function createAgentService(ctx) {
     });
   }
 
-  function touch(key, patch = {}) {
+  function touch(key: string, patch: Record<string, SQLInputValue> = {}): void {
     const now = Date.now();
     const sets = ['updated_at = ?', 'last_seen_at = ?'];
-    const params = [now, now];
+    const params: SQLInputValue[] = [now, now];
     for (const [column, value] of Object.entries(patch)) {
       sets.push(`${column} = ?`);
       params.push(value);
@@ -305,18 +478,19 @@ export function createAgentService(ctx) {
   }
 
   /** Attach the live message + channel slug so one read gives full context. */
-  function hydrateEvent(event) {
-    const enriched = { ...event };
+  function hydrateEvent(event: EventRecord): HydratedEvent {
+    const enriched: HydratedEvent = { ...event };
     if (event.channelId) {
       const channel = channels.find(event.channelId);
-      enriched.channelSlug = channel?.slug ?? event.payload?.channel?.slug ?? null;
+      const snapshot = isRecord(event.payload.channel) ? event.payload.channel : null;
+      enriched.channelSlug = channel?.slug ?? (typeof snapshot?.slug === 'string' ? snapshot.slug : null);
     }
     if (event.messageId) {
       const live = messages.find(event.messageId);
-      enriched.message = live ?? event.payload?.message ?? null;
+      enriched.message = live ?? (event.payload.message as Message | undefined) ?? null;
       // The payload carries a snapshot taken at write time; now that the live
       // row is attached, shipping both just doubles the size of every event.
-      if (enriched.payload?.message) {
+      if (enriched.payload.message) {
         const { message: _snapshot, ...rest } = enriched.payload;
         enriched.payload = rest;
       }
@@ -335,7 +509,7 @@ export function createAgentService(ctx) {
    * asked and cannot act on. `_model` and `_effort` stay — they are a few
    * words each and they say who answered, which is context an agent can use.
    */
-  function withoutThink(message) {
+  function withoutThink<T extends Message | null | undefined>(message: T): T {
     const metadata = message?.metadata;
     if (!metadata || !Object.prototype.hasOwnProperty.call(metadata, THINK_KEY)) return message;
     const { [THINK_KEY]: _trace, ...rest } = metadata;
@@ -343,14 +517,17 @@ export function createAgentService(ctx) {
   }
 
   /** `hydrateEvent` for the agent-facing reads, which is the same thing less that key. */
-  function hydrateForAgent(event) {
+  function hydrateForAgent(event: EventRecord): HydratedEvent {
     const enriched = hydrateEvent(event);
     return enriched.message ? { ...enriched, message: withoutThink(enriched.message) } : enriched;
   }
 
-  function readOpts(session, opts = {}) {
+  function readOpts(
+    session: AgentSession,
+    opts: ReadFilterOptions = {}
+  ): Pick<ListEventsOptions, 'channelId' | 'types' | 'excludeSessionKey'> {
     const includeOwn = opts.includeOwn ?? false;
-    let channelId = null;
+    let channelId: string | null = null;
     if (opts.channel) channelId = channels.get(opts.channel).id;
     else if (opts.scope === 'session' && session.channelId) channelId = session.channelId;
     return {
@@ -360,7 +537,7 @@ export function createAgentService(ctx) {
     };
   }
 
-  function pendingCount(session, opts = {}) {
+  function pendingCount(session: AgentSession, opts: ReadFilterOptions = {}): number {
     const filters = readOpts(session, opts);
     return countEvents(db, { since: session.cursorSeq, ...filters });
   }
@@ -369,12 +546,9 @@ export function createAgentService(ctx) {
    * Read new events for a session and (unless `peek`) advance its cursor.
    * This is the loop primitive: call it, handle what comes back, call again.
    *
-   * @param {string} ref history key or session name
-   * @param {{limit?: number, peek?: boolean, includeOwn?: boolean, channel?: string,
-   *          scope?: 'workspace'|'session', types?: readonly string[]|null,
-   *          agentId?: string}} [opts]
+   * @param ref history key or session name
    */
-  function pull(ref, opts = {}) {
+  function pull(ref: string, opts: PullOptions = {}): PullResult {
     return transact(db, () => {
       const session = get(ref, opts);
       const filters = readOpts(session, opts);
@@ -383,7 +557,7 @@ export function createAgentService(ctx) {
       const raw = listEvents(db, { since: session.cursorSeq, limit: limit + 1, ...filters });
       const hasMore = raw.length > limit;
       const page = raw.slice(0, limit);
-      const nextCursor = page.length ? page[page.length - 1].seq : session.cursorSeq;
+      const nextCursor = page.at(-1)?.seq ?? session.cursorSeq;
 
       if (!opts.peek && nextCursor !== session.cursorSeq) {
         touch(session.key, { cursor_seq: nextCursor });
@@ -407,12 +581,9 @@ export function createAgentService(ctx) {
    * Pick up where you left off. Peeks — it never moves the cursor — so an
    * agent can safely call it at the top of every run to re-orient.
    *
-   * @param {string} ref history key or session name
-   * @param {{limit?: number, contextLimit?: number, channel?: string,
-   *          includeOwn?: boolean, agentId?: string, create?: boolean,
-   *          scope?: 'workspace'|'session'}} [opts]
+   * @param ref history key or session name
    */
-  function resume(ref, opts = {}) {
+  function resume(ref: string, opts: ResumeOptions = {}): ResumeResult {
     return transact(db, () => {
       let session = find(ref, opts);
       // `create` means "make this session if it is missing", which only makes
@@ -427,7 +598,7 @@ export function createAgentService(ctx) {
           title: opts.title,
         });
       }
-      if (!session) return get(ref, opts); // throws with the helpful message
+      if (!session) session = get(ref, opts); // throws with the helpful message
 
       const filters = readOpts(session, opts);
       const limit = Math.min(Math.max(Number(opts.limit ?? 50), 1), 500);
@@ -436,10 +607,12 @@ export function createAgentService(ctx) {
 
       const contextLimit = Math.min(Math.max(Number(opts.contextLimit ?? 20), 0), 200);
       const channelRef = opts.channel ?? session.channelId;
-      let context = [];
+      let context: Message[] = [];
       const channel = channelRef ? channels.find(channelRef) : null;
       if (channel && contextLimit > 0) {
-        context = messages.list(channel.id, { limit: contextLimit, includeReplies: true }).messages.map(withoutThink);
+        context = messages
+          .list(channel.id, { limit: contextLimit, includeReplies: true })
+          .messages.map((m) => withoutThink(m));
       }
 
       // `serve` resumes every couple of seconds, and the docs promise resuming
@@ -485,7 +658,11 @@ export function createAgentService(ctx) {
   }
 
   /** Explicitly move the cursor (e.g. "I handled everything up to here"). */
-  function ack(ref, seq, opts = {}) {
+  function ack(
+    ref: string,
+    seq: number | string | null | undefined,
+    opts: SessionReadOptions = {}
+  ): AgentSession {
     return transact(db, () => {
       const session = get(ref, opts);
       const target = seq === undefined || seq === null || seq === 'latest' ? maxSeq(db) : Number(seq);
@@ -500,19 +677,20 @@ export function createAgentService(ctx) {
   /**
    * The agent's private memory. Anything JSON-serialisable: plans, todo lists,
    * the id of the message it is waiting on. It comes back verbatim on resume.
-   * @param {string} ref
-   * @param {Record<string, unknown>} value
-   * @param {{merge?: boolean, agentId?: string}} [opts]
    */
-  function setState(ref, value, opts = {}) {
+  function setState(
+    ref: string,
+    value: unknown,
+    opts: SessionReadOptions & { merge?: boolean } = {}
+  ): AgentSession {
     return transact(db, () => {
       const session = get(ref, opts);
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      if (!isRecord(value)) {
         throw new ValidationError('Session state must be a JSON object.', {
           details: { received: Array.isArray(value) ? 'array' : typeof value },
         });
       }
-      const next = opts.merge === false ? value : { ...session.state, ...value };
+      const next: SessionState = opts.merge === false ? value : { ...session.state, ...value };
       const changed = stableJson(session.state) !== stableJson(next);
       touch(session.key, { state: JSON.stringify(next) });
       // Re-writing the identical object is what a polling loop does on every
@@ -534,11 +712,9 @@ export function createAgentService(ctx) {
    * or anything else that can reach the database. A watcher re-reads it on
    * every pass, so a running one switches without being restarted.
    *
-   * @param {string} ref
-   * @param {string|null} model  a model name, or null/'' to go back to the default
-   * @param {{agentId?: string}} [opts]
+   * @param model  a model name, or null/'' to go back to the default
    */
-  function setModel(ref, model, opts = {}) {
+  function setModel(ref: string, model: unknown, opts: SessionReadOptions = {}): AgentSession {
     if (model !== null && model !== undefined && typeof model !== 'string') {
       throw new ValidationError('A model is a string, or null for the default.', {
         details: { received: typeof model },
@@ -548,6 +724,7 @@ export function createAgentService(ctx) {
     // It is spawned as one argv entry, so this is not about injection — a
     // newline or a page of text is simply not a model name, and storing it
     // would only fail later, inside the child, where it is harder to see.
+    // eslint-disable-next-line no-control-regex -- the control range is the point
     if (wanted.length > 200 || /[\u0000-\u001f]/.test(wanted)) {
       throw new ValidationError(`"${wanted.slice(0, 40)}…" is not a model name.`, {
         hint: 'Use the name the agent binary expects, e.g. anthropic/claude-sonnet-4.',
@@ -565,11 +742,9 @@ export function createAgentService(ctx) {
    * with a vocabulary of its own. A level the binary does not know is the
    * binary's complaint to make, in words that fit the binary.
    *
-   * @param {string} ref
-   * @param {string|null} effort  a level, or null/'' to go back to the default
-   * @param {{agentId?: string}} [opts]
+   * @param effort  a level, or null/'' to go back to the default
    */
-  function setEffort(ref, effort, opts = {}) {
+  function setEffort(ref: string, effort: unknown, opts: SessionReadOptions = {}): AgentSession {
     if (effort !== null && effort !== undefined && typeof effort !== 'string') {
       throw new ValidationError('An effort level is a string, or null for the default.', {
         details: { received: typeof effort },
@@ -595,12 +770,14 @@ export function createAgentService(ctx) {
    * being briefly unreachable is not a reason to empty the picker. Pass an
    * empty array to actually clear it.
    *
-   * @param {string} ref
-   * @param {unknown} choices  whatever `<cmd> --list-models` answered, or null
-   * @param {{agentId?: string, at?: number}} [opts]
+   * @param choices  whatever `<cmd> --list-models` answered, or null
    */
-  function setModelChoices(ref, choices, opts = {}) {
-    const patch = { [SERVE_MODELS_AT_KEY]: opts.at ?? Date.now() };
+  function setModelChoices(
+    ref: string,
+    choices: unknown,
+    opts: SessionReadOptions & { at?: number } = {}
+  ): AgentSession {
+    const patch: JsonObject = { [SERVE_MODELS_AT_KEY]: opts.at ?? Date.now() };
     if (choices !== null && choices !== undefined) {
       const normalized = normalizeModelChoices(choices);
       patch[SERVE_MODELS_KEY] = normalized.length > 0 ? normalized : null;
@@ -608,10 +785,10 @@ export function createAgentService(ctx) {
     return setState(ref, patch, { ...opts, merge: true });
   }
 
-  function update(ref, patch, opts = {}) {
+  function update(ref: string, patch: SessionPatch, opts: SessionReadOptions = {}): AgentSession {
     return transact(db, () => {
       const session = get(ref, opts);
-      const columns = {};
+      const columns: Record<string, SQLInputValue> = {};
       if (patch.title !== undefined) columns.title = String(patch.title ?? '').trim();
       if (patch.name !== undefined) {
         const name = patch.name ? String(patch.name).trim() : null;
@@ -620,7 +797,8 @@ export function createAgentService(ctx) {
           const clash = db
             .prepare('SELECT key FROM agent_sessions WHERE agent_id = ? AND name = ? AND key != ?')
             .get(session.agentId, name, session.key);
-          if (clash) throw new ConflictError(`Agent "${session.agentId}" already has a session named "${name}".`);
+          if (clash)
+            throw new ConflictError(`Agent "${session.agentId}" already has a session named "${name}".`);
         }
         columns.name = name;
       }
@@ -636,11 +814,8 @@ export function createAgentService(ctx) {
   /**
    * Post as this agent. Stamps the message with the history key so the session
    * can tell its own words apart from everyone else's on the next pull.
-   * @param {string} ref
-   * @param {{channel?: string, text: string, threadId?: string|null,
-   *          metadata?: Record<string, unknown>|null, label?: string, agentId?: string}} input
    */
-  function post(ref, input) {
+  function post(ref: string, input: AgentPostInput): { message: Message; session: AgentSession } {
     return transact(db, () => {
       const session = get(ref, input);
       const channelRef = input.threadId ? undefined : (input.channel ?? session.channelId);
@@ -669,8 +844,27 @@ export function createAgentService(ctx) {
   }
 
   /** Reply into a thread as this agent. */
-  function reply(ref, rootId, input) {
+  function reply(ref: string, rootId: string, input: Omit<AgentPostInput, 'threadId'>) {
     return post(ref, { ...input, threadId: rootId });
+  }
+
+  /** The latest row an agent wrote about each thread, for one signal type. */
+  function latestSignals(type: string, withinMs: number): SignalRow[] {
+    // SQLite hands back the row MAX(seq) came from, so each group is the last
+    // thing one agent said about one thread. Grouping by the actor as well as
+    // the session matters for external rows: their session key is NULL, which
+    // SQLite would otherwise collapse into one group per thread — two
+    // gateways answering in the same thread would hide each other.
+    return rows<SignalRow>(
+      db
+        .prepare(
+          `SELECT MAX(seq) AS seq, session_key, thread_id, channel_id, actor_id, payload, created_at
+             FROM events
+            WHERE type = ? AND created_at >= ? AND thread_id IS NOT NULL
+            GROUP BY session_key, actor_id, thread_id`
+        )
+        .all(type, Date.now() - withinMs)
+    );
   }
 
   /**
@@ -691,34 +885,18 @@ export function createAgentService(ctx) {
    * A row with no session key came from outside the workspace — see
    * `externalTyping` — and there is no lock to ask about, so for those the
    * window is the whole answer.
-   *
-   * @param {{withinMs?: number}} [opts]
-   * @returns {Array<{threadId: string, channelId: string|null, agentId: string, sessionKey: string|null, at: number}>}
    */
-  function typingNow(opts = {}) {
+  function typingNow(opts: { withinMs?: number } = {}): TypingEntry[] {
     const withinMs = Math.max(Number(opts.withinMs) || TYPING_WINDOW_MS, 1000);
-    // SQLite hands back the row MAX(seq) came from, so each group is the last
-    // thing one agent said about one thread. Grouping by the actor as well as
-    // the session matters for external rows: their session key is NULL, which
-    // SQLite would otherwise collapse into one group per thread — two
-    // gateways answering in the same thread would hide each other.
-    const latest = rows(
-      db
-        .prepare(
-          `SELECT MAX(seq) AS seq, session_key, thread_id, channel_id, actor_id, payload, created_at
-             FROM events
-            WHERE type = ? AND created_at >= ? AND thread_id IS NOT NULL
-            GROUP BY session_key, actor_id, thread_id`
-        )
-        .all(EVENT_TYPES.agentTyping, Date.now() - withinMs)
-    );
+    const latest = latestSignals(EVENT_TYPES.agentTyping, withinMs);
 
-    const watching = new Map();
-    const out = [];
+    const watching = new Map<string, boolean>();
+    const out: TypingEntry[] = [];
     for (const record of latest) {
-      let on = false;
+      let on: boolean;
       try {
-        on = Boolean(JSON.parse(record.payload ?? '{}').on);
+        const payload: unknown = JSON.parse(record.payload ?? '{}');
+        on = isRecord(payload) && Boolean(payload.on);
       } catch {
         on = false; // an unreadable payload is not a reason to claim someone is typing
       }
@@ -743,10 +921,8 @@ export function createAgentService(ctx) {
    * An ephemeral "working on it" signal for the UI — not part of the durable
    * conversation, so it never shows up in `pull`/`resume`. The daemon's live
    * stream carries it straight through like any other event.
-   * @param {string} ref
-   * @param {{on: boolean, threadId?: string|null, channelId?: string|null, agentId?: string}} [input]
    */
-  function typing(ref, input = {}) {
+  function typing(ref: string, input: TypingInput = {}): { ok: true } {
     const session = get(ref, input);
     recordEvent(db, {
       type: EVENT_TYPES.agentTyping,
@@ -772,11 +948,11 @@ export function createAgentService(ctx) {
    * message id and gets its thread, so pointing at a reply lights up the
    * root it belongs to, and the channel comes from the message instead of
    * from whoever asked.
-   *
-   * @param {{agentId: string, threadId: string, on?: boolean}} input
    */
-  function externalTyping(input = {}) {
-    const agentId = String(input.agentId ?? '').trim().toLowerCase();
+  function externalTyping(input: ExternalTypingInput = {}): { ok: true } {
+    const agentId = String(input.agentId ?? '')
+      .trim()
+      .toLowerCase();
     if (!NAME_RE.test(agentId)) {
       throw new ValidationError(`"${input.agentId ?? ''}" is not a valid agent id.`, {
         hint: 'Use letters, digits, "-", "_" or "." — the name the agent posts under.',
@@ -794,7 +970,7 @@ export function createAgentService(ctx) {
       type: EVENT_TYPES.agentTyping,
       actor: { id: agentId, kind: 'agent' },
       channelId: target.channelId,
-      threadId: target.threadId ?? target.id,
+      threadId: target.threadId,
       // No session, so no lock to expire it: see `typingNow`.
       sessionKey: null,
       payload: { on: Boolean(input.on) },
@@ -816,29 +992,18 @@ export function createAgentService(ctx) {
    * is left out: that trace belongs to the finished message, where it was
    * written down, and repeating it here would put a second copy of the same
    * reasoning under a reply that is already on screen.
-   *
-   * @param {{withinMs?: number}} [opts]
-   * @returns {Array<{threadId: string, channelId: string|null, agentId: string, sessionKey: string|null, at: number, think: object}>}
    */
-  function thinkingNow(opts = {}) {
+  function thinkingNow(opts: { withinMs?: number } = {}): ThinkingEntry[] {
     const withinMs = Math.max(Number(opts.withinMs) || TYPING_WINDOW_MS, 1000);
-    const latest = rows(
-      db
-        .prepare(
-          `SELECT MAX(seq) AS seq, session_key, thread_id, channel_id, actor_id, payload, created_at
-             FROM events
-            WHERE type = ? AND created_at >= ? AND thread_id IS NOT NULL
-            GROUP BY session_key, actor_id, thread_id`
-        )
-        .all(EVENT_TYPES.agentThinking, Date.now() - withinMs)
-    );
+    const latest = latestSignals(EVENT_TYPES.agentThinking, withinMs);
 
-    const watching = new Map();
-    const out = [];
+    const watching = new Map<string, boolean>();
+    const out: ThinkingEntry[] = [];
     for (const record of latest) {
-      let think = null;
+      let think: ThinkingTrace | null;
       try {
-        think = normalizeThinking(JSON.parse(record.payload ?? '{}').think);
+        const payload: unknown = JSON.parse(record.payload ?? '{}');
+        think = normalizeThinking(isRecord(payload) ? payload.think : null);
       } catch {
         think = null; // an unreadable payload is nothing to show, not an error
       }
@@ -880,20 +1045,23 @@ export function createAgentService(ctx) {
    * way by `recordEvent`. `ix_events_type` walks seq backwards within
    * `agent.thinking`, and the row being looked for is nearly always the most
    * recent one there, so this stops on its first or second step.
-   *
-   * @param {{actorId: string, sessionKey: string|null, threadId: string|null, payload: string}} what
    */
-  function thinkingRepeats({ actorId, sessionKey, threadId, payload }) {
-    const last = row(
+  function thinkingRepeats(what: {
+    actorId: string;
+    sessionKey: string | null;
+    threadId: string | null;
+    payload: string;
+  }): boolean {
+    const last = row<{ payload: string }>(
       db
         .prepare(
           `SELECT payload FROM events
             WHERE type = ? AND actor_id = ? AND session_key IS ? AND thread_id IS ?
             ORDER BY seq DESC LIMIT 1`
         )
-        .get(EVENT_TYPES.agentThinking, actorId, sessionKey, threadId)
+        .get(EVENT_TYPES.agentThinking, what.actorId, what.sessionKey, what.threadId)
     );
-    return last?.payload === payload;
+    return last?.payload === what.payload;
   }
 
   /**
@@ -904,11 +1072,8 @@ export function createAgentService(ctx) {
    *
    * The blob is normalized here rather than trusted, because this is the one
    * place a scratchpad becomes a row in the event log.
-   *
-   * @param {string} ref
-   * @param {{think?: unknown, threadId?: string|null, channelId?: string|null}} [input]
    */
-  function thinking(ref, input = {}) {
+  function thinking(ref: string, input: ThinkingInput = {}): { ok: true } {
     const session = get(ref, input);
     const threadId = input.threadId ?? null;
     const payload = { think: normalizeThinking(input.think) };
@@ -940,11 +1105,11 @@ export function createAgentService(ctx) {
    * session key and the snapshot trusts it for the window only. The thread is
    * resolved through the message rather than believed, so a reply id lights up
    * the root it belongs to and the channel comes from the message.
-   *
-   * @param {{agentId: string, threadId: string, think?: unknown}} input
    */
-  function externalThinking(input = {}) {
-    const agentId = String(input.agentId ?? '').trim().toLowerCase();
+  function externalThinking(input: ExternalThinkingInput = {}): { ok: true } {
+    const agentId = String(input.agentId ?? '')
+      .trim()
+      .toLowerCase();
     if (!NAME_RE.test(agentId)) {
       throw new ValidationError(`"${input.agentId ?? ''}" is not a valid agent id.`, {
         hint: 'Use letters, digits, "-", "_" or "." — the name the agent posts under.',
@@ -958,7 +1123,7 @@ export function createAgentService(ctx) {
         details: { threadId },
       });
     }
-    const rootId = target.threadId ?? target.id;
+    const rootId = target.threadId;
     const payload = { think: normalizeThinking(input.think) };
     // The same dedupe as `thinking`, and a gateway needs it more: it has no
     // session, so its rows are keyed on the agent name alone and a chatty
@@ -982,7 +1147,7 @@ export function createAgentService(ctx) {
     return { ok: true };
   }
 
-  function end(ref, opts = {}) {
+  function end(ref: string, opts: SessionReadOptions = {}): AgentSession {
     return transact(db, () => {
       const session = get(ref, opts);
       touch(session.key, { status: 'ended' });
@@ -996,7 +1161,7 @@ export function createAgentService(ctx) {
     });
   }
 
-  function remove(ref, opts = {}) {
+  function remove(ref: string, opts: SessionReadOptions = {}): AgentSession & { deleted: true } {
     const session = get(ref, opts);
     db.prepare('DELETE FROM agent_sessions WHERE key = ?').run(session.key);
     return { ...session, deleted: true };
@@ -1030,3 +1195,5 @@ export function createAgentService(ctx) {
     serialize,
   };
 }
+
+export type AgentService = ReturnType<typeof createAgentService>;

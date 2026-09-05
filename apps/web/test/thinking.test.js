@@ -21,7 +21,7 @@ import { applyChunk, emptyThink, readThinking, settle, stepStatusLabel, THINK_KE
 // The other half of the invariant at the bottom of this file. Reached for by
 // path rather than through the package's index, because that index opens a
 // database and this module has no imports at all.
-import { mergeThinking } from '../../../packages/core/src/thinking.js';
+import { mergeThinking } from '../../../packages/core/src/thinking.ts';
 
 /** A real `hermes` reply, minus everything this module does not look at. */
 function reply(metadata) {

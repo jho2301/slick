@@ -20,20 +20,22 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { slickHome } from './paths.js';
+import { errorCode } from './guards.ts';
+import { slickHome } from './paths.ts';
+import type { ServeStatus, SessionState } from './types.ts';
 
 /** Where `slick agent serve` takes its one-watcher-per-key lock. */
-export function serveLockPath(key, home) {
+export function serveLockPath(key: string, home?: string | null): string {
   return join(slickHome(home), `serve-${key}.lock`);
 }
 
-const isAlive = (pid) => {
+const isAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
     // EPERM means the process exists and belongs to someone else — still alive.
-    return err.code === 'EPERM';
+    return errorCode(err) === 'EPERM';
   }
 };
 
@@ -43,11 +45,9 @@ const isAlive = (pid) => {
  * A lock left behind by a killed process is not a watcher: the pid is checked
  * rather than trusted, so a machine that lost power does not spend the next
  * week claiming its agents are up.
- *
- * @returns {{pid: number}|null}
  */
-export function readServeLock(key, home) {
-  let raw;
+export function readServeLock(key: string, home?: string | null): { pid: number } | null {
+  let raw: string;
   try {
     raw = readFileSync(serveLockPath(key, home), 'utf8');
   } catch {
@@ -66,21 +66,26 @@ export function readServeLock(key, home) {
  * `_serveModel` is deliberately absent: a human can set a model from the app
  * on any session, and wanting an agent served is not the same as serving it.
  */
-const SERVE_FOOTPRINT = ['_serveThreads', '_serveSessionId', '_serveStateSig', '_serveModelsAt', '_serveModelChoices'];
+const SERVE_FOOTPRINT = [
+  '_serveThreads',
+  '_serveSessionId',
+  '_serveStateSig',
+  '_serveModelsAt',
+  '_serveModelChoices',
+];
 
 /** Has a watcher ever attached to this session? */
-export function wasEverServed(state) {
+export function wasEverServed(state: SessionState | null | undefined): boolean {
   return SERVE_FOOTPRINT.some((key) => state?.[key] != null);
 }
 
 /**
  * Whether an @mention of this session can expect an answer.
- *
- * @param {{key: string, status?: string, state?: Record<string, unknown>}} session
- * @param {string} [home]
- * @returns {{live: boolean, pid: number|null, served: boolean, callable: boolean}}
  */
-export function serveStatus(session, home) {
+export function serveStatus(
+  session: { key: string; status?: string | null; state?: SessionState | null },
+  home?: string | null
+): ServeStatus {
   const lock = readServeLock(session.key, home);
   const served = wasEverServed(session.state);
   const active = (session.status ?? 'active') === 'active';

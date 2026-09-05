@@ -9,14 +9,23 @@
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-/** @param {string} [override] */
-export function slickHome(override) {
+export function slickHome(override?: string | null): string {
   const raw = override ?? process.env.SLICK_HOME ?? join(homedir(), '.slick');
   return resolve(raw);
 }
 
-/** @param {string} [home] */
-export function paths(home) {
+export interface SlickPaths {
+  root: string;
+  db: string;
+  daemonFile: string;
+  daemonLog: string;
+  tokenFile: string;
+  noAuthFile: string;
+  uploads: string;
+  adapters: string;
+}
+
+export function paths(home?: string | null): SlickPaths {
   const root = slickHome(home);
   return {
     root,
@@ -28,7 +37,7 @@ export function paths(home) {
     // workspace; see `slickd --no-auth`.
     noAuthFile: join(root, 'no-auth'),
     uploads: join(root, 'files'),
-    // One JSON file per agent adapter; see `adapters.js`.
+    // One JSON file per agent adapter; see `adapters.ts`.
     adapters: join(root, 'adapters'),
   };
 }

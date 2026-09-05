@@ -13,31 +13,29 @@ const TIME_LEN = 10;
 const RANDOM_LEN = 16;
 
 let lastTime = -1;
-/** @type {number[]} */
-let lastRandom = [];
+let lastRandom: number[] = [];
 
-function encodeTime(now) {
+function encodeTime(now: number): string {
   let out = '';
   let t = now;
   for (let i = TIME_LEN - 1; i >= 0; i--) {
-    out = ALPHABET[t % 32] + out;
+    out = ALPHABET.charAt(t % 32) + out;
     t = Math.floor(t / 32);
   }
   return out;
 }
 
-function randomChars(len) {
-  const bytes = randomBytes(len);
-  const out = [];
-  for (let i = 0; i < len; i++) out.push(bytes[i] % 32);
+function randomChars(len: number): number[] {
+  const out: number[] = [];
+  for (const byte of randomBytes(len)) out.push(byte % 32);
   return out;
 }
 
 /** Bump the random suffix so ids minted in the same millisecond stay ordered. */
-function incrementRandom(chars) {
+function incrementRandom(chars: number[]): number[] {
   for (let i = chars.length - 1; i >= 0; i--) {
-    if (chars[i] < 31) {
-      chars[i] += 1;
+    if ((chars[i] ?? 0) < 31) {
+      chars[i] = (chars[i] ?? 0) + 1;
       return chars;
     }
     chars[i] = 0;
@@ -45,23 +43,21 @@ function incrementRandom(chars) {
   return randomChars(RANDOM_LEN); // astronomically unlikely overflow
 }
 
-/** @param {number} [now] */
-export function ulid(now = Date.now()) {
+export function ulid(now: number = Date.now()): string {
   if (now === lastTime) {
     lastRandom = incrementRandom(lastRandom);
   } else {
     lastTime = now;
     lastRandom = randomChars(RANDOM_LEN);
   }
-  return encodeTime(now) + lastRandom.map((c) => ALPHABET[c]).join('');
+  return encodeTime(now) + lastRandom.map((c) => ALPHABET.charAt(c)).join('');
 }
 
 /**
  * Prefixed id, e.g. `ch_01k2...`. The prefix makes CLI output self-describing
  * and lets us reject "you passed a channel id where a message id goes".
- * @param {string} prefix
  */
-export function newId(prefix, now = Date.now()) {
+export function newId(prefix: string, now: number = Date.now()): string {
   return `${prefix}_${ulid(now)}`;
 }
 
@@ -72,8 +68,7 @@ export const ID_PREFIX = Object.freeze({
   session: 'ses',
 });
 
-/** @param {string} value @param {string} prefix */
-export function hasPrefix(value, prefix) {
+export function hasPrefix(value: unknown, prefix: string): boolean {
   return typeof value === 'string' && value.startsWith(`${prefix}_`);
 }
 
@@ -82,14 +77,15 @@ export function hasPrefix(value, prefix) {
  * so they are shorter than ids and visually distinct.
  * Shape: `slk_h1_<20 base32 chars>`.
  */
-export function newHistoryKey() {
-  const chars = randomChars(20).map((c) => ALPHABET[c]).join('');
+export function newHistoryKey(): string {
+  const chars = randomChars(20)
+    .map((c) => ALPHABET.charAt(c))
+    .join('');
   return `slk_h1_${chars}`;
 }
 
 const HISTORY_KEY_RE = /^slk_h1_[0-9a-hjkmnp-tv-z]{20}$/;
 
-/** @param {unknown} value */
-export function looksLikeHistoryKey(value) {
+export function looksLikeHistoryKey(value: unknown): value is string {
   return typeof value === 'string' && HISTORY_KEY_RE.test(value);
 }

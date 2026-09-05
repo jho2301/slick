@@ -7,38 +7,62 @@
  * sync on every edit.
  */
 
-import { rows } from './db.js';
-import { serializeMessage } from './messages.js';
+import type { DatabaseSync } from 'node:sqlite';
+
+import { rows, type SQLInputValue } from './db.ts';
+import { serializeMessageRow, type MessageRow } from './messages.ts';
+import type { ChannelService } from './channels.ts';
+import type { Message } from './types.ts';
 
 /** Escape LIKE wildcards so a literal `%` in a query means `%`. */
-function likeTerm(term) {
+function likeTerm(term: string): string {
   return `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 }
 
-function tokenize(query) {
-  const terms = [];
+function tokenize(query: unknown): string[] {
+  const terms: string[] = [];
   const re = /"([^"]+)"|(\S+)/g;
   for (const match of String(query ?? '').matchAll(re)) {
-    const term = (match[1] ?? match[2]).trim();
+    const term = (match[1] ?? match[2] ?? '').trim();
     if (term) terms.push(term);
   }
   return terms;
 }
 
-export function createSearchService(ctx) {
+export interface SearchOptions {
+  channel?: string;
+  limit?: number;
+  author?: string;
+  kind?: string;
+  includeDeleted?: boolean;
+  threadsOnly?: boolean;
+}
+
+export interface SearchResult {
+  query: string;
+  terms: string[];
+  results: Message[];
+  count: number;
+  hasMore?: boolean;
+}
+
+export interface SearchServiceContext {
+  db: DatabaseSync;
+  channels: ChannelService;
+}
+
+export function createSearchService(ctx: SearchServiceContext) {
   const { db, channels } = ctx;
 
   /**
-   * @param {string} query terms are ANDed; use "quotes" for phrases
-   * @param {{channel?: string, limit?: number, author?: string, kind?: string,
-   *          includeDeleted?: boolean, threadsOnly?: boolean}} [opts]
+   * @param query terms are ANDed; use "quotes" for phrases
    */
-  function search(query, opts = {}) {
+  function search(query: unknown, opts: SearchOptions = {}): SearchResult {
     const terms = tokenize(query);
     if (terms.length === 0) return { query: '', terms: [], results: [], count: 0 };
 
     const where = terms.map(() => "m.text LIKE ? ESCAPE '\\'");
-    const params = terms.map(likeTerm);
+    const params: SQLInputValue[] = terms.map(likeTerm);
 
     if (!opts.includeDeleted) where.push('m.deleted_at IS NULL');
     if (opts.channel) {
@@ -56,7 +80,7 @@ export function createSearchService(ctx) {
     if (opts.threadsOnly) where.push('m.parent_id IS NULL');
 
     const limit = Math.min(Math.max(Number(opts.limit ?? 25), 1), 200);
-    const list = rows(
+    const list = rows<MessageRow>(
       db
         .prepare(
           `SELECT m.*, c.slug AS channel_slug
@@ -71,7 +95,7 @@ export function createSearchService(ctx) {
     return {
       query: String(query),
       terms,
-      results: list.slice(0, limit).map(serializeMessage),
+      results: list.slice(0, limit).map(serializeMessageRow),
       count: Math.min(list.length, limit),
       hasMore,
     };
@@ -79,3 +103,5 @@ export function createSearchService(ctx) {
 
   return { search, tokenize };
 }
+
+export type SearchService = ReturnType<typeof createSearchService>;

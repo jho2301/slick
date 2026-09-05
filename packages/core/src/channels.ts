@@ -5,15 +5,19 @@
  * and by id everywhere a machine stores them, so every lookup accepts either.
  */
 
-import { ConflictError, NotFoundError, ValidationError } from './errors.js';
-import { newId, ID_PREFIX } from './ids.js';
-import { row, rows, transact } from './db.js';
-import { EVENT_TYPES, recordEvent } from './events.js';
+import type { DatabaseSync } from 'node:sqlite';
+
+import { ConflictError, NotFoundError, ValidationError } from './errors.ts';
+import { newId, ID_PREFIX } from './ids.ts';
+import { row, rows, transact, type SQLInputValue } from './db.ts';
+import { EVENT_TYPES, recordEvent } from './events.ts';
+import type { CategoryService } from './categories.ts';
+import type { Author, Channel } from './types.ts';
 
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 /** Turn free text into a legal slug: "Design Review!" -> "design-review". */
-export function slugify(input) {
+export function slugify(input: unknown): string {
   const slug = String(input ?? '')
     .trim()
     .toLowerCase()
@@ -25,8 +29,8 @@ export function slugify(input) {
   return slug;
 }
 
-/** @param {string} slug @param {string} [what] what to call it in the error */
-export function assertSlug(slug, what = 'channel') {
+/** @param what what to call it in the error */
+export function assertSlug(slug: string, what = 'channel'): string {
   if (!SLUG_RE.test(slug)) {
     throw new ValidationError(
       `"${slug}" is not a valid ${what} name. Use 1–64 lowercase letters, digits, "-", "_" or "."`,
@@ -53,9 +57,27 @@ const CHANNEL_STATS = `,
                 (SELECT MAX(m.created_at) FROM messages m
                    WHERE m.channel_id = c.id AND m.deleted_at IS NULL) AS last_message_at`;
 
-function serialize(record) {
-  const c = row(record);
-  if (!c) return null;
+interface ChannelRow {
+  id: string;
+  slug: string;
+  name: string;
+  topic: string;
+  purpose: string;
+  kind: string;
+  category_id: string | null;
+  category_slug?: string | null;
+  category_name?: string | null;
+  category_position?: number | null;
+  position: number;
+  archived_at: number | null;
+  created_at: number;
+  updated_at: number;
+  created_by: string;
+  message_count?: number | null;
+  last_message_at?: number | null;
+}
+
+function serializeRow(c: ChannelRow): Channel {
   return {
     id: c.id,
     slug: c.slug,
@@ -68,9 +90,9 @@ function serialize(record) {
       c.category_slug == null
         ? null
         : {
-            id: c.category_id,
+            id: c.category_id ?? '',
             slug: c.category_slug,
-            name: c.category_name,
+            name: c.category_name ?? '',
             position: Number(c.category_position),
           },
     position: Number(c.position),
@@ -84,11 +106,57 @@ function serialize(record) {
   };
 }
 
-export function createChannelService(ctx) {
+function serialize(record: unknown): Channel | null {
+  const c = row<ChannelRow>(record);
+  return c ? serializeRow(c) : null;
+}
+
+/** A category by slug or id, or null / '' / false to mean "none". */
+export type CategoryRef = string | null | false;
+
+export interface ChannelInput {
+  slug?: string;
+  name?: string;
+  topic?: string;
+  purpose?: string;
+  kind?: string;
+  category?: CategoryRef;
+  categoryId?: string | null;
+  actor?: Author;
+}
+
+export interface ChannelPatch {
+  slug?: string | null;
+  name?: string | null;
+  topic?: string | null;
+  purpose?: string | null;
+  position?: number | null;
+  category?: CategoryRef;
+  categoryId?: string | null;
+  actor?: Author;
+}
+
+export interface ChannelListOptions {
+  includeArchived?: boolean;
+  withStats?: boolean;
+  /** Filter to one category by slug or id, or `null` for the channels in none. */
+  category?: CategoryRef;
+}
+
+export interface ChannelServiceContext {
+  db: DatabaseSync;
+  actor: Author;
+  categories: CategoryService;
+}
+
+/** The fields an update compares, in the order they are reported. */
+const EDITABLE = ['slug', 'name', 'topic', 'purpose', 'position', 'categoryId'] as const;
+
+export function createChannelService(ctx: ChannelServiceContext) {
   const { db, actor: defaultActor } = ctx;
 
   /** Resolve `#general`, `general` or `ch_01k…` to a row. Returns null if absent. */
-  function find(ref) {
+  function find(ref: string | null | undefined): Channel | null {
     if (!ref) return null;
     const raw = String(ref).trim().replace(/^#/, '');
     const byId = db.prepare(`${selectChannels()} WHERE c.id = ?`).get(raw);
@@ -97,7 +165,7 @@ export function createChannelService(ctx) {
     return bySlug ? serialize(bySlug) : null;
   }
 
-  function get(ref) {
+  function get(ref: string | null | undefined): Channel {
     const found = find(ref);
     if (!found) {
       throw new NotFoundError(`No channel named "${ref}".`, {
@@ -113,21 +181,23 @@ export function createChannelService(ctx) {
    * already-resolved form. Returns `undefined` when neither was mentioned, so
    * an update can tell "leave it alone" from "remove it".
    */
-  function resolveCategoryId(input) {
+  function resolveCategoryId(input: {
+    category?: CategoryRef;
+    categoryId?: string | null;
+  }): string | null | undefined {
     const ref = input.categoryId !== undefined ? input.categoryId : input.category;
     if (ref === undefined) return undefined;
     if (ref === null || ref === '' || ref === false) return null;
     return ctx.categories.get(ref).id;
   }
 
-  /** @param {{includeArchived?: boolean, withStats?: boolean, category?: string}} [opts] */
-  function list(opts = {}) {
+  function list(opts: ChannelListOptions = {}): Channel[] {
     const where = [opts.includeArchived ? '1 = 1' : 'c.archived_at IS NULL'];
-    const params = [];
+    const params: SQLInputValue[] = [];
     if (opts.category !== undefined) {
       const categoryId = resolveCategoryId({ category: opts.category });
       if (categoryId === null) where.push('c.category_id IS NULL');
-      else {
+      else if (categoryId !== undefined) {
         where.push('c.category_id = ?');
         params.push(categoryId);
       }
@@ -135,15 +205,10 @@ export function createChannelService(ctx) {
     const sql = `${selectChannels(opts.withStats === false ? '' : CHANNEL_STATS)}
           WHERE ${where.join(' AND ')}
           ORDER BY c.position ASC, c.slug ASC`;
-    return rows(db.prepare(sql).all(...params)).map(serialize);
+    return rows<ChannelRow>(db.prepare(sql).all(...params)).map(serializeRow);
   }
 
-  /**
-   * @param {{slug: string, name?: string, topic?: string, purpose?: string,
-   *          kind?: string, category?: string|null, categoryId?: string|null,
-   *          actor?: {id: string, kind: string}}} input
-   */
-  function create(input) {
+  function create(input: ChannelInput): Channel {
     const slug = assertSlug(slugify(input.slug ?? input.name));
     const actor = input.actor ?? defaultActor;
     return transact(db, () => {
@@ -154,8 +219,9 @@ export function createChannelService(ctx) {
       const categoryId = resolveCategoryId(input) ?? null;
       const now = Date.now();
       const id = newId(ID_PREFIX.channel, now);
-      const nextPosition =
-        Number(db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS p FROM channels').get().p);
+      const nextPosition = Number(
+        db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS p FROM channels').get()?.p ?? 1
+      );
       db.prepare(
         `INSERT INTO channels (id, slug, name, topic, purpose, kind, category_id, position, created_at, updated_at, created_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -184,13 +250,7 @@ export function createChannelService(ctx) {
     });
   }
 
-  /**
-   * @param {string} ref
-   * @param {{slug?: string, name?: string, topic?: string, purpose?: string,
-   *          position?: number, category?: string|null, categoryId?: string|null,
-   *          actor?: {id: string, kind: string}}} patch
-   */
-  function update(ref, patch) {
+  function update(ref: string, patch: ChannelPatch): Channel {
     const actor = patch.actor ?? defaultActor;
     return transact(db, () => {
       const current = get(ref);
@@ -206,7 +266,9 @@ export function createChannelService(ctx) {
       if (patch.slug !== undefined && patch.slug !== null) {
         const slug = assertSlug(slugify(patch.slug));
         if (slug !== current.slug) {
-          const clash = db.prepare('SELECT id FROM channels WHERE slug = ? AND id != ?').get(slug, current.id);
+          const clash = db
+            .prepare('SELECT id FROM channels WHERE slug = ? AND id != ?')
+            .get(slug, current.id);
           if (clash) throw new ConflictError(`Channel #${slug} already exists.`, { details: { slug } });
         }
         next.slug = slug;
@@ -218,7 +280,7 @@ export function createChannelService(ctx) {
       const categoryId = resolveCategoryId(patch);
       if (categoryId !== undefined) next.categoryId = categoryId;
 
-      const changed = Object.keys(next).filter((k) => next[k] !== current[k]);
+      const changed = EDITABLE.filter((k) => next[k] !== current[k]);
       if (changed.length === 0) return current;
 
       const now = Date.now();
@@ -239,7 +301,7 @@ export function createChannelService(ctx) {
     });
   }
 
-  function setArchived(ref, archived, actor = defaultActor) {
+  function setArchived(ref: string, archived: boolean, actor: Author = defaultActor): Channel {
     return transact(db, () => {
       const current = get(ref);
       if (current.archived === archived) return current;
@@ -261,29 +323,24 @@ export function createChannelService(ctx) {
     });
   }
 
-  const archive = (ref, actor) => setArchived(ref, true, actor);
-  const unarchive = (ref, actor) => setArchived(ref, false, actor);
+  const archive = (ref: string, actor?: Author): Channel => setArchived(ref, true, actor);
+  const unarchive = (ref: string, actor?: Author): Channel => setArchived(ref, false, actor);
 
   /**
    * Permanently drop a channel and everything in it. Refuses non-empty
    * channels unless `force` — archiving is almost always what you meant.
-   * @param {string} ref
-   * @param {{force?: boolean, actor?: {id: string, kind: string}}} [opts]
    */
-  function remove(ref, opts = {}) {
+  function remove(ref: string, opts: { force?: boolean; actor?: Author } = {}) {
     const actor = opts.actor ?? defaultActor;
     return transact(db, () => {
       const current = get(ref);
-      const { n } = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?').get(current.id);
-      const count = Number(n);
+      const n = db.prepare('SELECT COUNT(*) AS n FROM messages WHERE channel_id = ?').get(current.id)?.n;
+      const count = Number(n ?? 0);
       if (count > 0 && !opts.force) {
-        throw new ConflictError(
-          `#${current.slug} still holds ${count} message${count === 1 ? '' : 's'}.`,
-          {
-            hint: 'Archive it instead, or pass force to delete the messages too.',
-            details: { channelId: current.id, messageCount: count },
-          }
-        );
+        throw new ConflictError(`#${current.slug} still holds ${count} message${count === 1 ? '' : 's'}.`, {
+          hint: 'Archive it instead, or pass force to delete the messages too.',
+          details: { channelId: current.id, messageCount: count },
+        });
       }
       db.prepare('DELETE FROM channels WHERE id = ?').run(current.id);
       recordEvent(db, {
@@ -292,9 +349,11 @@ export function createChannelService(ctx) {
         channelId: current.id,
         payload: { channel: current, deletedMessages: count },
       });
-      return { ...current, deleted: true, deletedMessages: count };
+      return { ...current, deleted: true as const, deletedMessages: count };
     });
   }
 
   return { find, get, list, create, update, archive, unarchive, remove, serialize };
 }
+
+export type ChannelService = ReturnType<typeof createChannelService>;

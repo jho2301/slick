@@ -35,8 +35,9 @@ import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { NotFoundError, ValidationError } from './errors.js';
-import { paths } from './paths.js';
+import { NotFoundError, ValidationError } from './errors.ts';
+import { errorCode, errorMessage, isRecord } from './guards.ts';
+import { paths } from './paths.ts';
 
 /**
  * The argument groups an adapter can fill, in the order they are handed to the
@@ -56,20 +57,135 @@ const ARG_SLOTS = [
   'effort',
   'system',
   'listModels',
-];
+] as const;
+
+export type ArgSlot = (typeof ARG_SLOTS)[number];
+
+const isArgSlot = (value: string): value is ArgSlot => (ARG_SLOTS as readonly string[]).includes(value);
 
 /** Groups built into the argv, in order. `listModels` is its own call. */
 const CALL_SLOTS = ARG_SLOTS.filter((slot) => slot !== 'listModels');
 
 /** Slots whose presence alone is the value — no placeholder to fill. */
-const FLAG_SLOTS = new Set(['base', 'stream', 'skipPermissions', 'listModels']);
+const FLAG_SLOTS: ReadonlySet<ArgSlot> = new Set<ArgSlot>([
+  'base',
+  'stream',
+  'skipPermissions',
+  'listModels',
+]);
 
-const PROMPT_VIA = new Set(['arg', 'stdin']);
-const REPLY_FORMATS = new Set(['json', 'text']);
-const STREAMS = new Set(['stdout', 'stderr', 'both']);
-const STREAM_FORMATS = new Set(['jsonl']);
+type PromptVia = 'arg' | 'stdin';
+type ReplyFormat = 'json' | 'text';
+type StreamName = 'stdout' | 'stderr' | 'both';
+
+const PROMPT_VIA: ReadonlySet<string> = new Set<PromptVia>(['arg', 'stdin']);
+const REPLY_FORMATS: ReadonlySet<string> = new Set<ReplyFormat>(['json', 'text']);
+const STREAMS: ReadonlySet<string> = new Set<StreamName>(['stdout', 'stderr', 'both']);
+const STREAM_FORMATS: ReadonlySet<string> = new Set(['jsonl']);
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+/** One argument group, compiled: the template, and the match form if it has one. */
+export interface ArgGroup {
+  template: string[];
+  match: RegExp | null;
+  alt: string[] | null;
+}
+
+export interface ReplyLookup {
+  sqlite: string;
+  query: string;
+  bind: string | null;
+}
+
+/** Where one field of the reply is found. */
+export interface ReplyField {
+  path: string | null;
+  pattern: RegExp | null;
+  from?: StreamName;
+  group?: number;
+  lookup?: ReplyLookup | null;
+}
+
+export interface AdapterReply {
+  format: ReplyFormat;
+  text: ReplyField | null;
+  sessionId: ReplyField | null;
+  model: ReplyField | null;
+  effort: ReplyField | null;
+  error: ReplyField | null;
+}
+
+export interface CommandCall {
+  cmd: string | null;
+  args: string[];
+  cwd: string | null;
+}
+
+export interface AdapterCommands {
+  list: CommandCall | null;
+  run: CommandCall | null;
+}
+
+export interface StreamFrame {
+  text: string | null;
+  reasoning: string | null;
+  step: string | null;
+  stepStatus: string | null;
+}
+
+export interface StreamSpec {
+  format: string;
+  text: string | null;
+  reasoning: string | null;
+  step: string | null;
+  stepStatus: string | null;
+  args: ArgGroup | null;
+  read: (frame: unknown) => StreamFrame | null;
+}
+
+export interface Adapter {
+  name: string;
+  label: string;
+  cmd: string | null;
+  promptVia: PromptVia;
+  args: Partial<Record<ArgSlot, ArgGroup>>;
+  reply: AdapterReply;
+  commands: AdapterCommands | null;
+  stream: StreamSpec | null;
+  maxMessageLength: number | null;
+  installHint: string | null;
+  /** Docs for the human; Slick never sends it anywhere on its own. */
+  description: string | null;
+  source: string;
+}
+
+export interface AgentCallValues {
+  prompt?: string | null;
+  session?: string | null;
+  model?: string | null;
+  effort?: string | null;
+  system?: string | null;
+  permissionMode?: string | null;
+  allowedTools?: string | null;
+  skipPermissions?: boolean;
+}
+
+export interface AgentReply {
+  text: string;
+  sessionId: string | null;
+  model: string | null;
+  effort: string | null;
+  error: string | null;
+}
+
+export interface AdapterListing {
+  name: string;
+  label: string;
+  source: string;
+  error: string | null;
+  adapter: Adapter | null;
+}
 
 /**
  * The `claude` CLI, which is what `serve` has always called. It is spelled out
@@ -113,26 +229,26 @@ const PLAIN = {
 
 export const DEFAULT_ADAPTER = 'claude';
 
-function fail(message, hint, details) {
+function fail(message: string, hint?: string, details?: Record<string, unknown>): never {
   throw new ValidationError(message, { hint, details });
 }
 
 // --------------------------------------------------------------- arguments ---
 
-function asStrings(value, what, at) {
+function asStrings(value: unknown, what: string, at: string): string[] {
   if (!Array.isArray(value) || value.some((part) => typeof part !== 'string')) {
     fail(`${at}: "${what}" must be a list of strings.`, 'For example: ["--model", "{model}"].');
   }
-  return value;
+  return value as string[];
 }
 
-function compile(source, what, at) {
+function compile(source: string, what: string, at: string): RegExp {
   try {
     // A sticky or global pattern carries state between calls; nothing here
     // wants that, and `lastIndex` surviving a call is a bug nobody would find.
     return new RegExp(source);
   } catch (err) {
-    return fail(`${at}: "${what}" is not a valid pattern: ${err.message}`);
+    return fail(`${at}: "${what}" is not a valid pattern: ${errorMessage(err)}`);
   }
 }
 
@@ -150,13 +266,16 @@ function compile(source, what, at) {
  * `{1}`, `{2}`, … are the captures. Without `else`, a value that does not
  * match leaves the group out, which is how you say "only this shape counts".
  */
-function normalizeArgGroup(slot, raw, at) {
+function normalizeArgGroup(slot: string, raw: unknown, at: string): ArgGroup {
   if (Array.isArray(raw)) return { template: asStrings(raw, `args.${slot}`, at), match: null, alt: null };
-  if (!raw || typeof raw !== 'object') {
+  if (!isRecord(raw)) {
     fail(`${at}: "args.${slot}" must be a list of strings, or an object with a "match".`);
   }
   if (typeof raw.match !== 'string' || !raw.match) {
-    fail(`${at}: "args.${slot}" is an object, so it needs a "match" pattern.`, 'A plain list needs no match.');
+    fail(
+      `${at}: "args.${slot}" is an object, so it needs a "match" pattern.`,
+      'A plain list needs no match.'
+    );
   }
   return {
     template: asStrings(raw.args, `args.${slot}.args`, at),
@@ -165,19 +284,14 @@ function normalizeArgGroup(slot, raw, at) {
   };
 }
 
-const fill = (part, values) =>
-  part.replace(/\{(\w+)\}/g, (whole, key) => (values[key] == null ? whole : String(values[key])));
+const fill = (part: string, values: Record<string, unknown>): string =>
+  part.replace(/\{(\w+)\}/g, (whole, key: string) => (values[key] == null ? whole : String(values[key])));
 
 /**
  * The argv for one call.
- *
- * @param {object} adapter
- * @param {{prompt?: string, session?: string|null, model?: string|null, system?: string|null,
- *          permissionMode?: string|null, allowedTools?: string|null, skipPermissions?: boolean}} values
- * @returns {string[]}
  */
-export function buildAgentArgs(adapter, values = {}) {
-  const of = {
+export function buildAgentArgs(adapter: Adapter, values: AgentCallValues = {}): string[] {
+  const of: Partial<Record<ArgSlot, unknown>> = {
     prompt: adapter.promptVia === 'stdin' ? null : values.prompt,
     resume: values.session,
     permissionMode: values.permissionMode,
@@ -192,9 +306,9 @@ export function buildAgentArgs(adapter, values = {}) {
     // second thing to remember to turn on.
     stream: Boolean(adapter.stream),
   };
-  const args = [];
+  const args: string[] = [];
   for (const slot of CALL_SLOTS) {
-    const group = adapter.args?.[slot];
+    const group = adapter.args[slot];
     if (!group) continue;
     if (FLAG_SLOTS.has(slot)) {
       if (slot === 'base' || of[slot]) args.push(...group.template);
@@ -203,12 +317,13 @@ export function buildAgentArgs(adapter, values = {}) {
     const value = of[slot];
     if (value == null || value === '' || value === false) continue;
 
-    const bag = { ...values, value };
+    const bag: Record<string, unknown> = { ...values, value };
     let template = group.template;
     if (group.match) {
       const found = group.match.exec(String(value));
-      if (found) found.forEach((capture, index) => index > 0 && (bag[index] = capture));
-      else if (group.alt) template = group.alt;
+      if (found) {
+        for (let index = 1; index < found.length; index++) bag[index] = found[index];
+      } else if (group.alt) template = group.alt;
       else continue; // the value is not the shape this group is for
     }
     args.push(...template.map((part) => fill(part, bag)));
@@ -219,7 +334,7 @@ export function buildAgentArgs(adapter, values = {}) {
 // ------------------------------------------------------------------ replies ---
 
 /** `~/x` → `/Users/you/x`; anything else is left as written. */
-const expand = (path) => {
+const expand = (path: unknown): string => {
   const value = String(path);
   if (value === '~') return homedir();
   if (value.startsWith('~/')) return join(homedir(), value.slice(2));
@@ -248,9 +363,9 @@ const expand = (path) => {
  * still there when the lookup comes back empty. The session id is the one
  * field that cannot be sourced this way: it is the key the others bind to.
  */
-const LOOKUP_FIELDS = new Set(['text', 'model', 'effort']);
+const LOOKUP_FIELDS: ReadonlySet<string> = new Set(['text', 'model', 'effort']);
 
-function normalizeLookup(raw, name, at) {
+function normalizeLookup(raw: Record<string, unknown>, name: string, at: string): ReplyLookup {
   if (!LOOKUP_FIELDS.has(name)) {
     fail(
       `${at}: "reply.${name}" cannot be read from a database.`,
@@ -259,18 +374,27 @@ function normalizeLookup(raw, name, at) {
   }
   const query = String(raw.query ?? '').trim();
   if (!/^select\s/i.test(query) || query.includes(';')) {
-    fail(`${at}: "reply.${name}.query" must be a single SELECT.`, 'For example: SELECT model FROM sessions WHERE id = ?');
+    fail(
+      `${at}: "reply.${name}.query" must be a single SELECT.`,
+      'For example: SELECT model FROM sessions WHERE id = ?'
+    );
   }
   const wants = (query.match(/\?/g) ?? []).length;
   if (wants > 1) fail(`${at}: "reply.${name}.query" may take at most one "?".`);
-  const bind = raw.bind ?? (wants ? 'sessionId' : null);
+  const bind = raw.bind == null ? (wants ? 'sessionId' : null) : String(raw.bind);
   if (wants && bind !== 'sessionId') {
-    fail(`${at}: "reply.${name}.bind" must be "sessionId".`, 'It is the only value read before the lookup runs.');
+    fail(
+      `${at}: "reply.${name}.bind" must be "sessionId".`,
+      'It is the only value read before the lookup runs.'
+    );
   }
   // A bind with nothing to bind to throws on every call, and the lookup
   // swallows its own errors — so the field would just never resolve, silently.
   if (!wants && raw.bind) {
-    fail(`${at}: "reply.${name}.bind" has no "?" in the query to bind to.`, 'Add the placeholder, or drop the bind.');
+    fail(
+      `${at}: "reply.${name}.bind" has no "?" in the query to bind to.`,
+      'Add the placeholder, or drop the bind.'
+    );
   }
   const file = expand(raw.sqlite);
   if (!isAbsolute(file)) fail(`${at}: "reply.${name}.sqlite" must be an absolute path (or start with ~).`);
@@ -284,7 +408,7 @@ function normalizeLookup(raw, name, at) {
  * a filesystem path, and only the file name of it is a model as a human knows
  * it.
  */
-function normalizeField(raw, name, format, at) {
+function normalizeField(raw: unknown, name: string, format: ReplyFormat, at: string): ReplyField | null {
   if (raw == null) return null;
   if (typeof raw === 'string') {
     if (format !== 'json') {
@@ -295,34 +419,42 @@ function normalizeField(raw, name, format, at) {
     }
     return { path: raw, pattern: null };
   }
-  if (typeof raw !== 'object' || Array.isArray(raw)) fail(`${at}: "reply.${name}" must be a name or an object.`);
+  if (!isRecord(raw)) fail(`${at}: "reply.${name}" must be a name or an object.`);
 
   const lookup = raw.sqlite ? normalizeLookup(raw, name, at) : null;
   if (!lookup && (typeof raw.pattern !== 'string' || !raw.pattern)) {
     fail(`${at}: "reply.${name}" is an object, so it needs a "pattern" or a "sqlite" lookup.`);
   }
-  const from = raw.from ?? 'both';
+  const from = raw.from == null ? 'both' : String(raw.from);
   if (!STREAMS.has(from)) fail(`${at}: "reply.${name}.from" must be ${[...STREAMS].join(', ')}.`);
   const group = raw.group === undefined ? 1 : Number(raw.group);
   if (!Number.isInteger(group) || group < 0) fail(`${at}: "reply.${name}.group" must be a capture number.`);
   return {
     path: null,
-    pattern: raw.pattern ? compile(raw.pattern, `reply.${name}.pattern`, at) : null,
-    from,
+    pattern:
+      typeof raw.pattern === 'string' && raw.pattern
+        ? compile(raw.pattern, `reply.${name}.pattern`, at)
+        : null,
+    from: from as StreamName,
     group,
     lookup,
   };
 }
 
 /** `a.b.c` out of a parsed reply; undefined when any step is missing. */
-function pluck(value, path) {
+function pluck(value: unknown, path: string | null | undefined): unknown {
   if (!path) return undefined;
-  let current = value;
+  let current: unknown = value;
   for (const key of String(path).split('.')) {
-    if (current == null || typeof current !== 'object') return undefined;
+    if (!isRecord(current)) return undefined;
     current = current[key];
   }
   return current;
+}
+
+interface Streams {
+  stdout: string;
+  stderr: string;
 }
 
 /**
@@ -332,14 +464,18 @@ function pluck(value, path) {
  * trim what the lookup returns, and a trimming pattern turned loose on stdout
  * will happily match the whole answer.
  */
-function scan(field, streams) {
+function scan(field: ReplyField | null | undefined, streams: Streams): string | null {
   if (!field?.pattern || field.lookup) return null;
   const sources =
-    field.from === 'stdout' ? [streams.stdout] : field.from === 'stderr' ? [streams.stderr] : [streams.stdout, streams.stderr];
+    field.from === 'stdout'
+      ? [streams.stdout]
+      : field.from === 'stderr'
+        ? [streams.stderr]
+        : [streams.stdout, streams.stderr];
   for (const source of sources) {
     const found = field.pattern.exec(String(source ?? ''));
     if (!found) continue;
-    const captured = (found[field.group] ?? found[0] ?? '').trim();
+    const captured = (found[field.group ?? 1] ?? found[0] ?? '').trim();
     if (captured) return captured;
   }
   return null;
@@ -351,14 +487,21 @@ function scan(field, streams) {
  * us entirely — so a reply that names its own model is the only honest record
  * of which one wrote it. Absent for a binary that does not report one.
  */
-function reportedModel(parsed, field) {
-  const direct = pluck(parsed, field?.path ?? 'model') ?? parsed?.modelUsed;
+function reportedModel(parsed: unknown, field: ReplyField | null): string | null {
+  const direct = pluck(parsed, field?.path ?? 'model') ?? (isRecord(parsed) ? parsed.modelUsed : undefined);
   if (typeof direct === 'string' && direct.trim()) return direct.trim().slice(0, 200);
   // The `claude` CLI reports per-model token usage rather than a name; with one
   // model in it, that key is the answer.
-  const usage = parsed?.modelUsage;
-  const names = usage && typeof usage === 'object' ? Object.keys(usage) : [];
-  return names.length === 1 ? names[0].slice(0, 200) : null;
+  const usage = isRecord(parsed) ? parsed.modelUsage : undefined;
+  const names = isRecord(usage) ? Object.keys(usage) : [];
+  return names.length === 1 ? (names[0] ?? '').slice(0, 200) : null;
+}
+
+export interface AgentOutput {
+  stdout?: string;
+  stderr?: string;
+  code?: number | null;
+  cmd?: string;
 }
 
 /**
@@ -367,16 +510,17 @@ function reportedModel(parsed, field) {
  * A JSON adapter whose output did not parse falls through to the plain-text
  * reading rather than failing: a binary that printed a warning and then the
  * answer has still answered.
- *
- * @returns {{text: string, sessionId: string|null, model: string|null, error: string|null}}
  */
-export function parseAgentReply(adapter, { stdout = '', stderr = '', code = 0, cmd = 'the agent' } = {}) {
+export function parseAgentReply(
+  adapter: Adapter,
+  { stdout = '', stderr = '', code = 0, cmd = 'the agent' }: AgentOutput = {}
+): AgentReply {
   const trimmed = String(stdout).trim();
   const said = String(stderr).trim();
-  const reply = adapter.reply ?? {};
+  const reply = adapter.reply;
 
   if (reply.format === 'json') {
-    let parsed = null;
+    let parsed: unknown = null;
     try {
       parsed = JSON.parse(trimmed);
     } catch {
@@ -386,7 +530,7 @@ export function parseAgentReply(adapter, { stdout = '', stderr = '', code = 0, c
     // guessing at `result` would post the whole envelope as the reply.
     const pending = Boolean(reply.text?.lookup);
     const text = pending ? '' : pluck(parsed, reply.text?.path ?? 'result');
-    if (parsed && (pending || typeof text === 'string')) {
+    if (parsed && typeof text === 'string') {
       const sessionId = pluck(parsed, reply.sessionId?.path ?? 'session_id');
       const effort = pluck(parsed, reply.effort?.path);
       const answered = {
@@ -399,14 +543,15 @@ export function parseAgentReply(adapter, { stdout = '', stderr = '', code = 0, c
       }
       // An answer nobody can post is a failure, not an answer: saying so puts
       // it in front of the human instead of losing it inside a retry.
-      if (!pending && !text.trim()) return { text: '', ...answered, error: said || `${cmd} returned an empty answer` };
+      if (!pending && !text.trim())
+        return { text: '', ...answered, error: said || `${cmd} returned an empty answer` };
       return { text, ...answered, error: null };
     }
   }
 
   // Plain output. Whatever the adapter can find in it is worth keeping even
   // when the run failed: which conversation died is how the next one avoids it.
-  const streams = { stdout, stderr };
+  const streams: Streams = { stdout, stderr };
   const found = {
     sessionId: scan(reply.sessionId, streams),
     model: scan(reply.model, streams),
@@ -415,7 +560,7 @@ export function parseAgentReply(adapter, { stdout = '', stderr = '', code = 0, c
   // A looked-up answer is not in the output; the caller fills it in, and an
   // empty one is that caller's problem to report rather than ours to guess at.
   const pending = Boolean(reply.text?.lookup);
-  const text = pending ? '' : reply.text?.pattern ? scan(reply.text, streams) : trimmed;
+  const text = pending ? '' : reply.text?.pattern ? (scan(reply.text, streams) ?? '') : trimmed;
 
   if (code !== 0) return { text: '', ...found, error: said || `${cmd} exited with code ${code}` };
   // An agent that reports failure in its own words while exiting 0 gets to say
@@ -442,13 +587,13 @@ export function parseAgentReply(adapter, { stdout = '', stderr = '', code = 0, c
  * agent's business: Slick neither knows nor invents the vocabulary, it only
  * asks and shows the answer.
  */
-function normalizeCommands(raw, at) {
+function normalizeCommands(raw: unknown, at: string): AdapterCommands | null {
   if (raw == null) return null;
-  if (typeof raw !== 'object' || Array.isArray(raw)) fail(`${at}: "commands" must be an object.`);
-  const part = (name) => {
+  if (!isRecord(raw)) fail(`${at}: "commands" must be an object.`);
+  const part = (name: string): CommandCall | null => {
     const spec = raw[name];
     if (spec == null) return null;
-    if (typeof spec !== 'object' || Array.isArray(spec)) fail(`${at}: "commands.${name}" must be an object.`);
+    if (!isRecord(spec)) fail(`${at}: "commands.${name}" must be an object.`);
     const args = asStrings(spec.args ?? [], `commands.${name}.args`, at);
     if (args.length === 0) fail(`${at}: "commands.${name}.args" cannot be empty.`);
     return {
@@ -461,7 +606,10 @@ function normalizeCommands(raw, at) {
   const run = part('run');
   if (!list && !run) fail(`${at}: "commands" needs a "list", a "run", or both.`);
   if (run && !run.args.some((arg) => arg.includes('{command}'))) {
-    fail(`${at}: "commands.run.args" has no "{command}" placeholder.`, 'Slick has to say which command to run.');
+    fail(
+      `${at}: "commands.run.args" has no "{command}" placeholder.`,
+      'Slick has to say which command to run.'
+    );
   }
   return { list, run };
 }
@@ -496,20 +644,21 @@ function normalizeCommands(raw, at) {
  * decides what actually gets posted, out of the whole of what was printed, and
  * an adapter with no `stream` is called and read exactly as it was before.
  */
-function normalizeStream(raw, at) {
+function normalizeStream(raw: unknown, at: string): StreamSpec | null {
   if (raw == null) return null;
-  if (typeof raw !== 'object' || Array.isArray(raw)) fail(`${at}: "stream" must be an object.`);
-  const format = raw.format ?? 'jsonl';
+  if (!isRecord(raw)) fail(`${at}: "stream" must be an object.`);
+  const format = raw.format == null ? 'jsonl' : String(raw.format);
   if (!STREAM_FORMATS.has(format)) {
     fail(`${at}: "stream.format" must be ${[...STREAM_FORMATS].join(' or ')}.`, 'One JSON frame per line.');
   }
-  const path = (name) => {
+  const path = (name: string): string | null => {
     const value = raw[name];
     if (value == null) return null;
-    if (typeof value !== 'string' || !value) fail(`${at}: "stream.${name}" must be a field name, like "delta.text".`);
+    if (typeof value !== 'string' || !value)
+      fail(`${at}: "stream.${name}" must be a field name, like "delta.text".`);
     return value;
   };
-  const spec = {
+  const spec: StreamSpec = {
     format,
     text: path('text'),
     reasoning: path('reasoning'),
@@ -518,7 +667,12 @@ function normalizeStream(raw, at) {
     // A flag group with no value to fill, so it never needs the `match` form —
     // and naming the key the way the manifest spells it keeps the complaint
     // pointing at the line someone has just typed.
-    args: raw.args == null ? null : { template: asStrings(raw.args, 'stream.args', at), match: null, alt: null },
+    args:
+      raw.args == null ? null : { template: asStrings(raw.args, 'stream.args', at), match: null, alt: null },
+    // The reader rides along with the spec, so that whoever is holding the
+    // adapter — the watcher, reading a line it has just seen printed — can read
+    // a frame without also being handed the paths it was built from.
+    read: (frame) => readFrame(spec, frame),
   };
   if (!spec.text && !spec.reasoning && !spec.step) {
     fail(
@@ -526,10 +680,6 @@ function normalizeStream(raw, at) {
       'Give it a "text", a "reasoning" or a "step" path — otherwise there is nothing to send on.'
     );
   }
-  // The reader rides along with the spec, so that whoever is holding the
-  // adapter — the watcher, reading a line it has just seen printed — can read
-  // a frame without also being handed the paths it was built from.
-  spec.read = (frame) => readFrame(spec, frame);
   return spec;
 }
 
@@ -540,12 +690,10 @@ function normalizeStream(raw, at) {
  * is the wrong shape — a heartbeat, a usage summary, the envelope the answer
  * itself finally arrives in — reads as nothing and is skipped, rather than
  * being passed on as an empty flicker.
- *
- * @returns {{text: string|null, reasoning: string|null, step: string|null, stepStatus: string|null}|null}
  */
-function readFrame(spec, frame) {
-  if (!spec || !frame || typeof frame !== 'object') return null;
-  const piece = (path) => {
+function readFrame(spec: StreamSpec | null, frame: unknown): StreamFrame | null {
+  if (!spec || !isRecord(frame)) return null;
+  const piece = (path: string | null): string | null => {
     const value = pluck(frame, path);
     return typeof value === 'string' ? value : typeof value === 'number' ? String(value) : null;
   };
@@ -561,27 +709,24 @@ function readFrame(spec, frame) {
  *
  * Errors here name the file and the key, because the audience is someone who
  * has just hand-written JSON and needs to know which line to fix.
- *
- * @param {any} raw
- * @param {{name: string, source: string}} where
  */
-export function normalizeAdapter(raw, { name, source }) {
+export function normalizeAdapter(raw: unknown, { name, source }: { name: string; source: string }): Adapter {
   const at = source === 'built-in' ? `adapter "${name}"` : source;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+  if (!isRecord(raw)) {
     fail(`${at} is not a JSON object.`, 'An adapter file holds one object: { "cmd": …, "args": { … } }.');
   }
 
   const rawArgs = raw.args ?? {};
-  if (typeof rawArgs !== 'object' || Array.isArray(rawArgs)) fail(`${at}: "args" must be an object.`);
-  const args = {};
+  if (!isRecord(rawArgs)) fail(`${at}: "args" must be an object.`);
+  const args: Partial<Record<ArgSlot, ArgGroup>> = {};
   for (const [slot, group] of Object.entries(rawArgs)) {
-    if (!ARG_SLOTS.includes(slot)) {
+    if (!isArgSlot(slot)) {
       fail(`${at}: unknown argument group "${slot}".`, `Known groups: ${ARG_SLOTS.join(', ')}.`);
     }
     args[slot] = normalizeArgGroup(slot, group, at);
   }
 
-  const promptVia = raw.promptVia ?? 'arg';
+  const promptVia = raw.promptVia == null ? 'arg' : String(raw.promptVia);
   if (!PROMPT_VIA.has(promptVia)) fail(`${at}: "promptVia" must be ${[...PROMPT_VIA].join(' or ')}.`);
   if (promptVia === 'arg' && !(args.prompt?.template ?? []).some((part) => part.includes('{prompt}'))) {
     fail(
@@ -590,16 +735,22 @@ export function normalizeAdapter(raw, { name, source }) {
     );
   }
 
-  const rawReply = raw.reply ?? {};
-  const format = rawReply.format ?? 'json';
+  const rawReply = isRecord(raw.reply) ? raw.reply : {};
+  const format = rawReply.format == null ? 'json' : String(rawReply.format);
   if (!REPLY_FORMATS.has(format)) fail(`${at}: "reply.format" must be ${[...REPLY_FORMATS].join(' or ')}.`);
-  const reply = {
-    format,
-    text: normalizeField(rawReply.text ?? (format === 'json' ? 'result' : null), 'text', format, at),
-    sessionId: normalizeField(rawReply.sessionId, 'sessionId', format, at),
-    model: normalizeField(rawReply.model, 'model', format, at),
-    effort: normalizeField(rawReply.effort, 'effort', format, at),
-    error: normalizeField(rawReply.error, 'error', format, at),
+  const replyFormat = format as ReplyFormat;
+  const reply: AdapterReply = {
+    format: replyFormat,
+    text: normalizeField(
+      rawReply.text ?? (replyFormat === 'json' ? 'result' : null),
+      'text',
+      replyFormat,
+      at
+    ),
+    sessionId: normalizeField(rawReply.sessionId, 'sessionId', replyFormat, at),
+    model: normalizeField(rawReply.model, 'model', replyFormat, at),
+    effort: normalizeField(rawReply.effort, 'effort', replyFormat, at),
+    error: normalizeField(rawReply.error, 'error', replyFormat, at),
   };
 
   // A stream block brings its own argument group with it, and it lands in
@@ -629,50 +780,51 @@ export function normalizeAdapter(raw, { name, source }) {
     name,
     label: String(raw.label ?? name),
     cmd: raw.cmd ? String(raw.cmd) : null,
-    promptVia,
+    promptVia: promptVia as PromptVia,
     args,
     reply,
     commands: normalizeCommands(raw.commands, at),
     stream,
     maxMessageLength: max === null ? null : Number(max),
     installHint: raw.installHint ? String(raw.installHint) : null,
-    /** Docs for the human; Slick never sends it anywhere on its own. */
     description: raw.description ? String(raw.description) : null,
     source,
   };
 }
 
-/** @type {Record<string, ReturnType<typeof normalizeAdapter>>} */
-export const BUILT_IN_ADAPTERS = Object.freeze({
+export const BUILT_IN_ADAPTERS: { readonly claude: Adapter; readonly plain: Adapter } = Object.freeze({
   claude: Object.freeze(normalizeAdapter(CLAUDE, { name: 'claude', source: 'built-in' })),
   plain: Object.freeze(normalizeAdapter(PLAIN, { name: 'plain', source: 'built-in' })),
 });
 
 /** Where a workspace keeps the adapters it has added. */
-export function adapterDir(home) {
+export function adapterDir(home?: string | null): string {
   return paths(home).adapters;
 }
 
-/** @param {string} name */
-export function adapterFile(name, home) {
+export function adapterFile(name: string, home?: string | null): string {
   return join(adapterDir(home), `${name}.json`);
 }
 
 /** Read one manifest off disk, or null if there is no such file. */
-function readManifest(name, home) {
+function readManifest(name: string, home?: string | null): Adapter | null {
   const file = adapterFile(name, home);
-  let text;
+  let text: string;
   try {
     text = readFileSync(file, 'utf8');
   } catch (err) {
-    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+    const code = errorCode(err);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
     throw err;
   }
-  let raw;
+  let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch (err) {
-    fail(`${file} is not valid JSON: ${err.message}`, 'Fix the file, or delete it to fall back to the built-in.');
+    fail(
+      `${file} is not valid JSON: ${errorMessage(err)}`,
+      'Fix the file, or delete it to fall back to the built-in.'
+    );
   }
   return normalizeAdapter(raw, { name, source: file });
 }
@@ -684,7 +836,7 @@ function readManifest(name, home) {
  * for this workspace is a matter of writing `claude.json` — no new name to
  * remember, and no flag to change everywhere it is already typed.
  */
-export function loadAdapter(name, home) {
+export function loadAdapter(name: string | null | undefined, home?: string | null): Adapter {
   const wanted = String(name ?? DEFAULT_ADAPTER).trim();
   if (!NAME_RE.test(wanted)) {
     throw new ValidationError(`"${wanted}" is not a valid adapter name.`, {
@@ -693,7 +845,7 @@ export function loadAdapter(name, home) {
   }
   const onDisk = readManifest(wanted, home);
   if (onDisk) return onDisk;
-  const builtIn = BUILT_IN_ADAPTERS[wanted];
+  const builtIn = (BUILT_IN_ADAPTERS as Record<string, Adapter | undefined>)[wanted];
   if (builtIn) return builtIn;
   throw new NotFoundError(`No agent adapter called "${wanted}".`, {
     hint: `Run \`slick agent adapters\` to see them, or write ${adapterFile(wanted, home)}.`,
@@ -707,15 +859,13 @@ export function loadAdapter(name, home) {
  * A manifest that does not parse is listed with its complaint rather than
  * thrown: one bad file should cost you that adapter, not the ability to see
  * the others.
- *
- * @returns {Array<{name: string, label: string, source: string, error: string|null, adapter: object|null}>}
  */
-export function listAdapters(home) {
-  const found = new Map();
+export function listAdapters(home?: string | null): AdapterListing[] {
+  const found = new Map<string, AdapterListing>();
   for (const [name, adapter] of Object.entries(BUILT_IN_ADAPTERS)) {
     found.set(name, { name, label: adapter.label, source: 'built-in', error: null, adapter });
   }
-  let files = [];
+  let files: string[] = [];
   try {
     files = readdirSync(adapterDir(home));
   } catch {
@@ -727,9 +877,16 @@ export function listAdapters(home) {
     if (!NAME_RE.test(name)) continue;
     try {
       const adapter = readManifest(name, home);
+      if (!adapter) continue;
       found.set(name, { name, label: adapter.label, source: adapter.source, error: null, adapter });
     } catch (err) {
-      found.set(name, { name, label: name, source: adapterFile(name, home), error: err.message, adapter: null });
+      found.set(name, {
+        name,
+        label: name,
+        source: adapterFile(name, home),
+        error: errorMessage(err),
+        adapter: null,
+      });
     }
   }
   return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -747,29 +904,28 @@ export function listAdapters(home) {
  * Never throws and never blocks for long: a badge is a nicety, and a locked,
  * missing or restructured database is not a reason to fail an answer that has
  * already been given.
- *
- * @param {object} adapter
- * @param {{sessionId: string|null}} reply
- * @param {'model'|'effort'} [name]
- * @returns {string|null}
  */
-export function lookupReported(adapter, reply, name = 'model') {
-  const field = adapter.reply?.[name];
+export function lookupReported(
+  adapter: Adapter,
+  reply: { sessionId: string | null } | null | undefined,
+  name: 'model' | 'effort' | 'text' = 'model'
+): string | null {
+  const field = adapter.reply[name];
   if (!field?.lookup) return null;
   const { sqlite, query, bind } = field.lookup;
   if (bind && !reply?.sessionId) return null;
 
-  let db;
+  let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(sqlite, { readOnly: true });
     db.exec('PRAGMA busy_timeout = 2000');
-    const row = db.prepare(query).get(...(bind ? [reply.sessionId] : []));
-    const value = row ? Object.values(row)[0] : null;
+    const record = db.prepare(query).get(...(bind && reply?.sessionId ? [reply.sessionId] : []));
+    const value = record ? Object.values(record)[0] : null;
     if (value == null || String(value).trim() === '') return null;
     const found = String(value).trim();
     // The same pattern that trims a scraped field trims a looked-up one: local
     // weights arrive as a path, and the file name is the model's real name.
-    const trimmed = field.pattern ? (field.pattern.exec(found)?.[field.group] ?? found) : found;
+    const trimmed = field.pattern ? (field.pattern.exec(found)?.[field.group ?? 1] ?? found) : found;
     // A name is a name; an answer is as long as it is, and the message layer
     // is what decides how much of it fits in one post.
     const capped = name === 'text' ? trimmed : trimmed.slice(0, 200);
@@ -792,21 +948,20 @@ export function lookupReported(adapter, reply, name = 'model') {
  * `match`-form group with no `else` drops a value it does not recognise, and
  * then the request never reached the binary at all.
  */
-export function slotFires(adapter, slot, value) {
-  const group = adapter.args?.[slot];
+export function slotFires(adapter: Adapter, slot: ArgSlot, value: unknown): boolean {
+  const group = adapter.args[slot];
   if (!group || value == null || value === '' || value === false) return false;
   if (!group.match) return true;
   return Boolean(group.match.test(String(value)) || group.alt);
 }
 
 /** Does this agent have slash commands of its own to offer? */
-export const supportsCommands = (adapter) => Boolean(adapter.commands?.list);
+export const supportsCommands = (adapter: Adapter): boolean => Boolean(adapter.commands?.list);
 
 /**
  * The call that asks an agent for its command vocabulary.
- * @returns {{cmd: string, args: string[], cwd: string|null}|null}
  */
-export function buildCommandListCall(adapter, cmd) {
+export function buildCommandListCall(adapter: Adapter, cmd: string): CommandCall | null {
   const spec = adapter.commands?.list;
   return spec ? { cmd: spec.cmd ?? cmd, args: [...spec.args], cwd: spec.cwd } : null;
 }
@@ -815,10 +970,12 @@ export function buildCommandListCall(adapter, cmd) {
  * The call that runs one of them. `{command}` is the resolved name and
  * `{args}` the rest of the line, each substituted into its own argv entry so
  * nothing is ever re-parsed by a shell.
- *
- * @returns {{cmd: string, args: string[], cwd: string|null}|null}
  */
-export function buildCommandRunCall(adapter, cmd, { command, args = '' } = {}) {
+export function buildCommandRunCall(
+  adapter: Adapter,
+  cmd: string,
+  { command, args = '' }: { command?: string | null; args?: string } = {}
+): CommandCall | null {
   const spec = adapter.commands?.run;
   if (!spec || !command) return null;
   const values = { command: String(command), args: String(args) };
@@ -830,12 +987,13 @@ export function buildCommandRunCall(adapter, cmd, { command, args = '' } = {}) {
 }
 
 /** Can this adapter be handed a conversation to carry on? */
-export const supportsResume = (adapter) => Boolean(adapter.args?.resume);
+export const supportsResume = (adapter: Adapter): boolean => Boolean(adapter.args.resume);
 
 /** Will this adapter tell us what it can run? */
-export const supportsModelList = (adapter) => Boolean(adapter.args?.listModels);
+export const supportsModelList = (adapter: Adapter): boolean => Boolean(adapter.args.listModels);
 
 /** The argv that asks the binary what it can run, or null if it cannot be asked. */
-export function buildModelListArgs(adapter) {
-  return supportsModelList(adapter) ? [...adapter.args.listModels.template] : null;
+export function buildModelListArgs(adapter: Adapter): string[] | null {
+  const group = adapter.args.listModels;
+  return group ? [...group.template] : null;
 }

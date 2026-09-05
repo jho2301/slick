@@ -6,13 +6,15 @@
  * the same file without a compile step.
  */
 
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+export type { SQLInputValue };
+
 export const SCHEMA_VERSION = 2;
 
-const MIGRATIONS = [
+const MIGRATIONS: { version: number; sql: string }[] = [
   {
     version: 1,
     sql: /* sql */ `
@@ -120,10 +122,9 @@ const MIGRATIONS = [
 
 /**
  * Open (creating if needed) the workspace database.
- * @param {string} file absolute path, or ':memory:'
- * @returns {DatabaseSync}
+ * @param file absolute path, or ':memory:'
  */
-export function openDatabase(file) {
+export function openDatabase(file: string): DatabaseSync {
   if (file !== ':memory:') mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   // WAL lets the CLI write while the daemon reads, which is the whole point of
@@ -136,9 +137,8 @@ export function openDatabase(file) {
   return db;
 }
 
-/** @param {DatabaseSync} db */
-export function migrate(db) {
-  const current = Number(db.prepare('PRAGMA user_version').get().user_version ?? 0);
+export function migrate(db: DatabaseSync): number {
+  const current = Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
   for (const migration of MIGRATIONS) {
     if (migration.version <= current) continue;
     db.exec('BEGIN');
@@ -154,18 +154,17 @@ export function migrate(db) {
   return SCHEMA_VERSION;
 }
 
+/** Connections currently inside `transact`, so nested calls join rather than fail. */
+const inTransaction = new WeakSet<DatabaseSync>();
+
 /**
  * Run `fn` inside a transaction. Nested calls join the outer transaction
  * rather than failing, so services can compose freely.
- * @template T
- * @param {DatabaseSync & {__inTx?: boolean}} db
- * @param {() => T} fn
- * @returns {T}
  */
-export function transact(db, fn) {
-  if (db.__inTx) return fn();
+export function transact<T>(db: DatabaseSync, fn: () => T): T {
+  if (inTransaction.has(db)) return fn();
   db.exec('BEGIN IMMEDIATE');
-  db.__inTx = true;
+  inTransaction.add(db);
   try {
     const result = fn();
     db.exec('COMMIT');
@@ -178,16 +177,20 @@ export function transact(db, fn) {
     }
     throw err;
   } finally {
-    db.__inTx = false;
+    inTransaction.delete(db);
   }
 }
 
-/** node:sqlite hands back null-prototype rows; normalise for spreads and JSON. */
-export function row(value) {
-  return value === undefined || value === null ? null : { ...value };
+/**
+ * node:sqlite hands back null-prototype rows; normalise for spreads and JSON.
+ *
+ * The row type is the caller's claim about the schema — the columns a query
+ * selects are known where the query is written, not here.
+ */
+export function row<T extends object>(value: unknown): T | null {
+  return value === undefined || value === null ? null : { ...(value as T) };
 }
 
-/** @param {unknown[]} rows */
-export function rows(list) {
-  return list.map((r) => ({ ...r }));
+export function rows<T extends object>(list: readonly unknown[]): T[] {
+  return list.map((r) => ({ ...(r as T) }));
 }

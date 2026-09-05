@@ -1,0 +1,8 @@
+{
+  // Solution file: `tsc -b` checks every package in dependency order.
+  // Referenced projects emit declarations only, into a git-ignored
+  // `.tsbuild/`, because build mode refuses a referenced project that
+  // disables emit. Nothing runs from that output.
+  "files": [],
+  "references": [{ "path": "packages/core" }]
+}

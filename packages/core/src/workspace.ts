@@ -5,38 +5,102 @@
  * desktop app goes over HTTP without either duplicating domain logic.
  */
 
-import { openDatabase, row, transact } from './db.js';
-import { paths } from './paths.js';
-import { createCategoryService } from './categories.js';
-import { createChannelService } from './channels.js';
-import { createMessageService } from './messages.js';
-import { createAgentService } from './agents.js';
-import { createSearchService } from './search.js';
-import { countEvents, listEvents, maxSeq, CONVERSATION_EVENTS, EVENT_TYPES } from './events.js';
+import type { DatabaseSync } from 'node:sqlite';
 
-const DEFAULT_CHANNELS = [
+import { openDatabase, row, transact, type SQLInputValue } from './db.ts';
+import { paths } from './paths.ts';
+import { createCategoryService, type CategoryService } from './categories.ts';
+import { createChannelService, type ChannelInput, type ChannelService } from './channels.ts';
+import { createMessageService, type MessageService } from './messages.ts';
+import { createAgentService, type AgentService } from './agents.ts';
+import { createSearchService, type SearchOptions, type SearchResult, type SearchService } from './search.ts';
+import {
+  countEvents,
+  listEvents,
+  maxSeq,
+  CONVERSATION_EVENTS,
+  EVENT_TYPES,
+  type ListEventsOptions,
+} from './events.ts';
+import type { Author, EventRecord, HydratedEvent } from './types.ts';
+
+const DEFAULT_CHANNELS: ChannelInput[] = [
   { slug: 'general', name: 'general', topic: 'Everything that does not have a home yet' },
   { slug: 'agents', name: 'agents', topic: 'Where your AI agents report in' },
 ];
 
+export interface WorkspaceUser {
+  id: string;
+  name: string;
+}
+
+export interface WorkspaceInfo {
+  name: string;
+  file: string;
+  home: string | undefined;
+  user: WorkspaceUser;
+  createdAt: number | null;
+  seq: number;
+  counts: {
+    channels: number;
+    archivedChannels: number;
+    categories: number;
+    messages: number;
+    threads: number;
+    agentSessions: number;
+  };
+}
+
+export interface OpenOptions {
+  home?: string | null;
+  file?: string;
+  bootstrap?: boolean;
+}
+
+export interface BootstrapOptions {
+  user?: { id?: string; name?: string };
+  channels?: ChannelInput[];
+}
+
+/**
+ * What every service is built with. `home` travels with it because services
+ * need more than the database to answer some questions — `serve` locks live
+ * on disk. The services themselves are added as they are built, in
+ * dependency order, so each one can reach the ones before it.
+ */
+export interface ServiceContext {
+  db: DatabaseSync;
+  actor: Author;
+  home: string | undefined;
+  categories: CategoryService;
+  channels: ChannelService;
+  messages: MessageService;
+}
+
 export class Workspace {
-  /**
-   * @param {import('node:sqlite').DatabaseSync} db
-   * @param {{file: string, home?: string}} meta
-   */
-  constructor(db, meta) {
+  readonly db: DatabaseSync;
+  readonly file: string;
+  readonly home: string | undefined;
+  /** Default author for anything that does not say otherwise. */
+  readonly actor: Author;
+  readonly categories: CategoryService;
+  readonly channels: ChannelService;
+  readonly messages: MessageService;
+  readonly agents: AgentService;
+  readonly searchService: SearchService;
+
+  constructor(db: DatabaseSync, meta: { file: string; home?: string }) {
     this.db = db;
     this.file = meta.file;
     this.home = meta.home;
 
     const user = this.user();
-    /** Default author for anything that does not say otherwise. */
     this.actor = { id: user.id, kind: 'human', label: user.name };
 
-    // `home` travels with the context because services need more than the
-    // database to answer some questions — `serve` locks live on disk.
-    const ctx = { db, actor: this.actor, home: this.home };
-    // Categories first: channels resolve `category: 'engineering'` through them.
+    // Built up in dependency order: categories first, because channels resolve
+    // `category: 'engineering'` through them. The cast is the price of adding
+    // the services one at a time; nothing reads a service before it exists.
+    const ctx = { db, actor: this.actor, home: this.home } as ServiceContext;
     this.categories = createCategoryService(ctx);
     ctx.categories = this.categories;
     this.channels = createChannelService(ctx);
@@ -47,10 +111,7 @@ export class Workspace {
     this.searchService = createSearchService(ctx);
   }
 
-  /**
-   * @param {{home?: string, file?: string, bootstrap?: boolean}} [opts]
-   */
-  static open(opts = {}) {
+  static open(opts: OpenOptions = {}): Workspace {
     const p = paths(opts.home);
     const file = opts.file ?? p.db;
     const db = openDatabase(file);
@@ -59,7 +120,7 @@ export class Workspace {
     return ws;
   }
 
-  close() {
+  close(): void {
     try {
       this.db.close();
     } catch {
@@ -69,26 +130,31 @@ export class Workspace {
 
   // ---------------------------------------------------------------- meta ---
 
-  getMeta(key, fallback = null) {
-    const r = row(this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key));
-    return r ? r.value : fallback;
+  getMeta(key: string): string | null;
+  getMeta(key: string, fallback: string): string;
+  getMeta(key: string, fallback: number): string | number;
+  getMeta(key: string, fallback: string | number | null = null): string | number | null {
+    const r = row<{ value: string }>(this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key));
+    return r ? String(r.value) : fallback;
   }
 
-  setMeta(key, value) {
+  setMeta<T extends string | number>(key: string, value: T): T {
     this.db
-      .prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .prepare(
+        'INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+      )
       .run(key, String(value));
     return value;
   }
 
-  user() {
+  user(): WorkspaceUser {
     return {
       id: this.getMeta('user.id', 'you'),
       name: this.getMeta('user.name', this.getMeta('user.id', 'you')),
     };
   }
 
-  setUser({ id, name }) {
+  setUser({ id, name }: { id?: string | null; name?: string | null }): WorkspaceUser {
     if (id) {
       this.setMeta('user.id', id);
       this.actor.id = id;
@@ -101,7 +167,7 @@ export class Workspace {
   }
 
   /** Idempotent first-run setup: identity + a couple of channels to land in. */
-  bootstrap({ user, channels } = {}) {
+  bootstrap({ user, channels }: BootstrapOptions = {}): WorkspaceInfo & { created: boolean } {
     return transact(this.db, () => {
       const fresh = this.getMeta('workspace.created_at') == null;
       if (fresh) {
@@ -121,8 +187,9 @@ export class Workspace {
     });
   }
 
-  info() {
-    const count = (sql, ...params) => Number(row(this.db.prepare(sql).get(...params)).n);
+  info(): WorkspaceInfo {
+    const count = (sql: string, ...params: SQLInputValue[]) =>
+      Number(row<{ n: number }>(this.db.prepare(sql).get(...params))?.n ?? 0);
     return {
       name: this.getMeta('workspace.name', 'Slick'),
       file: this.file,
@@ -145,25 +212,24 @@ export class Workspace {
 
   // -------------------------------------------------------------- events ---
 
-  /** @param {{since?: number, limit?: number, channelId?: string, types?: string[]}} [opts] */
-  events(opts = {}) {
+  events(opts: ListEventsOptions = {}): EventRecord[] {
     return listEvents(this.db, opts);
   }
 
-  eventCount(opts = {}) {
+  eventCount(opts: ListEventsOptions = {}): number {
     return countEvents(this.db, opts);
   }
 
-  seq() {
+  seq(): number {
     return maxSeq(this.db);
   }
 
   /** Events with their message/channel filled in — what the live UI consumes. */
-  hydratedEvents(opts = {}) {
+  hydratedEvents(opts: ListEventsOptions = {}): HydratedEvent[] {
     return this.events(opts).map((event) => this.agents.hydrateEvent(event));
   }
 
-  search(query, opts) {
+  search(query: unknown, opts?: SearchOptions): SearchResult {
     return this.searchService.search(query, opts);
   }
 }

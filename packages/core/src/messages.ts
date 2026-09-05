@@ -7,20 +7,24 @@
  * than one level and the UI stays predictable.
  */
 
-import { ConflictError, NotFoundError, ValidationError } from './errors.js';
-import { newId, ID_PREFIX } from './ids.js';
-import { row, rows, transact } from './db.js';
-import { EVENT_TYPES, recordEvent } from './events.js';
-import { THINK_KEY, normalizeThinking } from './thinking.js';
+import type { DatabaseSync } from 'node:sqlite';
+
+import { ConflictError, NotFoundError, ValidationError } from './errors.ts';
+import { newId, ID_PREFIX } from './ids.ts';
+import { row, rows, transact, type SQLInputValue } from './db.ts';
+import { EVENT_TYPES, recordEvent } from './events.ts';
+import { THINK_KEY, normalizeThinking } from './thinking.ts';
+import type { ChannelService } from './channels.ts';
+import type { Author, AuthorKind, Channel, Message, MessageMetadata } from './types.ts';
 
 export const MAX_TEXT_LENGTH = 40_000;
 const MENTION_RE = /(?:^|[\s(<[])@([a-z0-9][a-z0-9._-]{0,63})/gi;
 
 /** `@claude fix this` -> ['claude'] */
-export function extractMentions(text) {
-  const found = new Set();
+export function extractMentions(text: unknown): string[] {
+  const found = new Set<string>();
   for (const match of String(text ?? '').matchAll(MENTION_RE)) {
-    found.add(match[1].toLowerCase().replace(/[.]+$/, ''));
+    found.add((match[1] ?? '').toLowerCase().replace(/[.]+$/, ''));
   }
   return [...found];
 }
@@ -46,27 +50,26 @@ const MIN_CHUNK = 200;
  * fence. A single line too long for any piece is cut where it falls — better
  * than losing it.
  *
- * @param {string} text
- * @param {number|null} [limit] characters per piece; Slick's own cap by default
- * @returns {string[]} at least one piece, each one postable
+ * @param limit characters per piece; Slick's own cap by default
+ * @returns at least one piece, each one postable
  */
-export function splitMessageText(text, limit = MAX_TEXT_LENGTH) {
+export function splitMessageText(text: unknown, limit: number | null = MAX_TEXT_LENGTH): string[] {
   const value = String(text ?? '');
   const cap = Math.min(Math.max(Math.trunc(Number(limit)) || MAX_TEXT_LENGTH, MIN_CHUNK), MAX_TEXT_LENGTH);
   if (value.length <= cap) return [value];
 
-  const closerFor = (fence) => fence.trim().match(FENCE_RE)[1];
+  const closerFor = (fence: string): string => FENCE_RE.exec(fence.trim())?.[1] ?? '';
   /** What a piece must keep back for a fence it will have to close off. */
-  const reserve = (fence) => (fence ? closerFor(fence).length + 1 : 0);
+  const reserve = (fence: string | null): number => (fence ? closerFor(fence).length + 1 : 0);
 
-  const pieces = [];
+  const pieces: string[] = [];
   /** The fence line the buffer is inside, as the buffer stands. */
-  let open = null;
+  let open: string | null = null;
   /** What the last break seeded the buffer with, so a lone fence never ships. */
-  let carried = null;
+  let carried: string | null = null;
   let buf = '';
 
-  const emit = (fence) => {
+  const emit = (fence: string | null) => {
     // Blank lines can pile up into a piece with nothing in it, and a message
     // with nothing in it is refused. Inside a fence the buffer always holds
     // the fence line, so this only ever drops empty space.
@@ -80,7 +83,7 @@ export function splitMessageText(text, limit = MAX_TEXT_LENGTH) {
     // happen either side of it, so the room kept back is whichever of the two
     // states needs more. Getting this wrong is how a piece ends up over the
     // cap: the closer is appended by `emit`, long after the fit was decided.
-    const after = FENCE_RE.test(line) ? (open ? null : line) : open;
+    const after: string | null = FENCE_RE.test(line) ? (open ? null : line) : open;
     const keep = Math.max(reserve(open), reserve(after));
 
     let rest = line;
@@ -119,32 +122,51 @@ export function splitMessageText(text, limit = MAX_TEXT_LENGTH) {
  * it comes back out as the very same object, so every existing caller writes
  * exactly the bytes it wrote yesterday. `_think` is the exception because it
  * is machine-written, unbounded, and re-sent with the message forever; see
- * `thinking.js` for why the caps live there and why they clamp instead of
+ * `thinking.ts` for why the caps live there and why they clamp instead of
  * throwing. A blob that normalizes to nothing takes the key with it rather
  * than leaving a `null` behind for every reader to test for.
  */
-function normalizeMetadata(metadata) {
+function normalizeMetadata<T extends MessageMetadata | null | undefined>(metadata: T): T {
   if (metadata == null || typeof metadata !== 'object') return metadata;
   if (!Object.prototype.hasOwnProperty.call(metadata, THINK_KEY)) return metadata;
   const think = normalizeThinking(metadata[THINK_KEY]);
-  const out = { ...metadata };
+  const out: MessageMetadata = { ...metadata };
   if (think) out[THINK_KEY] = think;
   else delete out[THINK_KEY];
-  return out;
+  return out as T;
 }
 
-function parseJson(value, fallback) {
+function parseJson<T>(value: unknown, fallback: T): T {
   if (value == null) return fallback;
   try {
-    return JSON.parse(value);
+    return JSON.parse(String(value)) as T;
   } catch {
     return fallback;
   }
 }
 
-export function serializeMessage(record) {
-  const m = row(record);
-  if (!m) return null;
+export interface MessageRow {
+  id: string;
+  channel_id: string;
+  channel_slug?: string | null;
+  parent_id: string | null;
+  author_id: string;
+  author_kind: string;
+  author_label: string | null;
+  text: string;
+  mentions: string | null;
+  metadata: string | null;
+  session_key: string | null;
+  seq: number;
+  reply_count: number;
+  last_reply_at: number | null;
+  created_at: number;
+  updated_at: number;
+  edited_at: number | null;
+  deleted_at: number | null;
+}
+
+export function serializeMessageRow(m: MessageRow): Message {
   const deleted = m.deleted_at != null;
   return {
     id: m.id,
@@ -155,12 +177,12 @@ export function serializeMessage(record) {
     isThreadRoot: m.parent_id == null,
     author: {
       id: m.author_id,
-      kind: m.author_kind,
+      kind: m.author_kind as AuthorKind,
       label: m.author_label ?? m.author_id,
     },
     text: m.text,
-    mentions: parseJson(m.mentions, []),
-    metadata: parseJson(m.metadata, null),
+    mentions: parseJson<string[]>(m.mentions, []),
+    metadata: parseJson<MessageMetadata | null>(m.metadata, null),
     sessionKey: m.session_key,
     seq: Number(m.seq),
     replyCount: Number(m.reply_count),
@@ -173,19 +195,80 @@ export function serializeMessage(record) {
   };
 }
 
-export function createMessageService(ctx) {
+export function serializeMessage(record: unknown): Message | null {
+  const m = row<MessageRow>(record);
+  return m ? serializeMessageRow(m) : null;
+}
+
+export interface PostMessageInput {
+  channel?: string | null;
+  channelId?: string | null;
+  text: string;
+  parentId?: string | null;
+  threadId?: string | null;
+  author?: Partial<Author> | null;
+  metadata?: MessageMetadata | null;
+  sessionKey?: string | null;
+}
+
+export interface MessageListOptions {
+  limit?: number;
+  before?: string | number | null;
+  after?: string | number | null;
+  includeDeleted?: boolean;
+  includeReplies?: boolean;
+}
+
+export interface MessagePage {
+  channel: Channel;
+  messages: Message[];
+  hasMore: boolean;
+  oldestSeq: number | null;
+  newestSeq: number | null;
+}
+
+export interface Thread {
+  root: Message;
+  replies: Message[];
+  replyCount: number;
+  channel: Channel;
+}
+
+export interface MessagePatch {
+  text?: string;
+  metadata?: MessageMetadata | null;
+  author?: Author;
+  sessionKey?: string | null;
+}
+
+export interface RemoveMessageOptions {
+  hard?: boolean;
+  author?: Author;
+  sessionKey?: string | null;
+}
+
+export interface MessageServiceContext {
+  db: DatabaseSync;
+  actor: Author;
+  channels: ChannelService;
+}
+
+export function createMessageService(ctx: MessageServiceContext) {
   const { db, channels, actor: defaultActor } = ctx;
 
   const SELECT_MESSAGE = `SELECT m.*, c.slug AS channel_slug FROM messages m
                             JOIN channels c ON c.id = m.channel_id`;
 
-  function find(id) {
+  function find(id: string | null | undefined): Message | null {
     if (!id) return null;
     const r = db.prepare(`${SELECT_MESSAGE} WHERE m.id = ?`).get(String(id).trim());
     return r ? serializeMessage(r) : null;
   }
 
-  function get(id, { includeDeleted = true } = {}) {
+  function get(
+    id: string | null | undefined,
+    { includeDeleted = true }: { includeDeleted?: boolean } = {}
+  ): Message {
     const found = find(id);
     if (!found || (!includeDeleted && found.deleted)) {
       throw new NotFoundError(`No message with id "${id}".`, {
@@ -196,7 +279,7 @@ export function createMessageService(ctx) {
     return found;
   }
 
-  function assertText(text) {
+  function assertText(text: unknown): string {
     const value = String(text ?? '');
     if (value.trim().length === 0) {
       throw new ValidationError('Message text is empty.', { hint: 'Pass some text to send.' });
@@ -208,7 +291,7 @@ export function createMessageService(ctx) {
   }
 
   /** Recompute a root's reply stats from the replies themselves — always correct. */
-  function refreshThreadStats(rootId) {
+  function refreshThreadStats(rootId: string | null | undefined): void {
     if (!rootId) return;
     db.prepare(
       `UPDATE messages
@@ -218,22 +301,13 @@ export function createMessageService(ctx) {
     ).run(rootId, rootId, rootId);
   }
 
-  /**
-   * @param {{
-   *   channel?: string, channelId?: string, text: string,
-   *   parentId?: string|null, threadId?: string|null,
-   *   author?: {id: string, kind?: string, label?: string},
-   *   metadata?: Record<string, unknown>|null,
-   *   sessionKey?: string|null,
-   * }} input
-   */
-  function post(input) {
+  function post(input: PostMessageInput): Message {
     const text = assertText(input.text);
     const metadata = normalizeMetadata(input.metadata);
-    const author = { ...defaultActor, ...(input.author ?? {}) };
+    const author: Author = { ...defaultActor, ...(input.author ?? {}) };
     return transact(db, () => {
       const parentRef = input.parentId ?? input.threadId ?? null;
-      let parent = null;
+      let parent: Message | null = null;
       if (parentRef) {
         parent = get(parentRef);
         if (parent.deleted) {
@@ -303,11 +377,11 @@ export function createMessageService(ctx) {
   }
 
   /** Convenience wrapper: reply into the thread of `rootRef`. */
-  function reply(rootRef, input) {
+  function reply(rootRef: string, input: Omit<PostMessageInput, 'parentId'>): Message {
     return post({ ...input, parentId: rootRef });
   }
 
-  function resolveCursor(value) {
+  function resolveCursor(value: string | number | null | undefined): number | null {
     if (value == null || value === '') return null;
     if (typeof value === 'number') return value;
     const asNumber = Number(value);
@@ -319,15 +393,12 @@ export function createMessageService(ctx) {
 
   /**
    * Channel timeline: root messages only, oldest → newest.
-   * @param {string} channelRef
-   * @param {{limit?: number, before?: string|number, after?: string|number,
-   *          includeDeleted?: boolean, includeReplies?: boolean}} [opts]
    */
-  function list(channelRef, opts = {}) {
+  function list(channelRef: string, opts: MessageListOptions = {}): MessagePage {
     const channel = channels.get(channelRef);
     const limit = Math.min(Math.max(Number(opts.limit ?? 50), 1), 500);
     const where = ['m.channel_id = ?'];
-    const params = [channel.id];
+    const params: SQLInputValue[] = [channel.id];
 
     if (!opts.includeReplies) where.push('m.parent_id IS NULL');
     if (!opts.includeDeleted) where.push('m.deleted_at IS NULL');
@@ -345,7 +416,7 @@ export function createMessageService(ctx) {
 
     // `after` pages forward from a point; everything else shows the newest tail.
     const ascending = after != null && before == null;
-    const list_ = rows(
+    const list_ = rows<MessageRow>(
       db
         .prepare(
           `${SELECT_MESSAGE} WHERE ${where.join(' AND ')} ORDER BY m.seq ${ascending ? 'ASC' : 'DESC'} LIMIT ?`
@@ -354,15 +425,15 @@ export function createMessageService(ctx) {
     );
 
     const hasMore = list_.length > limit;
-    const page = list_.slice(0, limit).map(serializeMessage);
+    const page = list_.slice(0, limit).map(serializeMessageRow);
     if (!ascending) page.reverse();
 
     return {
       channel,
       messages: page,
       hasMore,
-      oldestSeq: page.length ? page[0].seq : null,
-      newestSeq: page.length ? page[page.length - 1].seq : null,
+      oldestSeq: page[0]?.seq ?? null,
+      newestSeq: page[page.length - 1]?.seq ?? null,
     };
   }
 
@@ -370,24 +441,19 @@ export function createMessageService(ctx) {
    * A thread: its root message plus every reply, oldest → newest.
    * Accepts the root id or the id of any reply inside it.
    */
-  function thread(ref, opts = {}) {
+  function thread(ref: string, opts: { includeDeleted?: boolean } = {}): Thread {
     let root = get(ref);
     if (root.parentId) root = get(root.parentId);
     const where = ['m.parent_id = ?'];
-    const params = [root.id];
+    const params: SQLInputValue[] = [root.id];
     if (!opts.includeDeleted) where.push('m.deleted_at IS NULL');
-    const replies = rows(
+    const replies = rows<MessageRow>(
       db.prepare(`${SELECT_MESSAGE} WHERE ${where.join(' AND ')} ORDER BY m.seq ASC`).all(...params)
-    ).map(serializeMessage);
+    ).map(serializeMessageRow);
     return { root, replies, replyCount: replies.length, channel: channels.get(root.channelId) };
   }
 
-  /**
-   * @param {string} id
-   * @param {{text?: string, metadata?: Record<string, unknown>|null,
-   *          author?: {id: string, kind?: string}, sessionKey?: string|null}} patch
-   */
-  function update(id, patch) {
+  function update(id: string, patch: MessagePatch): Message {
     return transact(db, () => {
       const current = get(id);
       if (current.deleted) {
@@ -438,10 +504,11 @@ export function createMessageService(ctx) {
   /**
    * Soft delete leaves a tombstone so surviving replies keep their anchor and
    * the content is gone; `hard` removes the row (and any replies) outright.
-   * @param {string} id
-   * @param {{hard?: boolean, author?: {id: string, kind?: string}, sessionKey?: string|null}} [opts]
    */
-  function remove(id, opts = {}) {
+  function remove(
+    id: string,
+    opts: RemoveMessageOptions = {}
+  ): Message & { alreadyDeleted?: boolean; hard?: boolean; deletedReplies?: number } {
     return transact(db, () => {
       const current = get(id);
       const actor = opts.author ?? defaultActor;
@@ -478,3 +545,5 @@ export function createMessageService(ctx) {
 
   return { find, get, post, reply, list, thread, update, remove, refreshThreadStats };
 }
+
+export type MessageService = ReturnType<typeof createMessageService>;

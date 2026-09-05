@@ -1,26 +1,25 @@
-import { test, describe, before, after, beforeEach } from 'node:test';
+import { test, describe, beforeAll, afterAll, beforeEach } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { Workspace } from '../src/workspace.js';
-import { ConflictError, NotFoundError, ValidationError } from '../src/errors.js';
-import { looksLikeHistoryKey } from '../src/ids.js';
-import { serveLockPath } from '../src/serve.js';
+import { Workspace } from '../src/workspace.ts';
+import { ConflictError, NotFoundError, ValidationError } from '../src/errors.ts';
+import { looksLikeHistoryKey } from '../src/ids.ts';
+import { serveLockPath } from '../src/serve.ts';
 
-/** @type {string} */
-let home;
-/** @type {Workspace} */
-let ws;
+let home: string;
+
+let ws: Workspace;
 let dbCounter = 0;
 
-before(() => {
+beforeAll(() => {
   home = mkdtempSync(join(tmpdir(), 'slick-core-'));
 });
 
-after(() => {
+afterAll(() => {
   ws?.close();
   rmSync(home, { recursive: true, force: true });
 });
@@ -122,7 +121,11 @@ describe('channel categories', () => {
     assert.equal(created.slug, 'engineering-ops', 'the handle comes from the name');
     assert.equal(created.name, 'Engineering & Ops');
     assert.equal(created.collapsed, false);
-    assert.deepEqual(ws.categories.list().map((c) => c.channelCount), [0], 'counts come with the listing');
+    assert.deepEqual(
+      ws.categories.list().map((c) => c.channelCount),
+      [0],
+      'counts come with the listing'
+    );
 
     assert.equal(ws.categories.get('engineering-ops').id, created.id);
     assert.equal(ws.categories.get(created.id).name, created.name);
@@ -151,12 +154,17 @@ describe('channel categories', () => {
 
     const deploys = ws.channels.create({ slug: 'deploys', category: 'engineering' });
     assert.equal(deploys.categoryId, eng.id);
-    assert.deepEqual(deploys.category, { id: eng.id, slug: 'engineering', name: 'Engineering', position: eng.position });
+    assert.deepEqual(deploys.category, {
+      id: eng.id,
+      slug: 'engineering',
+      name: 'Engineering',
+      position: eng.position,
+    });
 
     const moved = ws.channels.update('deploys', { category: product.id });
     assert.equal(moved.categoryId, product.id, 'moving replaces rather than adds');
-    assert.equal(ws.categories.list().find((c) => c.id === eng.id).channelCount, 0);
-    assert.equal(ws.categories.list().find((c) => c.id === product.id).channelCount, 1);
+    assert.equal(ws.categories.list().find((c) => c.id === eng.id)!.channelCount, 0);
+    assert.equal(ws.categories.list().find((c) => c.id === product.id)!.channelCount, 1);
 
     const loose = ws.channels.update('deploys', { category: null });
     assert.equal(loose.categoryId, null);
@@ -199,7 +207,10 @@ describe('channel categories', () => {
     ws.categories.create({ name: 'One' });
     ws.categories.create({ name: 'Two' });
     ws.categories.create({ name: 'Three' });
-    assert.deepEqual(ws.categories.list().map((c) => c.slug), ['one', 'two', 'three']);
+    assert.deepEqual(
+      ws.categories.list().map((c) => c.slug),
+      ['one', 'two', 'three']
+    );
 
     assert.deepEqual(
       ws.categories.reorder(['three']).map((c) => c.slug),
@@ -274,20 +285,32 @@ describe('messages and threads', () => {
     ws.messages.reply(root.id, { text: 'child' });
     ws.messages.remove(root.id, { hard: true });
     assert.equal(ws.messages.find(root.id), null);
-    assert.equal(ws.messages.list('general', { includeReplies: true, includeDeleted: true }).messages.length, 0);
+    assert.equal(
+      ws.messages.list('general', { includeReplies: true, includeDeleted: true }).messages.length,
+      0
+    );
   });
 
   test('pagination walks backwards through history', () => {
     for (let i = 0; i < 10; i++) ws.messages.post({ channel: 'general', text: `m${i}` });
     const page1 = ws.messages.list('general', { limit: 4 });
-    assert.deepEqual(page1.messages.map((m) => m.text), ['m6', 'm7', 'm8', 'm9']);
+    assert.deepEqual(
+      page1.messages.map((m) => m.text),
+      ['m6', 'm7', 'm8', 'm9']
+    );
     assert.equal(page1.hasMore, true);
 
     const page2 = ws.messages.list('general', { limit: 4, before: page1.oldestSeq });
-    assert.deepEqual(page2.messages.map((m) => m.text), ['m2', 'm3', 'm4', 'm5']);
+    assert.deepEqual(
+      page2.messages.map((m) => m.text),
+      ['m2', 'm3', 'm4', 'm5']
+    );
 
     const forward = ws.messages.list('general', { limit: 3, after: page2.newestSeq });
-    assert.deepEqual(forward.messages.map((m) => m.text), ['m6', 'm7', 'm8']);
+    assert.deepEqual(
+      forward.messages.map((m) => m.text),
+      ['m6', 'm7', 'm8']
+    );
   });
 
   test('refuses empty text and archived channels', () => {
@@ -317,8 +340,8 @@ describe('agent sessions', () => {
       const resumed = restarted.agents.resume(session.key);
       assert.equal(resumed.session.key, session.key);
       assert.equal(resumed.pending, 1);
-      assert.equal(resumed.missed[0].message.id, asked.id);
-      assert.equal(resumed.missed[0].channelSlug, 'general');
+      assert.equal(resumed.missed[0]!.message!.id, asked.id);
+      assert.equal(resumed.missed[0]!.channelSlug, 'general');
       assert.equal(resumed.cursor, session.cursorSeq, 'resume peeks, it does not consume');
     } finally {
       restarted.close();
@@ -331,7 +354,10 @@ describe('agent sessions', () => {
     ws.messages.post({ channel: 'general', text: 'two' });
 
     const first = ws.agents.pull(session.key);
-    assert.deepEqual(first.events.map((e) => e.message.text), ['one', 'two']);
+    assert.deepEqual(
+      first.events.map((e) => e.message!.text),
+      ['one', 'two']
+    );
     assert.equal(first.pending, 0);
 
     const second = ws.agents.pull(session.key);
@@ -339,7 +365,10 @@ describe('agent sessions', () => {
 
     ws.messages.post({ channel: 'general', text: 'three' });
     const third = ws.agents.pull(session.key);
-    assert.deepEqual(third.events.map((e) => e.message.text), ['three']);
+    assert.deepEqual(
+      third.events.map((e) => e.message!.text),
+      ['three']
+    );
   });
 
   test('peek leaves the cursor alone', () => {
@@ -369,8 +398,14 @@ describe('agent sessions', () => {
     const bob = ws.agents.start({ agentId: 'bob' }); // joins later, so starts caught up
     ws.messages.post({ channel: 'general', text: 'second' });
 
-    assert.deepEqual(ws.agents.pull(alice.key).events.map((e) => e.message.text), ['first', 'second']);
-    assert.deepEqual(ws.agents.pull(bob.key).events.map((e) => e.message.text), ['second']);
+    assert.deepEqual(
+      ws.agents.pull(alice.key).events.map((e) => e.message!.text),
+      ['first', 'second']
+    );
+    assert.deepEqual(
+      ws.agents.pull(bob.key).events.map((e) => e.message!.text),
+      ['second']
+    );
   });
 
   test('state is private memory that survives resume', () => {
@@ -422,7 +457,10 @@ describe('agent sessions', () => {
     ws.messages.post({ channel: 'general', text: 'read me' });
 
     const scoped = ws.agents.pull(session.key, { scope: 'session' });
-    assert.deepEqual(scoped.events.map((e) => e.message.text), ['read me']);
+    assert.deepEqual(
+      scoped.events.map((e) => e.message!.text),
+      ['read me']
+    );
   });
 
   test('resume --create makes a session on first run and finds it after', () => {
@@ -469,10 +507,10 @@ describe('agent sessions', () => {
 
     const typingEvents = ws.events().filter((e) => e.type === 'agent.typing');
     assert.equal(typingEvents.length, 2);
-    assert.equal(typingEvents[0].payload.on, true);
-    assert.equal(typingEvents[0].threadId, root.id);
-    assert.equal(typingEvents[0].actor.id, 'claude');
-    assert.equal(typingEvents[1].payload.on, false);
+    assert.equal(typingEvents[0]!.payload.on, true);
+    assert.equal(typingEvents[0]!.threadId, root.id);
+    assert.equal(typingEvents[0]!.actor.id, 'claude');
+    assert.equal(typingEvents[1]!.payload.on, false);
 
     // Another session resuming should never see typing blips as unread work.
     const other = ws.agents.start({ agentId: 'watcher', channel: 'general' });
@@ -499,7 +537,7 @@ describe('agent sessions', () => {
           channelId: root.channelId,
           agentId: 'claude',
           sessionKey: session.key,
-          at: ws.events().at(-1).createdAt,
+          at: ws.events().at(-1)!.createdAt,
         },
       ]);
 
@@ -534,13 +572,13 @@ describe('agent sessions', () => {
         channelId: root.channelId,
         agentId: 'hermes',
         sessionKey: null,
-        at: ws.events().at(-1).createdAt,
+        at: ws.events().at(-1)!.createdAt,
       },
     ]);
 
     // No history key, so no lock to hold — and the snapshot does not ask for
     // one. That is the whole difference from a session row.
-    assert.equal(ws.agents.typingNow()[0].sessionKey, null);
+    assert.equal(ws.agents.typingNow()[0]!.sessionKey, null);
     assert.equal(ws.agents.list().length, 0, 'and nothing invented a session on the way');
 
     ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: false });
@@ -554,13 +592,16 @@ describe('agent sessions', () => {
     // A caller holding a reply's id means the thread that reply is in.
     ws.agents.externalTyping({ agentId: 'hermes', threadId: reply.id, on: true });
     const [live] = ws.agents.typingNow();
-    assert.equal(live.threadId, root.id);
-    assert.equal(live.channelId, root.channelId, 'and the channel comes from the message, not the caller');
+    assert.equal(live!.threadId, root.id);
+    assert.equal(live!.channelId, root.channelId, 'and the channel comes from the message, not the caller');
   });
 
   test('and it refuses what it cannot point at', () => {
     const root = ws.messages.post({ channel: 'general', text: 'anything' });
-    assert.throws(() => ws.agents.externalTyping({ agentId: 'hermes', threadId: 'msg_nope', on: true }), NotFoundError);
+    assert.throws(
+      () => ws.agents.externalTyping({ agentId: 'hermes', threadId: 'msg_nope', on: true }),
+      NotFoundError
+    );
     assert.throws(() => ws.agents.externalTyping({ agentId: 'hermes', on: true }), NotFoundError);
     assert.throws(
       () => ws.agents.externalTyping({ agentId: 'not a name', threadId: root.id, on: true }),
@@ -575,7 +616,7 @@ describe('agent sessions', () => {
 
     // Nothing here can be asked whether it is still alive, so age is the only
     // thing keeping a dead gateway's indicator from spinning forever.
-    const seq = ws.events().at(-1).seq;
+    const seq = ws.events().at(-1)!.seq;
     ws.db.prepare('UPDATE events SET created_at = ? WHERE seq = ?').run(Date.now() - 60 * 60 * 1000, seq);
     assert.deepEqual(ws.agents.typingNow(), [], 'an hour later, nobody is typing');
   });
@@ -585,7 +626,10 @@ describe('agent sessions', () => {
     ws.agents.externalTyping({ agentId: 'hermes', threadId: root.id, on: true });
     ws.agents.externalTyping({ agentId: 'other', threadId: root.id, on: true });
     assert.deepEqual(
-      ws.agents.typingNow().map((entry) => entry.agentId).sort(),
+      ws.agents
+        .typingNow()
+        .map((entry) => entry.agentId)
+        .sort(),
       ['hermes', 'other']
     );
 
@@ -613,7 +657,10 @@ describe('agent sessions', () => {
     writeFileSync(lock, String(process.pid));
     try {
       assert.deepEqual(
-        ws.agents.typingNow().map((entry) => entry.agentId).sort(),
+        ws.agents
+          .typingNow()
+          .map((entry) => entry.agentId)
+          .sort(),
         ['claude', 'hermes']
       );
     } finally {
@@ -628,8 +675,8 @@ describe('agent sessions', () => {
     ws.agents.post(automation.key, { text: 'this morning on Hacker News…' });
 
     const listed = ws.agents.list().find((s) => s.key === automation.key);
-    assert.equal(listed.callable, false);
-    assert.deepEqual(listed.serve, { live: false, pid: null, served: false, callable: false });
+    assert.equal(listed!.callable, false);
+    assert.deepEqual(listed!.serve, { live: false, pid: null, served: false, callable: false });
   });
 
   test('a live serve lock makes a session callable', () => {
@@ -698,7 +745,7 @@ describe('an agent’s thinking, and who gets to read it', () => {
     assert.equal(ws.seq(), written, 'five identical flushes wrote nothing');
 
     const moved = trace();
-    moved.s[0].st = 'complete';
+    moved.s[0]!.st = 'complete';
     ws.agents.thinking(session.key, { think: moved, threadId: root.id });
     assert.ok(ws.seq() > written, 'a step that actually changed is recorded');
 
@@ -736,16 +783,19 @@ describe('an agent’s thinking, and who gets to read it', () => {
         _think: { t: 'Done', p: 'done', s: [{ id: 't1', t: 'Searched' }] },
       },
     });
-    assert.ok(ws.messages.get(answered.id).metadata._think, 'the trace is on the message where it was written');
+    assert.ok(
+      ws.messages.get(answered.id).metadata!._think,
+      'the trace is on the message where it was written'
+    );
 
     // `message.created` *is* a conversation event, so leaving `agent.thinking`
     // out of that list was never what kept the reasoning private.
     const pulled = ws.agents.pull(watcher.key);
     const seen = pulled.events.find((e) => e.message?.id === answered.id);
     assert.ok(seen, 'the message itself still reaches the neighbour');
-    assert.equal(seen.message.metadata._think, undefined, 'without a step-by-step it was not asked for');
-    assert.equal(seen.message.metadata._model, 'sonnet', 'who answered is context it can use');
-    assert.equal(seen.message.metadata._effort, 'high');
+    assert.equal(seen.message!.metadata!._think, undefined, 'without a step-by-step it was not asked for');
+    assert.equal(seen.message!.metadata!._model, 'sonnet', 'who answered is context it can use');
+    assert.equal(seen.message!.metadata!._effort, 'high');
 
     const resumed = ws.agents.resume(watcher.key);
     assert.ok(resumed.context.length > 0);
@@ -756,7 +806,7 @@ describe('an agent’s thinking, and who gets to read it', () => {
 
     // And the browser, which is who the box was built for, still gets it.
     const live = ws.hydratedEvents({ since: 0 }).find((e) => e.message?.id === answered.id);
-    assert.ok(live.message.metadata._think, 'the live stream carries the trace it renders');
+    assert.ok(live!.message!.metadata!._think, 'the live stream carries the trace it renders');
   });
 });
 
@@ -788,12 +838,14 @@ describe('event log', () => {
     ws.messages.post({ channel: 'later', text: 'b' });
 
     const events = ws.events({ since: start });
-    assert.deepEqual(events.map((e) => e.type), [
-      'message.created',
-      'channel.created',
-      'message.created',
-    ]);
+    assert.deepEqual(
+      events.map((e) => e.type),
+      ['message.created', 'channel.created', 'message.created']
+    );
     const seqs = events.map((e) => e.seq);
-    assert.deepEqual(seqs, [...seqs].sort((x, y) => x - y));
+    assert.deepEqual(
+      seqs,
+      [...seqs].sort((x, y) => x - y)
+    );
   });
 });

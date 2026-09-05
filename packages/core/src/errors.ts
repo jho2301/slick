@@ -5,13 +5,32 @@
  * server maps it to a status, and agents can branch on it from `--json` output.
  */
 
+import { errorMessage } from './guards.ts';
+
+export interface SlickErrorOptions {
+  /** Override the class's default code — `not_found` becoming `unknown_history_key`. */
+  code?: string;
+  status?: number;
+  details?: Record<string, unknown>;
+  hint?: string;
+}
+
+export interface SlickErrorJson {
+  error: {
+    code: string;
+    message: string;
+    hint?: string;
+    details?: Record<string, unknown>;
+  };
+}
+
 export class SlickError extends Error {
-  /**
-   * @param {string} code
-   * @param {string} message
-   * @param {{status?: number, details?: Record<string, unknown>, hint?: string}} [opts]
-   */
-  constructor(code, message, opts = {}) {
+  code: string;
+  status: number;
+  details: Record<string, unknown> | undefined;
+  hint: string | undefined;
+
+  constructor(code: string, message: string, opts: SlickErrorOptions = {}) {
     super(message);
     this.name = 'SlickError';
     this.code = opts.code ?? code;
@@ -20,7 +39,7 @@ export class SlickError extends Error {
     this.hint = opts.hint;
   }
 
-  toJSON() {
+  toJSON(): SlickErrorJson {
     return {
       error: {
         code: this.code,
@@ -33,30 +52,30 @@ export class SlickError extends Error {
 }
 
 export class NotFoundError extends SlickError {
-  constructor(message, opts = {}) {
+  constructor(message: string, opts: SlickErrorOptions = {}) {
     super('not_found', message, { status: 404, ...opts });
     this.name = 'NotFoundError';
   }
 }
 
 export class ValidationError extends SlickError {
-  constructor(message, opts = {}) {
+  constructor(message: string, opts: SlickErrorOptions = {}) {
     super('invalid_request', message, { status: 422, ...opts });
     this.name = 'ValidationError';
   }
 }
 
 export class ConflictError extends SlickError {
-  constructor(message, opts = {}) {
+  constructor(message: string, opts: SlickErrorOptions = {}) {
     super('conflict', message, { status: 409, ...opts });
     this.name = 'ConflictError';
   }
 }
 
 /** Wrap unknown throwables so callers always get a `code`. */
-export function toSlickError(err) {
+export function toSlickError(err: unknown): SlickError {
   if (err instanceof SlickError) return err;
-  const wrapped = new SlickError('internal_error', err?.message ?? String(err), { status: 500 });
+  const wrapped = new SlickError('internal_error', errorMessage(err), { status: 500 });
   wrapped.cause = err;
   return wrapped;
 }
