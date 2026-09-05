@@ -11,8 +11,12 @@
 import assert from 'node:assert/strict';
 import { beforeEach, describe, test } from 'vitest';
 
-import { createHermesStore, type HermesApi, type HermesStore } from '../src/lib/hermes-store.ts';
-import type { HermesProfileSummary, ProfileModelAnswer, UsageAnswer } from '../src/lib/hermes-types.ts';
+import { createHermesStore, type HermesApi, type HermesStore } from '../src/features/hermes/hermes-store.ts';
+import type {
+  HermesProfileSummary,
+  ProfileModelAnswer,
+  UsageAnswer,
+} from '../src/features/hermes/hermes-types.ts';
 
 const CATALOG = [
   {

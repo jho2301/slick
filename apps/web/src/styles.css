@@ -1,0 +1,2744 @@
+/* Slick — desktop UI
+   One stylesheet, no build step, light and dark. */
+
+:root {
+  --rail-bg: #1e1b33;
+  --rail-bg-hi: #2a2648;
+  --rail-fg: #cfcbe6;
+  --rail-fg-dim: #8e88ae;
+  --rail-active: #4f46e5;
+
+  --bg: #ffffff;
+  --bg-sunk: #f7f7f9;
+  --bg-hover: #f4f4f7;
+  --fg: #1a1a1e;
+  --fg-dim: #6b6b76;
+  --fg-faint: #9a9aa4;
+  --line: #e6e6ea;
+  --line-soft: #f0f0f3;
+
+  --accent: #4f46e5;
+  --accent-fg: #ffffff;
+  --accent-soft: #eef0fe;
+  --danger: #dc2626;
+  --danger-soft: #fee2e2;
+  --agent: #0f766e;
+  --agent-soft: #d9f2ee;
+  --warn: #b45309;
+
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 2px rgb(15 15 25 / 0.06), 0 1px 3px rgb(15 15 25 / 0.06);
+  --shadow-lg: 0 12px 40px rgb(15 15 25 / 0.18), 0 2px 8px rgb(15 15 25 / 0.08);
+
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+
+  --rail-w: 264px;
+  /* Overwritten on #app by the splitter, which remembers what you dragged it
+     to; this is the width a fresh install opens with. */
+  --thread-w: 400px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --rail-bg: #15131f;
+    --rail-bg-hi: #221e33;
+    --rail-fg: #c6c2dc;
+    --rail-fg-dim: #7d789b;
+
+    --bg: #16171d;
+    --bg-sunk: #1b1c23;
+    --bg-hover: #21232b;
+    --fg: #e7e7ec;
+    --fg-dim: #9b9ba7;
+    --fg-faint: #6f6f7c;
+    --line: #2a2c36;
+    --line-soft: #23252e;
+
+    --accent: #6d67f0;
+    --accent-soft: #241f4d;
+    --danger: #f87171;
+    --danger-soft: #3a1d1d;
+    --agent: #5eead4;
+    --agent-soft: #10312e;
+    --warn: #fbbf24;
+
+    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-lg: 0 16px 48px rgb(0 0 0 / 0.55);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* `hidden` must beat any layout `display` we set on .thread, .palette, etc. */
+[hidden] {
+  display: none !important;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+button {
+  cursor: pointer;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--accent) 30%, transparent);
+}
+
+/* ---------------------------------------------------------------- layout */
+
+.app {
+  display: grid;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  height: 100vh;
+  height: 100dvh;
+}
+
+.app.with-thread {
+  grid-template-columns: var(--rail-w) minmax(0, 1fr) var(--thread-w);
+}
+
+/* The rail is a grid column sized by one variable, so collapsing it is that
+   variable going to zero — no second grid-template to keep in step with
+   `.with-thread`, and the narrow override below still wins on its own terms
+   because it replaces the whole template rather than this custom property. */
+.app.rail-hidden {
+  --rail-w: 0px;
+}
+
+/* Registered so the collapse can be animated: a plain custom property is a
+   string as far as transitions are concerned and would snap. Browsers without
+   @property just skip the animation, which is a fine place to land. */
+@property --rail-w {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 264px;
+}
+
+.app {
+  transition: --rail-w 0.18s ease;
+}
+/* Restoring a collapsed rail from last time is a starting state, not a move —
+   without this it slides shut in front of you on every load. */
+.app.is-loading {
+  transition: none;
+}
+
+/* A zero-width column still holds focusable buttons and is still read out, so
+   the rail goes properly hidden — but only once it has finished sliding away,
+   which is what the delayed zero-length step buys. Same trick as the stacked
+   panes further down. */
+.app.rail-hidden .rail {
+  visibility: hidden;
+  transition: visibility 0s linear 0.18s;
+}
+.rail {
+  transition: visibility 0s;
+}
+
+/* ------------------------------------------------------------ pane split */
+
+/* The grab handle sits on top of the thread's left border and takes up no
+   space at all. Giving it a column of its own instead pushes the two panes
+   apart by its width, and every rule that runs to the edge — the header
+   borders, most visibly — then comes up broken across the gap. */
+.pane-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 13px;
+  /* Centred on the 1px border it covers, so it is the same reach from either
+     side; a 1px target on its own would be unhittable. */
+  margin-left: -6px;
+  z-index: 6;
+  cursor: col-resize;
+  /* A touch drag here is a resize, never a scroll of what is underneath. */
+  touch-action: none;
+  /* It overlaps the header band, which is what the Electron window is dragged
+     by — without this the top of the handle would move the window instead. */
+  -webkit-app-region: no-drag;
+}
+
+/* At rest the pane's own border is the line you see; this only lights up under
+   the pointer, and covers that hairline when it does. */
+.pane-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 5px;
+  width: 3px;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+
+/* The grip. A hit area you cannot see is one nobody finds, so the split says
+   where it is: a quiet pill riding the line, which comes forward under the
+   pointer. */
+.pane-resizer::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 38px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--fg-faint) 45%, transparent);
+  transition:
+    background 0.12s ease,
+    height 0.12s ease,
+    width 0.12s ease;
+}
+
+.pane-resizer:hover::before,
+.pane-resizer:focus-visible::before,
+.pane-resizer.is-dragging::before {
+  background: var(--accent);
+}
+
+/* Wider than the lit line, or the knob would dissolve into it just as you go
+   to grab it. */
+.pane-resizer:hover::after,
+.pane-resizer:focus-visible::after,
+.pane-resizer.is-dragging::after {
+  background: var(--accent);
+  width: 7px;
+  height: 56px;
+}
+
+/* The lit-up line and grip above are the focus ring — a second one around a
+   13px sliver would only smear it. */
+.pane-resizer:focus {
+  outline: none;
+}
+
+/* Without this a drag that strays over the timeline selects message text, and
+   the cursor flickers back to a caret on every frame. */
+body.is-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+body.is-resizing * {
+  cursor: col-resize !important;
+}
+
+/* The headers are what you drag the Electron window by, and a drag region
+   takes the mouse away from the page — so for as long as the split is being
+   dragged, nothing is one. Otherwise wandering up into the header band mid-drag
+   would stall the resize against it, or start moving the window. */
+body.is-resizing .rail__head,
+body.is-resizing .chan-head,
+body.is-resizing .thread__head {
+  -webkit-app-region: no-drag;
+}
+
+.app.is-loading .main,
+.app.is-loading .rail__pinned,
+.app.is-loading .rail__scroll {
+  opacity: 0.4;
+}
+
+/* ------------------------------------------------------------------ rail */
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--rail-bg);
+  color: var(--rail-fg);
+  user-select: none;
+}
+
+.rail__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 12px 10px 14px;
+  /* Room for the traffic lights when Electron hides the title bar. */
+  padding-top: max(14px, env(titlebar-area-height, 14px));
+  -webkit-app-region: drag;
+}
+
+.rail__workspace {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.rail__mark {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: linear-gradient(140deg, #6d67f0, #a855f7);
+  color: #fff;
+  font-weight: 800;
+  font-size: 15px;
+  flex: none;
+}
+
+.rail__title {
+  font-weight: 700;
+  font-size: 15px;
+  color: #fff;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rail__user {
+  font-size: 12px;
+  color: var(--rail-fg-dim);
+}
+
+.rail__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 8px 20px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rail-bg-hi) transparent;
+}
+
+.rail__section {
+  margin-bottom: 14px;
+}
+
+.rail__heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  background: none;
+  color: var(--rail-fg-dim);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border-radius: 6px;
+  text-align: left;
+}
+.rail__heading:hover {
+  background: var(--rail-bg-hi);
+  color: var(--rail-fg);
+}
+/* The same heading, for a section that does not fold: no chevron, no hover
+   affordance, because there is nothing to click. */
+.rail__heading--static {
+  margin: 0;
+  cursor: default;
+}
+.rail__heading--row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rail__heading--row .rail__heading-text {
+  min-width: 0;
+}
+.rail__heading--static:hover {
+  background: none;
+  color: var(--rail-fg-dim);
+}
+.rail__chev {
+  font-size: 10px;
+  width: 10px;
+  flex: none;
+}
+.rail__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------- categories */
+
+/* Sections sit close together so a sidebar of categories reads as one list
+   rather than a stack of unrelated blocks. */
+.rail__section--category {
+  margin-bottom: 4px;
+}
+/* …but the uncategorised bucket underneath them gets a little air, and only
+   when there is actually something above it. */
+#category-sections:not(:empty) + .rail__section {
+  margin-top: 12px;
+}
+
+/* The heading and its "···" share a row so the button can sit on the right
+   without being part of the (full-width) collapse target. */
+.rail__headrow {
+  display: flex;
+  align-items: center;
+}
+.rail__headrow .rail__heading {
+  min-width: 0;
+}
+
+.rail__tally {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--rail-fg-dim);
+  background: var(--rail-bg-hi);
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+.rail__cog {
+  flex: none;
+  border: 0;
+  background: none;
+  color: var(--rail-fg-dim);
+  border-radius: 6px;
+  padding: 2px 6px 6px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.rail__headrow:hover .rail__cog,
+.rail__cog:focus-visible {
+  opacity: 1;
+}
+.rail__cog:hover {
+  background: var(--rail-bg-hi);
+  color: var(--rail-fg);
+}
+
+/* A bucket with nothing in it is a heading over empty space — hidden, unless a
+   channel is mid-drag and needs somewhere to land. */
+.rail__section.is-empty {
+  display: none;
+}
+.rail.has-drag .rail__section.is-empty {
+  display: block;
+}
+
+.rail__section.is-drop {
+  background: color-mix(in oklab, var(--rail-active) 22%, transparent);
+  border-radius: 9px;
+  outline: 1px dashed color-mix(in oklab, var(--rail-active) 65%, transparent);
+  outline-offset: -1px;
+}
+
+.chan-drop {
+  padding: 5px 10px 7px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--rail-fg-dim);
+}
+
+.chan.is-dragging {
+  opacity: 0.45;
+}
+
+.channel-list,
+.agent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.chan {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--rail-fg);
+  font-size: 14.5px;
+  text-align: left;
+  line-height: 1.35;
+}
+.chan:hover {
+  background: var(--rail-bg-hi);
+}
+.chan.is-active {
+  background: var(--rail-active);
+  color: #fff;
+  font-weight: 600;
+}
+.chan__hash {
+  color: var(--rail-fg-dim);
+  font-weight: 500;
+  flex: none;
+}
+.chan.is-active .chan__hash {
+  color: rgb(255 255 255 / 0.75);
+}
+.chan__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.chan__count {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--rail-fg-dim);
+  background: var(--rail-bg-hi);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.chan.is-active .chan__count {
+  background: rgb(0 0 0 / 0.25);
+  color: #fff;
+}
+.chan.is-unread .chan__name {
+  font-weight: 700;
+  color: #fff;
+}
+.chan.is-unread .chan__count {
+  background: #ef4444;
+  color: #fff;
+}
+
+.agent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  font-size: 13.5px;
+}
+.agent:hover {
+  background: var(--rail-bg-hi);
+}
+.agent__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex: none;
+  box-shadow: 0 0 0 3px rgb(34 197 94 / 0.18);
+}
+.agent__dot.is-idle {
+  background: var(--rail-fg-dim);
+  box-shadow: none;
+}
+.agent__body {
+  min-width: 0;
+  flex: 1;
+}
+.agent__name {
+  color: var(--rail-fg);
+  font-weight: 600;
+}
+.agent__key {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--rail-fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Reads as a label until you go near it, because most of the time it is one:
+   the answer to "what is this agent running?". */
+.agent__model {
+  display: block;
+  max-width: 100%;
+  margin-top: 2px;
+  /* The padding is the hover pill; the negative margin keeps the text itself
+     in the same column as the name and the key above it. */
+  margin-left: -5px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--rail-fg-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent__model.is-set {
+  color: var(--rail-fg);
+}
+.agent__effort {
+  display: inline-block;
+  margin-left: -5px;
+  padding: 1px 5px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--rail-fg-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  opacity: 0.65;
+}
+.agent__effort.is-set {
+  color: var(--rail-fg);
+  opacity: 1;
+}
+.agent__effort:hover {
+  background: var(--rail-active);
+  color: #fff;
+  opacity: 1;
+}
+.agent__model:hover {
+  background: var(--rail-active);
+  color: #fff;
+}
+
+.agent__copy {
+  border: 0;
+  background: none;
+  color: var(--rail-fg-dim);
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  flex: none;
+}
+.agent__copy:hover {
+  background: var(--rail-active);
+  color: #fff;
+}
+.rail__empty {
+  padding: 4px 10px 8px;
+  font-size: 12.5px;
+  color: var(--rail-fg-dim);
+  line-height: 1.5;
+}
+.rail__empty code {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--rail-fg);
+}
+
+/* Parked at the foot of the rail, below the scroller, so the channel list can
+   run as long as it likes without ever pushing this out of reach. */
+.rail__pinned {
+  flex: none;
+  margin-bottom: 0;
+  padding: 6px 8px;
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+}
+/* Expanded, it takes only as much of the rail as it needs and scrolls past
+   that — the channels above stay visible either way. */
+.rail__pinned .agent-list,
+.rail__pinned .hermes {
+  max-height: min(38vh, 260px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rail-bg-hi) transparent;
+}
+
+/* ----------------------------------------------------------------- hermes */
+
+/* Three selects in a sidebar column. Label above field rather than beside it:
+   the rail is ~220px and "Provider" alongside a menu of provider names leaves
+   the names in about nine characters. */
+.hermes {
+  padding: 2px 2px 4px;
+}
+.hermes__field {
+  display: block;
+  margin-bottom: 7px;
+}
+.hermes__label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--rail-fg-dim);
+}
+.hermes__select {
+  width: 100%;
+  padding: 3px 5px;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 5px;
+  background: var(--rail-bg-hi);
+  color: var(--rail-fg);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.hermes__select:disabled {
+  opacity: 0.5;
+}
+.hermes__help,
+.hermes__note,
+.hermes__scope {
+  display: block;
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--rail-fg-dim);
+}
+.hermes__note.is-warn {
+  color: #fca5a5;
+}
+.hermes__note.is-ok {
+  color: #86efac;
+}
+.hermes__scope {
+  margin-top: 7px;
+  opacity: 0.75;
+}
+.hermes__scope code {
+  font-family: var(--mono);
+  color: var(--rail-fg);
+}
+
+/* The answer to "what is it on?", without opening a menu. */
+.hermes__current {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+  min-width: 0;
+}
+.hermes__model {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--rail-fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hermes__prov {
+  font-size: 10px;
+  color: var(--rail-fg-dim);
+  flex: none;
+}
+
+.hermes__acts {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+}
+.hermes__save,
+.hermes__undo {
+  border: 0;
+  border-radius: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--rail-active);
+  color: #fff;
+}
+.hermes__save[disabled] {
+  opacity: 0.4;
+}
+.hermes__undo {
+  background: none;
+  color: var(--rail-fg-dim);
+  font-weight: 400;
+}
+.hermes__undo:hover {
+  background: var(--rail-bg-hi);
+  color: var(--rail-fg);
+}
+
+/* Inline with the error it answers: a read that failed is a read worth trying
+   again, and closing the panel to get one is not an affordance. */
+.hermes__retry {
+  margin-left: 6px;
+  border: 1px solid rgb(255 255 255 / 0.18);
+  border-radius: 5px;
+  padding: 1px 6px;
+  font-size: 10.5px;
+  background: none;
+  color: var(--rail-fg);
+}
+.hermes__retry:hover:not([disabled]) {
+  background: var(--rail-bg-hi);
+}
+.hermes__retry[disabled] {
+  opacity: 0.5;
+}
+
+/* What the account has left. A second block under the settings, separated by a
+   rule, because it is not a setting: nothing in here is something to change. */
+.hermes__usage {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+}
+/* In its own rail section the heading above is already the separator, so the
+   block does not draw a second rule of its own. */
+.rail__pinned--limits .hermes__usage {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+.hermes__usage-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+}
+.hermes__usage-plan {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: var(--rail-bg-hi);
+  color: var(--rail-fg-dim);
+}
+/* Pushed to the right so the block has one obvious control and it is the one
+   that costs a request. */
+.hermes__usage-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 0.18);
+  border-radius: 5px;
+  padding: 2px;
+  line-height: 0;
+  background: none;
+  color: var(--rail-fg);
+}
+.hermes__usage-refresh:hover:not([disabled]) {
+  background: var(--rail-bg-hi);
+}
+.hermes__usage-refresh[disabled] {
+  opacity: 0.5;
+}
+
+/* Both windows on one line, split by a slash. Kept on a single line on purpose
+   — a row that wraps makes the pair of them stop scanning as a pair — so
+   nothing here is allowed to break, and the line shrinks its own type rather
+   than folding when the rail is narrow. */
+.hermes__limits-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 5px;
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+}
+.hermes__limit {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.hermes__limit-sep {
+  font-size: 10.5px;
+  color: var(--rail-fg-dim);
+  flex: 0 0 auto;
+}
+.hermes__limit-label {
+  font-size: 10.5px;
+  color: var(--rail-fg);
+}
+.hermes__limit-value {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--rail-fg);
+}
+.hermes__limit-reset {
+  font-size: 10px;
+  color: var(--rail-fg);
+}
+
+/* The same muted grey as the rest of the rail's small print: a spare reset is
+   a fact about the account, not good news worth colouring. */
+.hermes__usage-banked {
+  margin-top: 7px;
+  font-size: 10.5px;
+  color: var(--rail-fg-dim);
+  text-align: right;
+}
+.hermes__usage-detail {
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--rail-fg-dim);
+}
+
+.rail__foot {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 14px;
+  border-top: 1px solid rgb(255 255 255 / 0.07);
+  font-size: 12px;
+  color: var(--rail-fg-dim);
+}
+/* The pinned block already carries the separator; a second hairline this close
+   would just read as noise. */
+.rail__pinned + .rail__foot {
+  border-top: 0;
+  padding-top: 4px;
+}
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+.dot.is-live {
+  background: #22c55e;
+}
+.dot.is-down {
+  background: #ef4444;
+}
+
+/* ------------------------------------------------------------------ main */
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+  border-left: 1px solid var(--line);
+  position: relative;
+}
+
+.chan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  height: 56px;
+  flex: none;
+  border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
+}
+.chan-head__left {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+/* The back arrow is an icon with no text baseline, so it sits out the row's
+   baseline alignment rather than hanging below the title. */
+#btn-menu {
+  align-self: center;
+}
+#btn-rail {
+  align-self: center;
+}
+/* macOS hides the title bar and floats the traffic lights over the top-left of
+   the window. That corner is the rail until the rail is collapsed — after
+   which it is this header, and the toggle would sit underneath them. Reserve
+   the strip they land on. Set from JS because only the desktop build gets that
+   window, and nothing in CSS can see it. */
+.app.is-inset-titlebar.rail-hidden .chan-head {
+  padding-left: 84px;
+}
+.chan-head__title {
+  font-size: 17px;
+  font-weight: 800;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+.chan-head__topic {
+  border: 0;
+  background: none;
+  padding: 2px 4px;
+  border-radius: 5px;
+  color: var(--fg-dim);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46ch;
+  -webkit-app-region: no-drag;
+}
+.chan-head__topic:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.chan-head__topic:empty::before {
+  content: 'Add a topic';
+  color: var(--fg-faint);
+}
+.chan-head__actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+  -webkit-app-region: no-drag;
+}
+
+.chip {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--fg-dim);
+  border-radius: 7px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.chip:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.chip--danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  -webkit-app-region: no-drag;
+}
+.icon-btn svg {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+}
+.icon-btn--ghost {
+  color: var(--rail-fg-dim);
+}
+.icon-btn--ghost:hover {
+  background: rgb(255 255 255 / 0.1);
+  color: #fff;
+}
+/* The rail is dark; every other surface the button sits on is not. */
+.thread .icon-btn--ghost,
+.main .icon-btn--ghost,
+.settings .icon-btn--ghost {
+  color: var(--fg-dim);
+}
+.thread .icon-btn--ghost:hover,
+.main .icon-btn--ghost:hover,
+.settings .icon-btn--ghost:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+/* -------------------------------------------------------------- timeline */
+
+.timeline {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+/* Short channels sit on the composer rather than floating at the top. */
+.timeline__inner {
+  padding: 18px 0 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-height: 100%;
+}
+
+.day {
+  position: sticky;
+  top: 6px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 14px 16px 10px;
+  pointer-events: none;
+}
+.day::before,
+.day::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.day span {
+  padding: 2px 12px;
+  margin: 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-dim);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.msg {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 10px;
+  padding: 5px 16px 5px 12px;
+  position: relative;
+}
+.msg:hover {
+  background: var(--bg-hover);
+}
+.msg.is-grouped {
+  padding-top: 1px;
+  padding-bottom: 1px;
+}
+.msg.is-pending {
+  opacity: 0.55;
+}
+.msg.is-flash {
+  animation: flash 1.4s ease-out;
+}
+@keyframes flash {
+  from {
+    background: color-mix(in oklab, var(--accent) 22%, transparent);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 15px;
+  flex: none;
+  user-select: none;
+}
+.avatar--agent {
+  border-radius: 50%;
+  box-shadow:
+    0 0 0 2px var(--bg),
+    0 0 0 3.5px var(--agent);
+}
+
+.msg__gutter {
+  display: grid;
+  place-items: start center;
+  padding-top: 2px;
+}
+.msg__stamp {
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  padding-top: 4px;
+}
+.msg:hover .msg__stamp {
+  opacity: 1;
+}
+
+.msg__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.msg__author {
+  font-weight: 700;
+  font-size: 14.5px;
+}
+.msg__time {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+.msg__badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--agent-soft);
+  color: var(--agent);
+}
+.msg__badge--system {
+  background: var(--bg-sunk);
+  color: var(--fg-faint);
+}
+/* The model and the level are two chips, and they belong to each other: one
+   wrapper so the header's gap separates the pair from the name rather than
+   the pair from itself, and so they wrap onto a new line together. */
+.msg__badges {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  min-width: 0;
+}
+/* Quieter than the model beside it: a setting, not a name. Same relationship
+   as the rail's model and effort buttons. */
+.msg__effort {
+  font-family: var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+/* Stands where the `agent` badge used to, and wears its pill — but a model id
+   is a literal name, so it keeps its own case and a monospace face. */
+.msg__model {
+  font-family: var(--mono);
+  text-transform: none;
+  letter-spacing: 0;
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msg__edited {
+  font-size: 11px;
+  color: var(--fg-faint);
+}
+
+.msg__body {
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+.msg__body > :first-child {
+  margin-top: 0;
+}
+.msg__body > :last-child {
+  margin-bottom: 0;
+}
+.msg__body p {
+  margin: 0.9em 0;
+}
+.msg__body code {
+  font-family: var(--mono);
+  font-size: 0.87em;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.5px 4px;
+}
+.msg__body pre {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+.msg__body pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+.msg__body a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.msg__body a:hover {
+  text-decoration: underline;
+}
+.msg__body blockquote {
+  margin: 4px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--line);
+  color: var(--fg-dim);
+}
+.msg__body h1,
+.msg__body h2,
+.msg__body h3,
+.msg__body h4,
+.msg__body h5,
+.msg__body h6 {
+  margin: 0.5em 0 0.3em;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.msg__body h1 {
+  font-size: 1.35em;
+}
+.msg__body h2 {
+  font-size: 1.2em;
+}
+.msg__body h3 {
+  font-size: 1.08em;
+}
+.msg__body h4,
+.msg__body h5,
+.msg__body h6 {
+  font-size: 1em;
+}
+.msg__body ul,
+.msg__body ol {
+  margin: 0.3em 0;
+  padding-left: 1.4em;
+}
+.msg__body li {
+  margin: 0.15em 0;
+}
+.msg__body li > p {
+  margin: 0;
+}
+.msg__body hr {
+  margin: 0.6em 0;
+  border: none;
+  border-top: 1px solid var(--line);
+}
+.msg__body table {
+  display: block;
+  overflow-x: auto;
+  margin: 0.4em 0;
+  border-collapse: collapse;
+  font-size: 0.94em;
+}
+.msg__body th,
+.msg__body td {
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  text-align: left;
+}
+.msg__body th {
+  background: var(--bg-sunk);
+  font-weight: 700;
+}
+.mention {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 4px;
+  padding: 0 3px;
+  font-weight: 600;
+}
+.msg__deleted {
+  color: var(--fg-faint);
+  font-style: italic;
+}
+
+.msg__meta {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-faint);
+  background: var(--bg-sunk);
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  padding: 4px 7px;
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* --------------------------------------------------------------- thinking */
+
+/* The box an agent's working is drawn in: what it looked up, what it ran, in
+   the order it said so. It wears the sunken box the model stamp above wears,
+   and for the same reason — this is the message talking about itself, not part
+   of what it said, and the two should not be told apart by size alone.
+
+   Every colour below is a token. Dark mode in this file is one
+   prefers-color-scheme block that redefines the palette and nothing else;
+   there is no data-theme hook to hang a second set of rules on, so a literal
+   colour here is a colour that is wrong in one of the two themes. */
+
+/* The glyphs, kept beside the rules that use them rather than up with the
+   palette: they are shapes, not colours — the mask picks the shape and the
+   `currentColor` underneath picks the colour, so none of them needs a
+   dark-mode counterpart. Inline because index.html ships
+   `default-src 'self'` with `img-src` widened only to `data:`; an icon fetched
+   from anywhere else would be blocked and simply never draw. */
+:root {
+  --think-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5L10.5 8 6 12.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  /* A ring with one bright quarter — it only reads as turning because the gap
+     goes round, so this is the one glyph that needs its own animation. */
+  --think-ring: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='none' stroke='%23000' stroke-width='2' opacity='.3'/%3E%3Cpath d='M8 2a6 6 0 016 6' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+  --think-dot: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='3.2' fill='none' stroke='%23000' stroke-width='2'/%3E%3C/svg%3E");
+  /* Filled disc, check knocked out of it: one path, `evenodd`, so the tick is
+     the background showing through rather than a second element to colour. */
+  --think-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23000' fill-rule='evenodd' d='M8 0a8 8 0 100 16A8 8 0 008 0zm3.6 5.6a1 1 0 010 1.4l-4 4a1 1 0 01-1.4 0L4.4 9.2a1 1 0 111.4-1.4l1.1 1.1 3.3-3.3a1 1 0 011.4 0z'/%3E%3C/svg%3E");
+  --think-alert: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%23000' fill-rule='evenodd' d='M8 0a8 8 0 100 16A8 8 0 008 0zM7 3.6h2l-.35 5.8h-1.3L7 3.6zm1 7.2a1.15 1.15 0 110 2.3 1.15 1.15 0 010-2.3z'/%3E%3C/svg%3E");
+}
+
+.think {
+  /* Deliberately not the width of the pane. The working is an aside about the
+     answer, and a line of it running the full width of a wide window reads as
+     the answer. */
+  max-width: 620px;
+  margin: 3px 0 6px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  /* The head's hover fill runs to the corners otherwise. */
+  overflow: hidden;
+}
+
+.think__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 5px 9px;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+.think__head:hover {
+  background: var(--bg-hover);
+}
+.think__head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.think__chev {
+  flex: none;
+  display: block;
+  width: 12px;
+  height: 12px;
+  background: currentColor;
+  -webkit-mask: var(--think-chevron) center / contain no-repeat;
+  mask: var(--think-chevron) center / contain no-repeat;
+  color: var(--fg-faint);
+  transition: transform 0.2s ease;
+}
+.think__head[aria-expanded='true'] .think__chev {
+  transform: rotate(90deg);
+}
+
+.think__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Still going: the agent's own colour, with the light moving across it. The
+   line is the only thing on screen that is still changing, and a summary that
+   updates without any sign it is live looks like a summary that got stuck. */
+.think[data-phase='streaming'] .think__title {
+  color: var(--agent);
+  background: linear-gradient(
+    100deg,
+    var(--agent) 30%,
+    color-mix(in oklab, var(--agent) 30%, var(--fg-faint)) 50%,
+    var(--agent) 70%
+  );
+  background-size: 300% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: think-shimmer 2.6s linear infinite;
+}
+/* Done, and the answer is underneath it now — so the line stops advertising
+   itself and settles into ordinary body colour. */
+.think[data-phase='done'] .think__title {
+  color: var(--fg);
+}
+.think[data-phase='error'] .think__title {
+  color: var(--danger);
+}
+.think[data-phase='error'] {
+  border-color: color-mix(in oklab, var(--danger) 35%, var(--line));
+}
+
+/* One mark, four states, told apart by the glyph rather than by colour alone:
+   pending and complete are the same size and the same weight either side of a
+   run, and colour on its own would not survive a monochrome display. */
+.think__mark {
+  flex: none;
+  display: block;
+  width: 13px;
+  height: 13px;
+  background: currentColor;
+  color: var(--fg-faint);
+  -webkit-mask: var(--think-mark-icon, var(--think-dot)) center / contain no-repeat;
+  mask: var(--think-mark-icon, var(--think-dot)) center / contain no-repeat;
+}
+.think__mark[data-status='pending'] {
+  --think-mark-icon: var(--think-dot);
+  animation: think-twinkle 2s ease-in-out infinite;
+}
+.think__mark[data-status='in_progress'] {
+  --think-mark-icon: var(--think-ring);
+  color: var(--agent);
+  animation: think-spin 0.9s linear infinite;
+}
+.think__mark[data-status='complete'] {
+  --think-mark-icon: var(--think-check);
+  color: var(--agent);
+}
+.think__mark[data-status='error'] {
+  --think-mark-icon: var(--think-alert);
+  color: var(--danger);
+}
+
+/* The mark in the head needs no rules of its own. It belongs to the box rather
+   than to a step, but the box's phase is handed to it as a step status —
+   streaming is a step in progress, done is a step complete, an error is an
+   error — so the four rules above already draw it, spinner and all, and the
+   collapsed line can still say by itself that something broke inside it. */
+
+/* The collapse. `display: none` would be simpler and is not an option: the
+   steps are content, and content taken out of the box is taken out of the
+   accessibility tree with it — a screen reader would be told the box exists
+   and never told what is in it. A row of `0fr` hides the pixels and keeps the
+   text, and it is also the only way the height animates at all, since `auto`
+   is not a length and has nothing to interpolate towards. */
+.think__body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.2s ease;
+}
+/* `~` rather than `+`, so the rule does not depend on where the box's live
+   region ends up among the head's siblings. It is the only thing collapsing
+   the body — the markup carries no `hidden`, which in this file is
+   `display: none !important` and would take the steps out of the reader's
+   reach and out of the transition with them. */
+.think__head[aria-expanded='true'] ~ .think__body {
+  grid-template-rows: 1fr;
+}
+/* The row is zero-height; without this the child simply overflows it. */
+.think__body > * {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* No padding on the top and bottom of the grid item itself, and this is not a
+   style choice. A `0fr` track is really `minmax(auto, 0fr)`, and the `auto`
+   floor is the item's border-box minimum — `min-height: 0` and `overflow:
+   hidden` take the *content* to zero but leave the padding standing, so
+   `2px` over and `8px` under measured a collapsed box at ten stubborn pixels.
+   The breathing room moves inward, onto the first and last row, where it is
+   margin on a child that clips away with everything else. */
+.think__steps {
+  list-style: none;
+  margin: 0;
+  padding: 0 10px;
+  display: grid;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.think__steps > :first-child {
+  margin-top: 2px;
+}
+.think__steps > :last-child {
+  margin-bottom: 8px;
+}
+.think__step {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  color: var(--fg-dim);
+}
+/* The step is a two-column grid with one thing in the first column, and every
+   other child belongs under the title rather than beside the mark. Without the
+   explicit column, auto-placement drops the details into the 13px marker
+   column and the output ends up about a character wide. And whatever lands in
+   the text column has to be allowed to shrink, or a long tool name pushes the
+   box past the width chosen above. */
+.think__step > :not(.think__mark) {
+  min-width: 0;
+  grid-column: 2;
+}
+.think__step .think__mark {
+  margin-top: 2px;
+}
+/* The way back to the steps that were folded away — a row standing in for the
+   gap, not a control sitting on top of one. It gives up its platform button
+   chrome the way every other in-place control in this file does, and it is
+   indented past the marker column so it starts where the step titles under it
+   start rather than where their marks do. */
+.think__more {
+  padding-left: 21px;
+  color: var(--fg-faint);
+}
+.think__more button {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+}
+.think__more button:hover {
+  color: var(--fg-dim);
+}
+.think__more button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* The step being worked on is the one worth reading; the rest are a record. */
+.think__step[data-status='in_progress'] .think__step-title {
+  color: var(--fg);
+}
+.think__step[data-status='error'] .think__step-title {
+  color: var(--danger);
+}
+
+.think__details {
+  list-style: none;
+  margin: 3px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-faint);
+  overflow-wrap: anywhere;
+}
+.think__output {
+  margin-top: 3px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}
+
+/* A `<ul>`, so it arrives with the browser's bullet and its ~40px indent until
+   it is told otherwise — the same reset `.think__steps` and `.think__details`
+   do above. And the flex items are the `<li>`s each link is wrapped in, not
+   the links themselves, so the shrinking has to be allowed there too. */
+.think__sources {
+  list-style: none;
+  margin: 5px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.think__sources > li {
+  min-width: 0;
+}
+.think__source {
+  display: block;
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 11px;
+  text-decoration: none;
+}
+.think__source:hover {
+  text-decoration: underline;
+}
+
+/* Said, not shown: the status suffix on each step, and the box's one live
+   region — which is a sibling of the collapsible body on purpose, because a
+   region announcing from inside a `0fr` row is a region announcing from inside
+   something the browser has been told is not there.
+
+   Clipped rather than hidden, since `display: none` and `visibility: hidden`
+   both take the words out of the accessibility tree along with the pixels. */
+.think__sr,
+.think__live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* A draft is the typing bubble with the answer landing inside it rather than
+   beside it. It stops being dimmed the moment there is something to read:
+   0.8 says "not really here", which is right for a placeholder and wrong for
+   the answer itself arriving a word at a time. */
+.msg.is-typing:has(.msg__body:not(.msg__body--typing)) {
+  opacity: 1;
+}
+.msg.is-typing .think {
+  margin-top: 0;
+}
+
+@keyframes think-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+@keyframes think-spin {
+  to {
+    transform: rotate(1turn);
+  }
+}
+@keyframes think-twinkle {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* The first reduced-motion block in this file, and it needs to cover only what
+   is above it: everything else that folds in this app snaps on purpose. A
+   category collapses by going `hidden`, and the rail's slide moves a column
+   width rather than revealing anything — this box is the only disclosure in
+   Slick where the content itself opens, and an opening box that also shimmers
+   and spins is the exact pile-up this setting exists to stop.
+
+   Nothing load-bearing is lost: the state lives in the chevron's direction,
+   the glyph and `aria-expanded`, none of which move. */
+@media (prefers-reduced-motion: reduce) {
+  .think__title,
+  .think__mark {
+    animation: none;
+  }
+  .think__body,
+  .think__chev {
+    transition: none;
+  }
+}
+
+.msg__thread {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 5px;
+  padding: 3px 9px 3px 4px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: none;
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.msg__thread:hover {
+  background: var(--bg);
+  border-color: var(--line);
+  box-shadow: var(--shadow-sm);
+}
+.msg__thread .stack {
+  display: flex;
+}
+.msg__thread .stack .avatar {
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+  border-radius: 6px;
+  margin-right: -5px;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+.msg__thread .when {
+  color: var(--fg-faint);
+  font-weight: 400;
+}
+
+.msg__thread--typing {
+  color: var(--agent);
+}
+
+.typing-dots {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+.typing-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.35;
+  animation: typing-bounce 1.1s infinite ease-in-out;
+}
+.typing-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.typing-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 0.9;
+    transform: translateY(-2px);
+  }
+}
+
+.msg.is-typing {
+  opacity: 0.8;
+}
+.msg.is-typing .msg__gutter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.msg__body--typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+/* The rail spans the whole row so the bar inside it can slide down as a tall
+   message scrolls past; it is only as wide as the bar and lets clicks through
+   so it never eats a selection drag over the message body. */
+.msg__rail {
+  position: absolute;
+  top: -12px;
+  right: 16px;
+  bottom: 0;
+  display: none;
+  pointer-events: none;
+  z-index: 3;
+}
+.msg:hover .msg__rail {
+  display: block;
+}
+
+.msg__actions {
+  position: sticky;
+  /* Docks flush against the pane header once the message top has scrolled
+     past. A scroll container's own top padding counts toward the offset, so
+     the panes that have one take it back below rather than each guessing. */
+  top: var(--dock-top, 0px);
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow-sm);
+  pointer-events: auto;
+}
+.msg__actions button {
+  border: 0;
+  background: none;
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.msg__actions button:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+.msg__actions button.is-danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.msg__edit {
+  display: grid;
+  gap: 6px;
+  margin: 2px 0;
+}
+.msg__edit textarea {
+  width: 100%;
+  border: 1.5px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  background: var(--bg);
+  resize: vertical;
+  min-height: 64px;
+  outline: none;
+}
+.msg__edit .row {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  align-items: center;
+}
+.msg__edit .hint {
+  margin-right: auto;
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+
+/* ------------------------------------------------------------- composer */
+
+.composer {
+  flex: none;
+  padding: 0 16px 16px;
+}
+.composer--thread {
+  padding: 0 14px 14px;
+}
+
+.composer__box {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg);
+  box-shadow: var(--shadow-sm);
+  transition:
+    border-color 0.12s,
+    box-shadow 0.12s;
+}
+.composer__box:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
+}
+
+.composer__input {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: none;
+  resize: none;
+  outline: none;
+  padding: 11px 13px 4px;
+  max-height: 42vh;
+  overflow-y: auto;
+  line-height: 1.5;
+  font-family: inherit;
+}
+.composer__input::placeholder {
+  color: var(--fg-faint);
+}
+
+.composer__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 8px 8px 13px;
+}
+.composer__hint {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+.composer__hint b {
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+
+/* The pane above already says "Thread", so its composer spends no row on
+   repeating it: the box is all typing space and the send button tucks into a
+   gutter on the right, which the text stops short of. */
+.composer--thread .composer__input {
+  padding: 12px 52px 12px 13px;
+  min-height: 88px;
+}
+.composer--thread .send-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+}
+
+.mention-menu {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 100%;
+  margin-bottom: 6px;
+  list-style: none;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-height: 220px;
+  overflow-y: auto;
+  z-index: 20;
+}
+.mention-menu li {
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.mention-menu li.is-sel {
+  background: var(--accent-soft);
+}
+.mention-menu .what {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.mention-menu .where {
+  font-size: 12px;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+
+/* The slash menu is the mention menu with a longer right-hand column: a
+   command's summary is a sentence, not a handle. */
+.command-menu {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 100%;
+  margin-bottom: 6px;
+  list-style: none;
+  padding: 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  max-height: 260px;
+  overflow-y: auto;
+  z-index: 20;
+}
+.command-menu li {
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.command-menu li.is-sel {
+  background: var(--accent-soft);
+}
+.command-menu li.is-loading {
+  color: var(--fg-faint);
+  cursor: default;
+  justify-content: flex-start;
+}
+/* Listed, but the agent said it cannot answer it from here. */
+.command-menu li.is-off {
+  opacity: 0.55;
+}
+.command-menu .what {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.command-menu .where {
+  font-size: 12px;
+  color: var(--fg-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A command's answer: one person's, above their own composer, gone on the
+   next thing they type. It is deliberately not shaped like a message. */
+.composer__out {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-soft, transparent);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.composer__out.is-warn {
+  border-color: var(--danger, #c2410c);
+}
+.composer__out-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.composer__out-title {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-faint);
+}
+.composer__out-close {
+  border: 0;
+  background: none;
+  color: var(--fg-faint);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.composer__out-close:hover {
+  color: var(--fg);
+}
+.composer__out-body {
+  margin-top: 4px;
+  font-size: 13.5px;
+}
+.composer__out-body pre {
+  overflow-x: auto;
+}
+
+.send-btn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--fg);
+  flex: none;
+  transition:
+    opacity 0.12s,
+    transform 0.08s,
+    background 0.12s;
+}
+.send-btn:not(:disabled):hover {
+  background: var(--bg-hover);
+}
+.send-btn svg {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
+.send-btn:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+.send-btn:not(:disabled):active {
+  transform: scale(0.94);
+}
+
+.jump {
+  position: absolute;
+  left: 50%;
+  bottom: 108px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 5px 14px;
+  border-radius: 999px;
+  box-shadow: var(--shadow-lg);
+  z-index: 4;
+}
+
+/* --------------------------------------------------------------- thread */
+
+.thread {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--bg);
+  /* What the splitter overlay above anchors to. */
+  position: relative;
+}
+.thread__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 56px;
+  flex: none;
+  padding: 0 10px 0 16px;
+  border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
+}
+.thread__head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.thread__title {
+  font-weight: 800;
+  font-size: 15px;
+}
+.thread__sub {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.thread__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 0;
+  scrollbar-width: thin;
+  /* Cancels the 12px above, so a docked .msg__actions meets the head border. */
+  --dock-top: -12px;
+}
+
+/* A thread pane is one conversation held open, and every row in it belongs to
+   that conversation: the avatar column repeats an identity the header beside it
+   already spells out, and it pushes the words most of a column in from the edge
+   the title and the divider sit on. So the pane drops the gutter and runs the
+   body out to its own content edge. Thread pane only — the channel timeline,
+   the rail and the thread-summary pill keep their avatars.
+
+   The second selector carries one class more than it needs so it ties
+   `.msg.is-typing .msg__gutter` above and wins on order: the transient typing
+   and draft rows are rows in this pane like any other. */
+.thread__scroll .msg {
+  grid-template-columns: minmax(0, 1fr);
+  padding-left: 16px;
+}
+.thread__scroll .msg .msg__gutter {
+  display: none;
+}
+
+.thread__divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 16px;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.thread__divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* --------------------------------------------------------- empty states */
+
+.empty {
+  margin: auto;
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--fg-dim);
+  max-width: 46ch;
+}
+.empty h2 {
+  font-size: 19px;
+  color: var(--fg);
+  margin: 0 0 6px;
+}
+.empty p {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+.empty code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+/* -------------------------------------------------------------- overlays */
+
+.modal {
+  border: 0;
+  padding: 0;
+  border-radius: var(--radius-lg);
+  background: var(--bg);
+  color: var(--fg);
+  box-shadow: var(--shadow-lg);
+  width: min(440px, calc(100vw - 40px));
+  z-index: 50;
+}
+.modal::backdrop {
+  background: rgb(10 10 16 / 0.45);
+}
+.modal__title {
+  margin: 0;
+  padding: 18px 20px 4px;
+  font-size: 17px;
+  font-weight: 800;
+}
+.modal__body {
+  padding: 8px 20px 4px;
+  display: grid;
+  gap: 12px;
+}
+.modal__foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 20px 18px;
+}
+.modal__extra {
+  display: flex;
+  gap: 8px;
+  margin-right: auto;
+}
+.field {
+  display: grid;
+  gap: 5px;
+}
+.field label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-dim);
+}
+.field input,
+.field textarea,
+.field select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--bg);
+  outline: none;
+  font-family: inherit;
+}
+.field input:focus,
+.field textarea:focus,
+.field select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 16%, transparent);
+}
+.field .help {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+.field .help code {
+  font-family: var(--mono);
+}
+
+.btn {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.btn:hover {
+  background: var(--bg-hover);
+}
+/* No filled variants: every button is the page surface with a border, and the
+   emphasis is carried by the border and the label colour instead. */
+.btn--primary {
+  border-color: var(--fg-faint);
+  color: var(--fg);
+}
+.btn--danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.btn--danger:hover {
+  background: var(--danger-soft);
+}
+.btn--ghost {
+  border-color: transparent;
+  color: var(--fg-dim);
+}
+
+.warn-note {
+  font-size: 13px;
+  color: var(--warn);
+  background: color-mix(in oklab, var(--warn) 12%, transparent);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+/* ------------------------------------------------------------- settings */
+
+/* Everything the rail used to spell out in its own controls — adding a
+   channel, adding a category, turning notifications on — lives behind the
+   header's ☰ instead, so the sidebar stays a list of places to go. */
+.settings {
+  width: min(480px, calc(100vw - 40px));
+}
+
+.settings__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 12px 14px 20px;
+  border-bottom: 1px solid var(--line);
+}
+.settings__head h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.settings__body {
+  padding: 4px 20px 18px;
+  max-height: min(70vh, 620px);
+  overflow-y: auto;
+}
+
+.settings__legend {
+  margin: 18px 0 2px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 11px 0;
+}
+.setting + .setting {
+  border-top: 1px solid var(--line);
+}
+.setting__text {
+  flex: 1;
+  min-width: 0;
+}
+.setting__name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.setting__hint {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+}
+.setting .btn {
+  flex: none;
+}
+.setting__value {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--fg-dim);
+}
+
+/* ------------------------------------------------------------- palette */
+
+.palette {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  align-items: start;
+  justify-items: center;
+  padding-top: 12vh;
+  background: rgb(10 10 16 / 0.35);
+  backdrop-filter: blur(2px);
+}
+.palette__box {
+  width: min(620px, calc(100vw - 40px));
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.palette__input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 15px 18px;
+  font-size: 16px;
+  background: none;
+  outline: none;
+}
+.palette__results {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.palette__results li {
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+.palette__results li.is-sel {
+  background: var(--accent-soft);
+}
+.palette__results .what {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.palette__results .where {
+  font-size: 12px;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+.palette__results .snippet {
+  color: var(--fg-dim);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.palette__results mark {
+  background: color-mix(in oklab, var(--accent) 25%, transparent);
+  color: inherit;
+  border-radius: 3px;
+}
+.palette__foot {
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  background: var(--bg-sunk);
+}
+.palette__foot b {
+  color: var(--fg-dim);
+}
+
+/* --------------------------------------------------------------- toasts */
+
+.toasts {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  gap: 8px;
+  z-index: 70;
+  pointer-events: none;
+}
+.toast {
+  background: var(--fg);
+  color: var(--bg);
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 13.5px;
+  font-weight: 500;
+  box-shadow: var(--shadow-lg);
+  animation: rise 0.18s ease-out;
+}
+.toast.is-error {
+  background: var(--danger);
+  color: #fff;
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* ------------------------------------------------------------ responsive */
+
+.only-narrow {
+  display: none;
+}
+.only-wide {
+  display: grid;
+}
+
+@media (max-width: 900px) {
+  /* The channel list is home and holds the one column on its own; the channel
+     and the thread lift out of the grid and slide in over it, so going back is
+     just sliding them away again. */
+  .app,
+  .app.with-thread {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  /* Nothing sits side by side down here, so there is no boundary to drag. */
+  .pane-resizer {
+    display: none;
+  }
+  .main,
+  .thread {
+    position: fixed;
+    inset: 0;
+    border-left: 0;
+    transform: translateX(100%);
+    /* A layer parked off-screen is still focusable and still read aloud, so it
+       goes properly hidden — but only once it has finished sliding out, which
+       is what the zero-length delayed step buys. */
+    visibility: hidden;
+    transition:
+      transform 0.22s ease,
+      visibility 0s linear 0.22s;
+  }
+  .main {
+    z-index: 44;
+  }
+  .thread {
+    z-index: 45;
+  }
+  .app.with-channel .main,
+  .app.with-thread .thread {
+    transform: none;
+    visibility: visible;
+    transition:
+      transform 0.22s ease,
+      visibility 0s;
+  }
+  /* display:none would cut the slide-out short; visibility above already does
+     the hiding this attribute is here for. */
+  .thread[hidden] {
+    display: flex;
+  }
+
+  .only-narrow {
+    display: grid;
+  }
+  /* The rail is the whole column down here, so there is nothing to collapse it
+     away from — and a stale `rail-hidden` from a wide window must not follow
+     you into a layout where it would hide the only thing on screen. */
+  .only-wide {
+    display: none;
+  }
+  .app.rail-hidden .rail {
+    visibility: visible;
+  }
+  /* The rail is never the collapsed column here, so the header never inherits
+     the traffic lights from it. */
+  .app.is-inset-titlebar.rail-hidden .chan-head {
+    padding-left: 16px;
+  }
+  /* The back arrow already closes the thread; a second control for it would
+     just crowd the header. */
+  #btn-close-thread {
+    display: none;
+  }
+  .chan-head__actions .chip:not(:first-child) {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------- response sections */
+
+/* The three boxes an agent's reply can carry under its answer. Native
+   `<details>`, so closed is the element's own default and no script is
+   involved — the accent stripe and the mask icon are the only things the
+   stylesheet adds, and both are set per section by `data-section`. Colour is
+   never the only difference: each card has its own glyph and its own written
+   label. */
+.rsec {
+  /* `.think`'s reason: an aside about the answer, not the answer. */
+  max-width: 620px;
+  margin: 4px 0;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line-soft);
+  border-left: 3px solid var(--rsec-accent, var(--line));
+  border-radius: 8px;
+  overflow: hidden;
+}
+.rsec[data-section='reasoning'] {
+  --rsec-accent: var(--agent, #7c6cf5);
+  --rsec-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5a4.5 4.5 0 00-2.6 8.2v1.6h5.2V9.7A4.5 4.5 0 008 1.5z' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M6.2 13.4h3.6M6.8 15h2.4' stroke='%23000' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.rsec[data-section='process'] {
+  --rsec-accent: #0ea5a5;
+  --rsec-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 4h8M6 8h8M6 12h8M2.5 4h.01M2.5 8h.01M2.5 12h.01' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+.rsec[data-section='assumptions'] {
+  --rsec-accent: #d97706;
+  --rsec-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.2' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M6.2 6.1a1.9 1.9 0 113 1.6c-.5.4-.8.7-.8 1.4' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='11.6' r='.95' fill='%23000'/%3E%3C/svg%3E");
+}
+
+.rsec__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 9px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  /* The default triangle sits where the icon goes; the chevron below replaces
+     it so both marks cannot disagree about the open state. */
+  list-style: none;
+}
+.rsec__head::-webkit-details-marker {
+  display: none;
+}
+.rsec__head:hover {
+  background: var(--bg-hover);
+}
+.rsec__head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Chevron first, then the section's own glyph, then the label. */
+.rsec__head::before,
+.rsec__title::before {
+  content: '';
+  flex: none;
+  width: 13px;
+  height: 13px;
+  background: currentColor;
+}
+.rsec__head::before {
+  -webkit-mask: var(--think-chevron) center / contain no-repeat;
+  mask: var(--think-chevron) center / contain no-repeat;
+  transition: transform 0.15s ease;
+}
+.rsec[open] > .rsec__head::before {
+  transform: rotate(90deg);
+}
+
+.rsec__title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--rsec-accent, var(--fg-dim));
+}
+.rsec__title::before {
+  -webkit-mask: var(--rsec-icon) center / contain no-repeat;
+  mask: var(--rsec-icon) center / contain no-repeat;
+}
+
+.rsec__body {
+  padding: 2px 11px 9px 27px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--fg);
+}
+.rsec__body > :first-child {
+  margin-top: 0;
+}
+.rsec__body > :last-child {
+  margin-bottom: 0;
+}
+.rsec__body ul,
+.rsec__body ol {
+  padding-left: 20px;
+  margin: 4px 0;
+}
+.rsec__body li {
+  margin: 2px 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rsec__head::before {
+    transition: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .rsec {
+    max-width: none;
+  }
+  .rsec__body {
+    padding-left: 13px;
+  }
+}

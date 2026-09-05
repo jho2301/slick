@@ -29,7 +29,7 @@ import {
   settle,
   stepStatusLabel,
   THINK_KEY,
-} from '../src/lib/thinking.ts';
+} from '../src/features/thinking/thinking.ts';
 
 /** A real `hermes` reply, minus everything this module does not look at. */
 function reply(metadata: Record<string, unknown> | null) {

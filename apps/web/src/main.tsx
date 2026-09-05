@@ -9,10 +9,10 @@
 import { Provider } from 'jotai';
 import { createRoot } from 'react-dom/client';
 
-import { boot, goTo } from './actions.ts';
-import { App } from './components/App.tsx';
-import { store } from './store.ts';
-import { bootstrapServiceWorker } from './sw-bootstrap.ts';
+import { boot, goTo } from './app/actions.ts';
+import { App } from './app/App.tsx';
+import { store } from './app/store.ts';
+import { bootstrapServiceWorker } from './pwa/sw-bootstrap.ts';
 
 const root = document.getElementById('root');
 if (!root) throw new Error('index.html has no #root to mount into');

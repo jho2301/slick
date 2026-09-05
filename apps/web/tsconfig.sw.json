@@ -13,5 +13,5 @@
     "lib": ["es2024", "webworker"],
     "types": []
   },
-  "include": ["src/sw.ts"]
+  "include": ["src/pwa/sw.ts"]
 }

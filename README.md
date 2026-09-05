@@ -540,6 +540,40 @@ apps/desktop       the Electron shell around it
 scripts            demo seeding, the dev server, UI smoke test, screenshots
 ```
 
+Source directories follow the responsibilities inside each workspace:
+
+```text
+apps/web/src/
+  app/                  application shell, shared state, navigation, and live events
+  features/
+    messages/           channels, threads, composer, message rendering, and helpers
+    thinking/           thinking display and its UI state
+    hermes/             profile, model, and usage UI with its helpers and store
+    search/             search palette
+  shared/
+    api/                HTTP client
+    lib/                formatting and clipboard helpers
+    ui/                 modal and toast hosts and controls
+  pwa/                  service worker, registration, and push subscriptions
+  main.tsx              browser entry point
+  styles.css            application stylesheet
+apps/desktop/src/       Electron entry point
+packages/server/src/
+  http/                 routing, request helpers, and static file serving
+  realtime/             SSE hub and web push delivery
+  integrations/         agent commands and the Hermes TypeScript/Python bridge
+  index.ts              server composition and public exports
+  daemon.ts             daemon process lifecycle
+```
+
+Keep feature components and their helpers together. Application-wide orchestration
+belongs in `app/`; reusable infrastructure belongs in `shared/`. Each workspace
+keeps its tests in `test/` and executable shims in `bin/` where needed. Core domain
+modules stay in `packages/core/src/`, and CLI handlers stay in
+`packages/cli/src/commands/`. Package names and public exports remain the stable
+boundaries between workspaces. Generated web assets live in
+`packages/server/public/`; edit `apps/web/src/` or `apps/web/public/` instead.
+
 `@slick/core` holds every rule. The CLI calls it directly; the server exposes
 it over HTTP; the app calls the server. There is exactly one implementation of
 "what happens when you post a message", so the two front ends cannot drift.

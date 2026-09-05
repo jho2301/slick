@@ -18,8 +18,8 @@ import {
   usageWindows,
   withConfigured,
   type UsageInput,
-} from '../src/lib/hermes-panel.ts';
-import type { HermesProviderEntry } from '../src/lib/hermes-types.ts';
+} from '../src/features/hermes/hermes-panel.ts';
+import type { HermesProviderEntry } from '../src/features/hermes/hermes-types.ts';
 
 /** The shape `GET /api/hermes/profiles/:name/model` hands back. */
 const CATALOG: HermesProviderEntry[] = [

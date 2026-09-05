@@ -14,12 +14,12 @@ import { resolve } from 'node:path';
 import { render } from '@testing-library/react';
 import { describe, test } from 'vitest';
 
-import { HermesUsage } from '../src/components/Hermes.tsx';
-import { bankedResetLine, usageDetailLines } from '../src/lib/hermes-panel.ts';
-import type { HermesUsageState } from '../src/lib/hermes-store.ts';
+import { HermesUsage } from '../src/features/hermes/Hermes.tsx';
+import { bankedResetLine, usageDetailLines } from '../src/features/hermes/hermes-panel.ts';
+import type { HermesUsageState } from '../src/features/hermes/hermes-store.ts';
 
 // By path from the repo root: under jsdom `import.meta.url` is an http URL.
-const css = readFileSync(resolve(process.cwd(), 'apps/web/styles.css'), 'utf8');
+const css = readFileSync(resolve(process.cwd(), 'apps/web/src/styles.css'), 'utf8');
 
 describe('the line the card draws', () => {
   test('a count becomes "N reset tickets"', () => {

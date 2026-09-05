@@ -15,13 +15,13 @@ import { act, render } from '@testing-library/react';
 import { Provider } from 'jotai';
 import { beforeEach, describe, test } from 'vitest';
 
-import { hermesAtom } from '../src/atoms.ts';
-import { HermesLimitsSection, HermesSection } from '../src/components/Rail.tsx';
-import type { HermesState } from '../src/lib/hermes-store.ts';
-import { hermes, store } from '../src/store.ts';
+import { hermesAtom } from '../src/app/atoms.ts';
+import { HermesLimitsSection, HermesSection } from '../src/app/Rail.tsx';
+import type { HermesState } from '../src/features/hermes/hermes-store.ts';
+import { hermes, store } from '../src/app/store.ts';
 
 // By path from the repo root: under jsdom `import.meta.url` is an http URL.
-const css = readFileSync(resolve(process.cwd(), 'apps/web/styles.css'), 'utf8');
+const css = readFileSync(resolve(process.cwd(), 'apps/web/src/styles.css'), 'utf8');
 
 /** A store write, flushed through React before the next assertion. */
 const setHermes = (state: HermesState) =>

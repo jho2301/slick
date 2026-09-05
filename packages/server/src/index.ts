@@ -12,12 +12,12 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { randomBytes } from 'node:crypto';
 import { Workspace, isRecord } from '@slick/core';
 
-import { createRoutes, RAW } from './routes.ts';
-import { createHub, type Hub } from './hub.ts';
-import { createPushService, type PushService } from './push.ts';
-import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot } from './static.ts';
-import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http.ts';
-import type { Env } from './hermes.ts';
+import { createRoutes, RAW } from './http/routes.ts';
+import { createHub, type Hub } from './realtime/hub.ts';
+import { createPushService, type PushService } from './realtime/push.ts';
+import { buildStamp, createStaticHandler, manifestWithToken, resolveWebRoot } from './http/static.ts';
+import { isLocalHost, parseCookies, query, readJson, sendError, sendJson } from './http/http.ts';
+import type { Env } from './integrations/hermes/hermes.ts';
 
 export const VERSION = '0.6.0';
 const COOKIE = 'slick_token';
@@ -264,7 +264,7 @@ code{background:#f4f4f5;padding:.15em .4em;border-radius:4px;font-size:.9em}</st
 export { createHub, createPushService, resolveWebRoot };
 export type { Hub, PushService, Env };
 export type { DaemonInfo, DaemonStatus, RunningDaemon, StoppedDaemon, StartedDaemon } from './daemon.ts';
-export type { CommandEntry, CommandList, CommandOutput } from './commands.ts';
+export type { CommandEntry, CommandList, CommandOutput } from './integrations/commands.ts';
 export type {
   AccountUsage,
   HermesProfile,
@@ -273,4 +273,4 @@ export type {
   ProfileUsage,
   UsageWindow,
   EffortChoice,
-} from './hermes.ts';
+} from './integrations/hermes/hermes.ts';

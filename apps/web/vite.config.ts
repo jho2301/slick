@@ -20,7 +20,7 @@ export default defineConfig({
       // network-first, push, notification taps — is Slick's, and only the
       // "which files, and which build" half is the bundler's to know.
       strategies: 'injectManifest',
-      srcDir: 'src',
+      srcDir: 'src/pwa',
       filename: 'sw.ts',
       // Registered by hand in `main.tsx`, so nothing is injected into the
       // page and the CSP stays exactly as it was.

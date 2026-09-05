@@ -9,10 +9,10 @@ import { act, fireEvent, render } from '@testing-library/react';
 import { Provider } from 'jotai';
 import { beforeEach, describe, test } from 'vitest';
 
-import { ThinkingBox } from '../src/components/ThinkingBox.tsx';
-import { emptyThink, type ThinkingView } from '../src/lib/thinking.ts';
-import { store } from '../src/store.ts';
-import { resetThinkState } from '../src/think-state.ts';
+import { ThinkingBox } from '../src/features/thinking/ThinkingBox.tsx';
+import { emptyThink, type ThinkingView } from '../src/features/thinking/thinking.ts';
+import { store } from '../src/app/store.ts';
+import { resetThinkState } from '../src/features/thinking/think-state.ts';
 
 const think = (phase: ThinkingView['phase'], steps = 1): ThinkingView => ({
   title: 'Working out what took the canary down',

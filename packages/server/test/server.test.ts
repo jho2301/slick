@@ -18,9 +18,9 @@ import { EventEmitter } from 'node:events';
 
 import { Workspace, serveLockPath } from '@slick/core';
 import { createServer, type SlickServer } from '../src/index.ts';
-import { createHub } from '../src/hub.ts';
-import { createPushService, type PushSubscription } from '../src/push.ts';
-import { buildStamp } from '../src/static.ts';
+import { createHub } from '../src/realtime/hub.ts';
+import { createPushService, type PushSubscription } from '../src/realtime/push.ts';
+import { buildStamp } from '../src/http/static.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

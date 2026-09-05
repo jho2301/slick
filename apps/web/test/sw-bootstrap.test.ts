@@ -13,7 +13,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, test } from 'vitest';
 
-import { bootstrapServiceWorker, type ServiceWorkerBridge } from '../src/sw-bootstrap.ts';
+import { bootstrapServiceWorker, type ServiceWorkerBridge } from '../src/pwa/sw-bootstrap.ts';
 
 type Listener = (event: { data?: unknown }) => void;
 

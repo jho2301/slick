@@ -7,6 +7,6 @@
     "outDir": ".tsbuild",
     "rootDir": "."
   },
-  "include": ["main.ts"],
+  "include": ["src/**/*.ts"],
   "references": [{ "path": "../../packages/core" }, { "path": "../../packages/server" }]
 }

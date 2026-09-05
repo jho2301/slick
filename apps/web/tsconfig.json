@@ -16,6 +16,6 @@
   },
   "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx", "vite.config.ts"],
   // The service worker has a different global scope; see tsconfig.sw.json.
-  "exclude": ["src/sw.ts"],
+  "exclude": ["src/pwa/sw.ts"],
   "references": [{ "path": "../../packages/core" }]
 }

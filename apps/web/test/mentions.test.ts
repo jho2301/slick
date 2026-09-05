@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 
-import { findMention, insertMention, mentionMatches } from '../src/lib/mentions.ts';
+import { findMention, insertMention, mentionMatches } from '../src/features/messages/mentions.ts';
 
 const agents = [{ id: 'claude', hint: '#deploys · 2m ago' }, { id: 'reviewer' }, { id: 'clara' }];
 

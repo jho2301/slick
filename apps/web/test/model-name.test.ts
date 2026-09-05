@@ -11,8 +11,8 @@
 import { strictEqual } from 'node:assert/strict';
 import { test } from 'vitest';
 
-import { trimModelName } from '../src/lib/format.ts';
-import { isGrouped, type Groupable } from '../src/lib/grouping.ts';
+import { trimModelName } from '../src/shared/lib/format.ts';
+import { isGrouped, type Groupable } from '../src/features/messages/grouping.ts';
 
 test('a local weight file badges as its name', () => {
   // The live repro: one model in one workspace, badged 14 times without the

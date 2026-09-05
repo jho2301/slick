@@ -145,7 +145,7 @@ opens in your default browser.`,
     const info = await ensureDaemon({ home: ctx.home });
     const url = `${info.url}${info.token ? `?token=${info.token}` : ''}`;
 
-    if (!flagOn(ctx.flags, 'browser') && existsSync(resolve(DESKTOP_DIR, 'main.ts'))) {
+    if (!flagOn(ctx.flags, 'browser') && existsSync(resolve(DESKTOP_DIR, 'src/main.ts'))) {
       const electron = await loadElectronBinary();
       if (electron) {
         const child = spawn(electron, [DESKTOP_DIR], {

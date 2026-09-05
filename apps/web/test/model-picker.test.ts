@@ -6,7 +6,7 @@ import {
   modelPickerDefaults,
   modelsForProvider,
   parseModelCommandArgs,
-} from '../src/lib/model-picker.ts';
+} from '../src/features/hermes/model-picker.ts';
 
 test('groups provider-qualified model choices without losing their full ids', () => {
   const providers = groupModelChoices([

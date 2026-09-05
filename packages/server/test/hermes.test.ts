@@ -19,7 +19,7 @@ import {
   setUsageClock,
   writeProfileModel,
   type Env,
-} from '../src/hermes.ts';
+} from '../src/integrations/hermes/hermes.ts';
 import { createServer, type SlickServer } from '../src/index.ts';
 
 /** A throwaway HERMES_HOME. Nothing here ever touches the real one. */

@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'vitest';
 
-import { parseSections, readSections, SECTION_CARDS } from '../src/lib/response-sections.ts';
+import { parseSections, readSections, SECTION_CARDS } from '../src/features/messages/response-sections.ts';
 
 describe('parseSections', () => {
   test('text with no recognized label comes back unchanged', () => {

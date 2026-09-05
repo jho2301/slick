@@ -12,7 +12,7 @@
 import { strictEqual } from 'node:assert/strict';
 import { test } from 'vitest';
 
-import { isGrouped, type Groupable } from '../src/lib/grouping.ts';
+import { isGrouped, type Groupable } from '../src/features/messages/grouping.ts';
 
 /** Taken from a real pair of consecutive `hermes` replies in one thread. */
 const AT = 1787457959755;

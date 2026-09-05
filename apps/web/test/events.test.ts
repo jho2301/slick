@@ -22,10 +22,10 @@ import {
   threadAtom,
   typingAtom,
   unreadAtom,
-} from '../src/atoms.ts';
-import { applyFrame } from '../src/events.ts';
-import { resetLive } from '../src/live.ts';
-import { api, store } from '../src/store.ts';
+} from '../src/app/atoms.ts';
+import { applyFrame } from '../src/app/events.ts';
+import { resetLive } from '../src/app/live.ts';
+import { api, store } from '../src/app/store.ts';
 
 const AT = 1787457959755;
 

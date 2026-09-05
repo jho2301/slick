@@ -6,8 +6,13 @@ import assert from 'node:assert/strict';
 import { fireEvent, render } from '@testing-library/react';
 import { describe, test } from 'vitest';
 
-import { Composer } from '../src/components/Composer.tsx';
-import { commandMatches, findCommand, insertCommand, type CommandEntry } from '../src/lib/commands.ts';
+import { Composer } from '../src/features/messages/Composer.tsx';
+import {
+  commandMatches,
+  findCommand,
+  insertCommand,
+  type CommandEntry,
+} from '../src/features/messages/commands.ts';
 
 function flush() {
   return new Promise((resolve) => setTimeout(resolve, 0));

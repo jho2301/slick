@@ -1,6 +1,6 @@
 """A stand-in for the parts of Hermes the Slick bridge is allowed to touch.
 
-`packages/server/src/hermes-bridge.py` may only reach Hermes through its
+`packages/server/src/integrations/hermes/hermes-bridge.py` may only reach Hermes through its
 sanctioned helpers — `load_config`/`save_config` for the config file, the
 model registry for the catalog. This package provides exactly those names and
 nothing else, so a bridge that tried to parse `config.yaml` itself, or to write
