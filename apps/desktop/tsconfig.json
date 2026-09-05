@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": ".tsbuild",
+    "rootDir": "."
+  },
+  "include": ["main.ts"],
+  "references": [{ "path": "../../packages/core" }, { "path": "../../packages/server" }]
+}

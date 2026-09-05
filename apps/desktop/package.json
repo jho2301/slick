@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Slick desktop app (Electron shell around the local workspace)",
-  "main": "main.js",
+  "main": "main.ts",
   "scripts": {
     "start": "electron ."
   },
